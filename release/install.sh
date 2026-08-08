@@ -99,36 +99,7 @@ install_acme() {
     curl https://get.acme.sh | sh
 }
 
-# 升级安装时将旧版 XrayR 目录迁入新路径，并清理旧 unit / 命令名（不保留旧名别名）。
-migrate_from_xrayr() {
-    systemctl stop XrayR >/dev/null 2>&1 || true
-    systemctl disable XrayR >/dev/null 2>&1 || true
-
-    if [[ -d /etc/XrayR && ! -e /etc/ECYCloudNode ]]; then
-        mv /etc/XrayR /etc/ECYCloudNode
-        echo -e "${green}已迁移配置目录 /etc/XrayR -> /etc/ECYCloudNode${plain}"
-    elif [[ -e /etc/XrayR ]]; then
-        rm -rf /etc/XrayR
-    fi
-
-    if [[ -d /usr/local/XrayR && ! -e /usr/local/ECYCloudNode ]]; then
-        mv /usr/local/XrayR /usr/local/ECYCloudNode
-        if [[ -f /usr/local/ECYCloudNode/XrayR && ! -f /usr/local/ECYCloudNode/ECYCloudNode ]]; then
-            mv /usr/local/ECYCloudNode/XrayR /usr/local/ECYCloudNode/ECYCloudNode
-        fi
-        echo -e "${green}已迁移程序目录 /usr/local/XrayR -> /usr/local/ECYCloudNode${plain}"
-    elif [[ -e /usr/local/XrayR ]]; then
-        rm -rf /usr/local/XrayR
-    fi
-
-    rm -f /etc/systemd/system/XrayR.service
-    rm -f /usr/bin/XrayR /usr/bin/xrayr
-    systemctl daemon-reload >/dev/null 2>&1 || true
-}
-
 install_ECYCloudNode() {
-    migrate_from_xrayr
-
     if [[ -e /usr/local/ECYCloudNode/ ]]; then
         rm /usr/local/ECYCloudNode/ -rf
     fi

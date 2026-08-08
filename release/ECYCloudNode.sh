@@ -160,13 +160,10 @@ uninstall() {
     fi
     systemctl stop ECYCloudNode
     systemctl disable ECYCloudNode
-    systemctl stop XrayR >/dev/null 2>&1 || true
-    systemctl disable XrayR >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/ECYCloudNode.service /etc/systemd/system/XrayR.service
+    rm -f /etc/systemd/system/ECYCloudNode.service
     systemctl daemon-reload
     systemctl reset-failed
-    rm -rf /etc/ECYCloudNode /etc/XrayR /usr/local/ECYCloudNode /usr/local/XrayR
-    rm -f /usr/bin/XrayR /usr/bin/xrayr
+    rm -rf /etc/ECYCloudNode /usr/local/ECYCloudNode
 
     echo ""
     echo -e "卸载成功，如果你想删除此脚本，则退出脚本后运行 ${green}rm /usr/bin/ECYCloudNode /usr/bin/ecycloudnode -f${plain} 进行删除"
@@ -385,7 +382,6 @@ update_shell() {
     else
         chmod +x /usr/bin/ECYCloudNode
         ln -sfn /usr/bin/ECYCloudNode /usr/bin/ecycloudnode
-        rm -f /usr/bin/XrayR /usr/bin/xrayr
         echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0
     fi
 }
