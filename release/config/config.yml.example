@@ -1,0 +1,91 @@
+Log:
+  Level: warning # Log level: none, error, warning, info, debug
+  AccessPath: # /etc/ECYCloudNode/access.Log
+  ErrorPath: # /etc/ECYCloudNode/error.log
+DnsConfigPath: # /etc/ECYCloudNode/dns.json # Path to dns config, check https://xtls.github.io/config/dns.html for help
+RouteConfigPath: # /etc/ECYCloudNode/route.json # Path to route config, check https://xtls.github.io/config/routing.html for help
+InboundConfigPath: # /etc/ECYCloudNode/custom_inbound.json # Path to custom inbound config, check https://xtls.github.io/config/inbound.html for help
+OutboundConfigPath: # /etc/ECYCloudNode/custom_outbound.json # Path to custom outbound config, check https://xtls.github.io/config/outbound.html for help
+ConnectionConfig:
+  Handshake: 4 # Handshake time limit, Second
+  ConnIdle: 30 # Connection idle time limit, Second
+  UplinkOnly: 2 # Time limit when the connection downstream is closed, Second
+  DownlinkOnly: 4 # Time limit when the connection is closed after the uplink is closed, Second
+  BufferSize: 64 # The internal cache size of each connection, kB
+Nodes:
+  - PanelType: "SSPanel" # Panel type: SSPanel
+    ApiConfig:
+      ApiHost: "http://127.0.0.1:667"
+      ApiKey: "123"
+      NodeID: 41,42,43   # 启动多个节点 41,42,43
+      Timeout: 30 # Timeout for the api request
+      SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
+      DeviceLimit: 0 # Local settings will replace remote settings, 0 means disable
+      RuleListPath: # /etc/ECYCloudNode/rulelist Path to local rulelist file
+      DisableCustomConfig: false # disable custom config for sspanel
+    ControllerConfig:
+      ListenIP: 0.0.0.0 # IP address you want to listen
+      SendIP: 0.0.0.0 # IP address you want to send pacakage
+      UpdatePeriodic: 60 # Time to update the nodeinfo, how many sec.
+      EnableDNS: false # Use custom DNS config, Please ensure that you set the dns.json well
+      DNSType: AsIs # AsIs, UseIP, UseIPv4, UseIPv6, DNS strategy
+      AutoSpeedLimitConfig:
+        Limit: 0 # Warned speed. Set to 0 to disable AutoSpeedLimit (mbps)
+        WarnTimes: 0 # After (WarnTimes) consecutive warnings, the user will be limited. Set to 0 to punish overspeed user immediately.
+        LimitSpeed: 0 # The speedlimit of a limited user (unit: mbps)
+        LimitDuration: 0 # How many minutes will the limiting last (unit: minute)
+      GlobalDeviceLimitConfig:
+        Enable: true # Enable the global device limit of a user
+        RedisNetwork: tcp # Redis protocol, tcp or unix
+        RedisAddr: # 留空则自动读取面板“设置中心-节点相关-站点IP”（站点IP:6379）；填写则以本地为准
+        RedisUsername: # Redis username
+        RedisPassword: # 留空则自动读取面板“设置中心-节点相关-RedisPassword”；填写则以本地为准
+        RedisDB: 0 # Redis DB
+        Timeout: 5 # Timeout for redis request
+        Expiry: 60 # Expiry time (second)
+      EnableFallback: false # Only support for Trojan and Vless
+      FallBackConfigs:  # Support multiple fallbacks
+        - SNI: # TLS SNI(Server Name Indication), Empty for any
+          Alpn: # Alpn, Empty for any
+          Path: # HTTP PATH, Empty for any
+          Dest: 80 # Required, Destination of fallback, check https://xtls.github.io/config/features/fallback.html for details.
+          ProxyProtocolVer: 0 # Send PROXY protocol version, 0 for disable
+      # CertConfig is managed by panel and not configured here.
+
+	    #  - PanelType: "SSPanel" # Panel type: SSPanel
+	    #    ApiConfig:
+	    #      ApiHost: "http://127.0.0.1:667"
+	    #      ApiKey: "123"
+	    #      NodeID: 41
+	    #      Timeout: 30 # Timeout for the api request
+	    #      SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
+	    #      DeviceLimit: 0 # Local settings will replace remote settings, 0 means disable
+	    #      RuleListPath: # /etc/ECYCloudNode/rulelist Path to local rulelist file
+	    #      DisableCustomConfig: false # disable custom config for sspanel
+	    #    ControllerConfig:
+	    #      ListenIP: 0.0.0.0 # IP address you want to listen
+	    #      SendIP: 0.0.0.0 # IP address you want to send pacakage
+	    #      UpdatePeriodic: 60 # Time to update the nodeinfo, how many sec.
+	    #      EnableDNS: false # Use custom DNS config, Please ensure that you set the dns.json well
+	    #      DNSType: AsIs # AsIs, UseIP, UseIPv4, UseIPv6, DNS strategy
+	    #      AutoSpeedLimitConfig:
+	    #        Limit: 0 # Warned speed. Set to 0 to disable AutoSpeedLimit (mbps)
+	    #        WarnTimes: 0 # After (WarnTimes) consecutive warnings, the user will be limited. Set to 0 to punish overspeed user immediately.
+	    #        LimitSpeed: 0 # The speedlimit of a limited user (unit: mbps)
+	    #        LimitDuration: 0 # How many minutes will the limiting last (unit: minute)
+	    #      GlobalDeviceLimitConfig:
+	    #        Enable: true # Enable the global device limit of a user
+	    #        RedisNetwork: tcp # Redis protocol, tcp or unix
+	    #        RedisAddr: # 留空则自动读取面板“设置中心-节点相关-站点IP”（站点IP:6379）；填写则以本地为准
+	    #        RedisUsername: # Redis username
+	    #        RedisPassword: # 留空则自动读取面板“设置中心-节点相关-RedisPassword”；填写则以本地为准
+	    #        RedisDB: 0 # Redis DB
+	    #        Timeout: 5 # Timeout for redis request
+	    #        Expiry: 60 # Expiry time (second)
+	    #      EnableFallback: false # Only support for Trojan and Vless
+	    #      FallBackConfigs:  # Support multiple fallbacks
+	    #        - SNI: # TLS SNI(Server Name Indication), Empty for any
+	    #          Alpn: # Alpn, Empty for any
+	    #          Path: # HTTP PATH, Empty for any
+	    #          Dest: 80 # Required, Destination of fallback, check https://xtls.github.io/config/features/fallback.html for details.
+	    #          ProxyProtocolVer: 0 # Send PROXY protocol version, 0 for disable
