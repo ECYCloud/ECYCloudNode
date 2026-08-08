@@ -1,0 +1,31 @@
+[Unit]
+Description=ECYCloudNode Service
+# 使用 network-online.target 确保网络完全可用后再启动
+# 这对于需要连接面板 API 的 ECYCloudNode 非常重要
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+# 防止服务启动失败后无限重启
+StartLimitIntervalSec=500
+StartLimitBurst=5
+
+[Service]
+User=root
+Group=root
+Type=simple
+LimitAS=infinity
+LimitRSS=infinity
+LimitCORE=infinity
+LimitNOFILE=999999
+WorkingDirectory=/usr/local/ECYCloudNode/
+# 启动前等待 DNS 解析可用（检测外部网络连通性）
+# 尝试解析 google.com，最多等待 30 秒
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do nslookup google.com >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
+ExecStart=/usr/local/ECYCloudNode/ECYCloudNode --config /etc/ECYCloudNode/config.yml
+# 设置合理的超时时间
+TimeoutStartSec=60
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -20,9 +20,16 @@ on:
   release:
     types: [ published ]
 
+# 仓库默认 Workflow permissions 为 read；上传 Release 资产需要 contents: write。
+# 未声明时会出现 Resource not accessible by integration（svenstaro/upload-release-action）。
+permissions:
+  contents: read
+
 jobs:
 
   build:
+    permissions:
+      contents: write
     strategy:
       matrix:
         # Include amd64 on all platforms.

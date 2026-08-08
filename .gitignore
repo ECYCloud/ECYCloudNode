@@ -10,9 +10,10 @@ gen
 *.test
 *.out
 go.work
-main
-ECYCloudNode
-ECYCloudNode*
+# 仅忽略仓库根目录本地编译产物，勿用 ECYCloudNode*（会误伤 release/ECYCloudNode.sh|.service）
+/main
+/ECYCloudNode
+/ECYCloudNode.exe
 access.log
 error.log
 .lego
