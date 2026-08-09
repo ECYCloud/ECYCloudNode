@@ -95,11 +95,6 @@ ECYCloudNode uninstall    卸载
 * `DnsConfigPath` / `RouteConfigPath` 等：可选；留空（注释）则不加载对应 JSON
 * 证书：优先由面板 `ecycloudnode_cert` 下发；也可在节点侧自行配置 CertConfig
 
-上游协议与 Xray 配置文档可参考：
-
-* [XrayR 文档（上游）](https://xrayr-project.github.io/XrayR-doc/)
-* [Xray-core 配置](https://xtls.github.io/)
-
 ## 编译
 
 需要 Go 1.26+（见 `go.mod`）：
