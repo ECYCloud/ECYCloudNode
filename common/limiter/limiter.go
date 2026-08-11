@@ -4,6 +4,7 @@ package limiter
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -187,8 +188,8 @@ func (l *Limiter) GetUserBucket(tag string, userKey string, ip string) (limiter 
 	return nil, false, false
 }
 
-// admitIP 登记/刷新用户的在线 IP；本地或全局超出设备限制时拒绝。
-// 已在线 IP 刷新活跃时间放行；新 IP 在清理过期条目后按剩余名额判定。
+// admitIP 登记/刷新用户的在线 IP；名额满时踢最旧 IP 后放行新 IP。
+// 已在线 IP 刷新活跃时间放行；新 IP 在清理过期条目后按剩余名额判定，不足则挤出最旧。
 func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int) bool {
 	now := time.Now().Unix()
 	v, _ := inboundInfo.UserOnlineIP.LoadOrStore(userKey, new(sync.Map))
@@ -206,8 +207,13 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 			}
 			return true
 		})
-		if deviceLimit > 0 && counter >= deviceLimit {
-			return false
+		for deviceLimit > 0 && counter >= deviceLimit {
+			oldestIP, ok := evictOldestOnlineIP(ipMap, now)
+			if !ok {
+				return false
+			}
+			NoteDeviceKick(uid, oldestIP)
+			counter--
 		}
 		ipMap.Store(ip, onlineEntry{UID: uid, LastSeen: now})
 	}
@@ -220,9 +226,31 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 	return true
 }
 
+func evictOldestOnlineIP(ipMap *sync.Map, now int64) (string, bool) {
+	oldestIP := ""
+	oldestSeen := int64(math.MaxInt64)
+	expiry := int64(OnlineIPExpiry / time.Second)
+	ipMap.Range(func(key, value interface{}) bool {
+		entry := value.(onlineEntry)
+		if now-entry.LastSeen > expiry {
+			return true
+		}
+		if entry.LastSeen < oldestSeen {
+			oldestSeen = entry.LastSeen
+			oldestIP = key.(string)
+		}
+		return true
+	})
+	if oldestIP == "" {
+		return "", false
+	}
+	ipMap.Delete(oldestIP)
+	return oldestIP, true
+}
+
 // EnsureOnline 供上行方向（客户端→服务端有真实数据）周期性复查：
 // IP 仍在线则刷新活跃时间；若名额已被占满且该 IP 已被挤出，
-// 返回 false（调用方应断开连接）。
+// 返回 false（调用方应断开连接）。被挤出后禁止再通过踢人重新抢回名额。
 func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	value, ok := l.InboundInfo.Load(tag)
 	if !ok {
@@ -236,7 +264,30 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 		uid = u.UID
 		deviceLimit = u.DeviceLimit
 	}
-	return admitIP(inboundInfo, userKey, ip, uid, deviceLimit)
+
+	v, ok := inboundInfo.UserOnlineIP.Load(userKey)
+	if !ok {
+		return false
+	}
+	ipMap := v.(*sync.Map)
+	entryValue, online := ipMap.Load(ip)
+	if !online {
+		return false
+	}
+
+	now := time.Now().Unix()
+	entry := entryValue.(onlineEntry)
+	if now-entry.LastSeen > int64(OnlineIPExpiry/time.Second) {
+		ipMap.Delete(ip)
+		return false
+	}
+	ipMap.Store(ip, onlineEntry{UID: uid, LastSeen: now})
+
+	if !inboundInfo.GlobalLimit.Refresh(uid, ip, deviceLimit) {
+		ipMap.Delete(ip)
+		return false
+	}
+	return true
 }
 
 // VerifyOnline 供下行方向（远端→客户端）周期性复查：只读、不续期、不登记。

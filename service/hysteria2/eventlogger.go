@@ -155,22 +155,15 @@ func (l *hyEventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 		user, ok = l.svc.users[id]
 		l.svc.mu.RUnlock()
 
-		// Update last active time and re-add IP to onlineIPs
-		// This ensures that active connections are tracked even after collectUsage() clears the maps
-		// Similar to how traditional Xray protocols call GetUserBucket on every traffic event
+		// 仅刷新仍持有名额的 IP；已被超限踢出的 IP 禁止靠流量抢回名额
 		if ok && host != "" && id != "" {
 			l.svc.mu.Lock()
-			// Re-add IP to onlineIPs (in case it was cleared by collectUsage)
 			if ipSet, exists := l.svc.onlineIPs[id]; exists {
-				ipSet[host] = struct{}{}
-			} else {
-				l.svc.onlineIPs[id] = map[string]struct{}{host: struct{}{}}
-			}
-			// Update last active time
-			if activeMap, exists := l.svc.ipLastActive[id]; exists {
-				activeMap[host] = time.Now()
-			} else {
-				l.svc.ipLastActive[id] = map[string]time.Time{host: time.Now()}
+				if _, online := ipSet[host]; online {
+					if activeMap, ok := l.svc.ipLastActive[id]; ok {
+						activeMap[host] = time.Now()
+					}
+				}
 			}
 			l.svc.mu.Unlock()
 		}
@@ -227,22 +220,15 @@ func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, r
 		user, ok = l.svc.users[id]
 		l.svc.mu.RUnlock()
 
-		// Update last active time and re-add IP to onlineIPs
-		// This ensures that active connections are tracked even after collectUsage() clears the maps
-		// Similar to how traditional Xray protocols call GetUserBucket on every traffic event
+		// 仅刷新仍持有名额的 IP；已被超限踢出的 IP 禁止靠流量抢回名额
 		if ok && host != "" && id != "" {
 			l.svc.mu.Lock()
-			// Re-add IP to onlineIPs (in case it was cleared by collectUsage)
 			if ipSet, exists := l.svc.onlineIPs[id]; exists {
-				ipSet[host] = struct{}{}
-			} else {
-				l.svc.onlineIPs[id] = map[string]struct{}{host: {}}
-			}
-			// Update last active time
-			if activeMap, exists := l.svc.ipLastActive[id]; exists {
-				activeMap[host] = time.Now()
-			} else {
-				l.svc.ipLastActive[id] = map[string]time.Time{host: time.Now()}
+				if _, online := ipSet[host]; online {
+					if activeMap, ok := l.svc.ipLastActive[id]; ok {
+						activeMap[host] = time.Now()
+					}
+				}
 			}
 			l.svc.mu.Unlock()
 		}

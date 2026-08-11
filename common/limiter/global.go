@@ -3,6 +3,7 @@ package limiter
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/eko/gocache/lib/v4/cache"
@@ -25,7 +26,7 @@ type GlobalDeviceChecker struct {
 	expiry int64 // second
 }
 
-// NewGlobalDeviceChecker 未启用全局限制时返回 nil；nil 检查器的 Allow 恒放行。
+// NewGlobalDeviceChecker 未启用全局限制时返回 nil；nil 检查器的 Allow / Refresh 恒放行。
 func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecker {
 	if config == nil || !config.Enable {
 		return nil
@@ -63,7 +64,7 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 }
 
 // Allow 判定 uid 的 ip 是否允许在线（全局口径）。
-// 已在线 IP 刷新活跃时间并放行；新 IP 在名额未满时登记放行，超限拒绝。
+// 已在线 IP 刷新活跃时间并放行；新 IP 在名额未满时登记放行，超限则踢最旧 IP 后放行。
 func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int) bool {
 	if g == nil || deviceLimit <= 0 {
 		return true
@@ -94,8 +95,14 @@ func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int) bool {
 	}
 
 	lastSeen, online := (*ipMap)[ip]
-	if !online && len(*ipMap) >= deviceLimit {
-		return false
+	if !online {
+		for len(*ipMap) >= deviceLimit {
+			oldestIP, ok := evictOldestGlobalIP(*ipMap)
+			if !ok {
+				return false
+			}
+			NoteDeviceKick(uid, oldestIP)
+		}
 	}
 
 	// 新 IP 立即登记；已在线 IP 节流刷新，避免高频写缓存
@@ -104,6 +111,61 @@ func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int) bool {
 		go g.push(uniqueKey, ipMap)
 	}
 	return true
+}
+
+// Refresh 仅续期已在全局名额中的 IP；若已被挤出则返回 false，禁止踢人抢回。
+func (g *GlobalDeviceChecker) Refresh(uid int, ip string, deviceLimit int) bool {
+	if g == nil || deviceLimit <= 0 {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(g.config.Timeout)*time.Second)
+	defer cancel()
+
+	uniqueKey := fmt.Sprintf("UID|%d", uid)
+	now := time.Now().Unix()
+
+	v, err := g.store.Get(ctx, uniqueKey, new(map[string]int64))
+	if err != nil {
+		if _, ok := err.(*store.NotFound); ok {
+			return false
+		}
+		errors.LogErrorInner(context.Background(), err, "cache service")
+		return true
+	}
+
+	ipMap := v.(*map[string]int64)
+	for k, lastSeen := range *ipMap {
+		if now-lastSeen > g.expiry {
+			delete(*ipMap, k)
+		}
+	}
+
+	lastSeen, online := (*ipMap)[ip]
+	if !online {
+		return false
+	}
+	if now-lastSeen >= onlineTouchSec {
+		(*ipMap)[ip] = now
+		go g.push(uniqueKey, ipMap)
+	}
+	return true
+}
+
+func evictOldestGlobalIP(ipMap map[string]int64) (string, bool) {
+	oldestIP := ""
+	oldestSeen := int64(math.MaxInt64)
+	for ip, lastSeen := range ipMap {
+		if lastSeen < oldestSeen {
+			oldestSeen = lastSeen
+			oldestIP = ip
+		}
+	}
+	if oldestIP == "" {
+		return "", false
+	}
+	delete(ipMap, oldestIP)
+	return oldestIP, true
 }
 
 func (g *GlobalDeviceChecker) push(uniqueKey string, ipMap *map[string]int64) {

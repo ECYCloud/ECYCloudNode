@@ -457,6 +457,29 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 	return nil
 }
 
+// ReportKickedUsers reports IPs kicked due to device limit exceeded.
+func (c *APIClient) ReportKickedUsers(kickedUserList *[]api.OnlineUser) error {
+	if kickedUserList == nil || len(*kickedUserList) == 0 {
+		return nil
+	}
+
+	data := make([]OnlineUser, len(*kickedUserList))
+	for i, user := range *kickedUserList {
+		data[i] = OnlineUser{UID: user.UID, IP: user.IP}
+	}
+	postData := &PostData{Data: data}
+	path := "/mod_mu/users/ipkick"
+	res, err := c.client.R().
+		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
+		SetBody(postData).
+		SetResult(&Response{}).
+		ForceContentType("application/json").
+		Post(path)
+
+	_, err = c.parseResponse(res, path, err)
+	return err
+}
+
 // ReportUserTraffic reports the user traffic
 func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
 
@@ -928,23 +951,17 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 			deviceLimit = user.DeviceLimit
 		}
 
-		// If there is still device available, add the user
+		// 超限时由节点本地/Redis 踢最旧 IP，不再因全局已满而跳过下发用户。
 		if deviceLimit > 0 && user.AliveIP > 0 {
 			lastOnline := 0
 			if v, ok := c.LastReportOnline[user.ID]; ok {
 				lastOnline = v
 			}
-			// If there are any available device.
 			if localDeviceLimit = deviceLimit - user.AliveIP + lastOnline; localDeviceLimit > 0 {
 				deviceLimit = localDeviceLimit
-				// If this backend server has reported any user in the last reporting period.
 			} else if lastOnline > 0 {
 				deviceLimit = lastOnline
-			} else if user.AliveIP > deviceLimit {
-				// 全局在线 IP 确实超过限额，且本节点未持有名额，不下发该用户
-				continue
 			}
-			// else: alive_ip 未超限但本节点暂无在线（可能为陈旧统计），仍下发用户，由节点本地+Redis 判限
 		}
 
 		if c.SpeedLimit > 0 {

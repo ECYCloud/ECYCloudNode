@@ -353,6 +353,11 @@ func (h *Hysteria2Service) userMonitor() error {
 	if err = h.apiClient.ReportNodeOnlineUsers(&onlineUsers); err != nil {
 		h.logger.Print(err)
 	}
+	if kicks := limiter.TakeDeviceKicks(); len(kicks) > 0 {
+		if err = h.apiClient.ReportKickedUsers(&kicks); err != nil {
+			h.logger.Print(err)
+		}
+	}
 
 	// Report Illegal user
 	if h.rules != nil {

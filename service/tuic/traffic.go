@@ -150,24 +150,16 @@ func (s *TuicService) allowConnection(uuid, ip string) bool {
 		s.ipLastActive[uuid] = activeMap
 	}
 
-	fresh := limiter.PurgeStaleDeviceIPs(ips, activeMap, limiter.OnlineIPExpiry)
-
-	if _, exists := ips[host]; !exists {
-		if user.DeviceLimit > 0 && fresh >= user.DeviceLimit {
-			s.mu.Unlock()
-			s.logger.WithFields(log.Fields{
-				"uid":         user.UID,
-				"deviceLimit": user.DeviceLimit,
-				"remote":      ip,
-			}).Warn("TUIC user exceeded device limit")
-			return false
-		}
-		ips[host] = struct{}{}
-	}
-
-	// Update last active time for this IP
-	activeMap[host] = time.Now()
+	allowed := limiter.AdmitDeviceIP(ips, activeMap, host, user.UID, user.DeviceLimit)
 	s.mu.Unlock()
+	if !allowed {
+		s.logger.WithFields(log.Fields{
+			"uid":         user.UID,
+			"deviceLimit": user.DeviceLimit,
+			"remote":      ip,
+		}).Warn("TUIC user exceeded device limit")
+		return false
+	}
 
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
 	if !s.globalChecker.Allow(user.UID, host, user.DeviceLimit) {
@@ -208,23 +200,16 @@ func (s *TuicService) updateOnlineIP(uuid string, addr net.Addr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Re-add IP to onlineIPs (in case it was cleared by collectUsage)
 	if ipSet, exists := s.onlineIPs[uuid]; exists {
-		ipSet[host] = struct{}{}
-	} else {
-		s.onlineIPs[uuid] = map[string]struct{}{host: {}}
-	}
-
-	// Update last active time
-	if activeMap, exists := s.ipLastActive[uuid]; exists {
-		activeMap[host] = time.Now()
-	} else {
-		s.ipLastActive[uuid] = map[string]time.Time{host: time.Now()}
+		if _, online := ipSet[host]; online {
+			if activeMap, ok := s.ipLastActive[uuid]; ok {
+				activeMap[host] = time.Now()
+			}
+		}
 	}
 }
 
-// updateOnlineIPSimple re-adds an IP (already parsed) to the onlineIPs map.
-// This is used for UDP connections where the host is already extracted.
+// updateOnlineIPSimple 仅刷新仍持有名额的 IP（UDP 路径，host 已解析）。
 func (s *TuicService) updateOnlineIPSimple(uuid, host string) {
 	if host == "" || uuid == "" {
 		return
@@ -233,18 +218,12 @@ func (s *TuicService) updateOnlineIPSimple(uuid, host string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Re-add IP to onlineIPs (in case it was cleared by collectUsage)
 	if ipSet, exists := s.onlineIPs[uuid]; exists {
-		ipSet[host] = struct{}{}
-	} else {
-		s.onlineIPs[uuid] = map[string]struct{}{host: {}}
-	}
-
-	// Update last active time
-	if activeMap, exists := s.ipLastActive[uuid]; exists {
-		activeMap[host] = time.Now()
-	} else {
-		s.ipLastActive[uuid] = map[string]time.Time{host: time.Now()}
+		if _, online := ipSet[host]; online {
+			if activeMap, ok := s.ipLastActive[uuid]; ok {
+				activeMap[host] = time.Now()
+			}
+		}
 	}
 }
 
@@ -400,6 +379,11 @@ func (s *TuicService) userMonitor() error {
 	}
 	if err = s.apiClient.ReportNodeOnlineUsers(&onlineUsers); err != nil {
 		s.logger.Print(err)
+	}
+	if kicks := limiter.TakeDeviceKicks(); len(kicks) > 0 {
+		if err = s.apiClient.ReportKickedUsers(&kicks); err != nil {
+			s.logger.Print(err)
+		}
 	}
 
 	// Report Illegal user

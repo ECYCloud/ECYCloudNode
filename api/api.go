@@ -16,6 +16,8 @@ type API interface {
 	GetUserList() (userList *[]UserInfo, err error)
 	ReportNodeStatus(nodeStatus *NodeStatus) (err error)
 	ReportNodeOnlineUsers(onlineUser *[]OnlineUser) (err error)
+	// ReportKickedUsers 上报因在线 IP 超限被踢下线的 IP，供面板通知官方客户端。
+	ReportKickedUsers(kickedUser *[]OnlineUser) (err error)
 	ReportUserTraffic(userTraffic *[]UserTraffic) (err error)
 	Describe() ClientInfo
 	GetNodeRule() (ruleList *[]DetectRule, err error)

@@ -793,6 +793,11 @@ func (c *Controller) userInfoMonitor() (err error) {
 				sample.IP,
 			)
 		}
+		if kicks := limiter.TakeDeviceKicks(); len(kicks) > 0 {
+			if err = c.apiClient.ReportKickedUsers(&kicks); err != nil {
+				c.logger.Print(err)
+			}
+		}
 	}
 
 	// Report Illegal user

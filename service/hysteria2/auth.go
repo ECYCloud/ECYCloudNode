@@ -55,25 +55,16 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		a.svc.ipLastActive[auth] = activeMap
 	}
 
-	fresh := limiter.PurgeStaleDeviceIPs(ipSet, activeMap, limiter.OnlineIPExpiry)
-
-	if _, exists := ipSet[host]; !exists {
-		// New device
-		if user.DeviceLimit > 0 && fresh >= user.DeviceLimit {
-			a.svc.mu.Unlock()
-			logger.WithFields(log.Fields{
-				"uid":         user.UID,
-				"deviceLimit": user.DeviceLimit,
-				"remote":      host,
-			}).Warn("Hysteria2 user exceeded device limit")
-			return false, ""
-		}
-		ipSet[host] = struct{}{}
-	}
-
-	// Update last active time for this IP
-	activeMap[host] = time.Now()
+	allowed := limiter.AdmitDeviceIP(ipSet, activeMap, host, user.UID, user.DeviceLimit)
 	a.svc.mu.Unlock()
+	if !allowed {
+		logger.WithFields(log.Fields{
+			"uid":         user.UID,
+			"deviceLimit": user.DeviceLimit,
+			"remote":      host,
+		}).Warn("Hysteria2 user exceeded device limit")
+		return false, ""
+	}
 
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
 	if !a.svc.globalChecker.Allow(user.UID, host, user.DeviceLimit) {
