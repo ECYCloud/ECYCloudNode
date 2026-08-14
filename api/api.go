@@ -20,6 +20,8 @@ type API interface {
 	ReportNodeOnlineUsers(onlineUser *[]OnlineUser) (err error)
 	// ReportKickedUsers 上报因在线 IP 超限被踢下线的 IP，供面板通知官方客户端。
 	ReportKickedUsers(kickedUser *[]OnlineUser) (err error)
+	// ConsumeIpReclaim 消耗官方客户端确认：仅该出口 IP 可踢最旧在线 IP。
+	ConsumeIpReclaim(uid int, ip string) (ok bool, err error)
 	ReportUserTraffic(userTraffic *[]UserTraffic) (err error)
 	Describe() ClientInfo
 	GetNodeRule() (ruleList *[]DetectRule, err error)

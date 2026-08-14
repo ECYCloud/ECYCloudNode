@@ -188,13 +188,14 @@ func (l *Limiter) GetUserBucket(tag string, userKey string, ip string) (limiter 
 	return nil, false, false
 }
 
-// admitIP 登记/刷新用户的在线 IP；名额满时踢最旧 IP 后放行新 IP。
-// 已在线 IP 刷新活跃时间放行；新 IP 在清理过期条目后按剩余名额判定，不足则挤出最旧。
+// admitIP 登记/刷新用户的在线 IP；名额满时须有官方客户端确认才踢最旧 IP。
+// 已在线 IP 刷新活跃时间放行；新 IP 在清理过期条目后按剩余名额判定，不足则拒绝。
 func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int) bool {
 	now := time.Now().Unix()
 	v, _ := inboundInfo.UserOnlineIP.LoadOrStore(userKey, new(sync.Map))
 	ipMap := v.(*sync.Map)
 
+	granted := false
 	if _, online := ipMap.Load(ip); online {
 		ipMap.Store(ip, onlineEntry{UID: uid, LastSeen: now})
 	} else {
@@ -207,26 +208,35 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 			}
 			return true
 		})
-		for deviceLimit > 0 && counter >= deviceLimit {
-			oldestIP, ok := evictOldestOnlineIP(ipMap, now)
-			if !ok {
+		if deviceLimit > 0 && counter >= deviceLimit {
+			if _, ok := peekOldestOnlineIP(ipMap, now); !ok {
 				return false
 			}
-			NoteDeviceKick(uid, oldestIP)
-			counter--
+			if !ConsumeReclaimGrant(uid, ip) {
+				return false
+			}
+			granted = true
+			for deviceLimit > 0 && counter >= deviceLimit {
+				oldestIP, ok := evictOldestOnlineIP(ipMap, now)
+				if !ok {
+					return false
+				}
+				NoteDeviceKick(uid, oldestIP)
+				counter--
+			}
 		}
 		ipMap.Store(ip, onlineEntry{UID: uid, LastSeen: now})
 	}
 
 	// 全局（跨节点）限制
-	if !inboundInfo.GlobalLimit.Allow(uid, ip, deviceLimit) {
+	if !inboundInfo.GlobalLimit.Allow(uid, ip, deviceLimit, granted) {
 		ipMap.Delete(ip)
 		return false
 	}
 	return true
 }
 
-func evictOldestOnlineIP(ipMap *sync.Map, now int64) (string, bool) {
+func peekOldestOnlineIP(ipMap *sync.Map, now int64) (string, bool) {
 	oldestIP := ""
 	oldestSeen := int64(math.MaxInt64)
 	expiry := int64(OnlineIPExpiry / time.Second)
@@ -242,6 +252,14 @@ func evictOldestOnlineIP(ipMap *sync.Map, now int64) (string, bool) {
 		return true
 	})
 	if oldestIP == "" {
+		return "", false
+	}
+	return oldestIP, true
+}
+
+func evictOldestOnlineIP(ipMap *sync.Map, now int64) (string, bool) {
+	oldestIP, ok := peekOldestOnlineIP(ipMap, now)
+	if !ok {
 		return "", false
 	}
 	ipMap.Delete(oldestIP)

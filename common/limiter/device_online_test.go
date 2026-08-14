@@ -9,6 +9,15 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/api"
 )
 
+func TestNormalizeClientIP(t *testing.T) {
+	if got := NormalizeClientIP("::ffff:1.2.3.4"); got != "1.2.3.4" {
+		t.Fatalf("mapped=%q", got)
+	}
+	if got := NormalizeClientIP("1.2.3.4, 10.0.0.1"); got != "1.2.3.4" {
+		t.Fatalf("xff=%q", got)
+	}
+}
+
 func TestPurgeStaleDeviceIPs(t *testing.T) {
 	ips := map[string]struct{}{"1.1.1.1": {}, "2.2.2.2": {}}
 	active := map[string]time.Time{
@@ -24,7 +33,35 @@ func TestPurgeStaleDeviceIPs(t *testing.T) {
 	}
 }
 
+func setupReclaim(t *testing.T, allow bool) {
+	t.Helper()
+	if allow {
+		SetReclaimConsumer(func(int, string) bool { return true })
+	} else {
+		SetReclaimConsumer(nil)
+	}
+	t.Cleanup(func() { SetReclaimConsumer(nil) })
+}
+
+func TestRejectNewWhenLimitFullWithoutGrant(t *testing.T) {
+	setupReclaim(t, false)
+	l, key := newTestLimiter(t, 1)
+	if _, _, reject := l.GetUserBucket("node", key, "1.1.1.1"); reject {
+		t.Fatal("A should be admitted")
+	}
+	if _, _, reject := l.GetUserBucket("node", key, "2.2.2.2"); !reject {
+		t.Fatal("B should be rejected without reclaim grant")
+	}
+	if !l.EnsureOnline("node", key, "1.1.1.1") {
+		t.Fatal("A should remain online")
+	}
+	if kicks := TakeDeviceKicks(); len(kicks) != 0 {
+		t.Fatalf("reject must not kick, got %v", kicks)
+	}
+}
+
 func TestKickOldestWhenLimitFull(t *testing.T) {
+	setupReclaim(t, true)
 	l, key := newTestLimiter(t, 1)
 	if _, _, reject := l.GetUserBucket("node", key, "1.1.1.1"); reject {
 		t.Fatal("A should be admitted")
@@ -45,6 +82,7 @@ func TestKickOldestWhenLimitFull(t *testing.T) {
 }
 
 func TestKickOldestByLastSeen(t *testing.T) {
+	setupReclaim(t, true)
 	l, key := newTestLimiter(t, 2)
 	if _, _, reject := l.GetUserBucket("node", key, "1.1.1.1"); reject {
 		t.Fatal("A should be admitted")
@@ -82,6 +120,7 @@ func TestStaleIPReleasesSlotForNewIP(t *testing.T) {
 }
 
 func TestEnsureOnlineDoesNotReadmitKickedIP(t *testing.T) {
+	setupReclaim(t, true)
 	l, key := newTestLimiter(t, 1)
 	if _, _, reject := l.GetUserBucket("node", key, "1.1.1.1"); reject {
 		t.Fatal("A should be admitted")

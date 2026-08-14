@@ -150,7 +150,7 @@ func (s *TuicService) allowConnection(uuid, ip string) bool {
 		s.ipLastActive[uuid] = activeMap
 	}
 
-	allowed := limiter.AdmitDeviceIP(ips, activeMap, host, user.UID, user.DeviceLimit)
+	allowed, granted := limiter.AdmitDeviceIP(ips, activeMap, host, user.UID, user.DeviceLimit)
 	s.mu.Unlock()
 	if !allowed {
 		s.logger.WithFields(log.Fields{
@@ -162,7 +162,7 @@ func (s *TuicService) allowConnection(uuid, ip string) bool {
 	}
 
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if !s.globalChecker.Allow(user.UID, host, user.DeviceLimit) {
+	if !s.globalChecker.Allow(user.UID, host, user.DeviceLimit, granted) {
 		s.mu.Lock()
 		delete(s.onlineIPs[uuid], host)
 		if am, ok := s.ipLastActive[uuid]; ok {

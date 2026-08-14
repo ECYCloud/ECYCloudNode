@@ -2,6 +2,7 @@ package sspanel
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -505,6 +506,36 @@ func (c *APIClient) ReportKickedUsers(kickedUserList *[]api.OnlineUser) error {
 
 	_, err = c.parseResponse(res, path, err)
 	return err
+}
+
+func (c *APIClient) ConsumeIpReclaim(uid int, ip string) (bool, error) {
+	if uid <= 0 || ip == "" {
+		return false, nil
+	}
+
+	path := "/mod_mu/users/ipreclaim"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	res, err := c.trafficClient.R().
+		SetContext(ctx).
+		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
+		SetBody(&PostData{Data: map[string]interface{}{"user_id": uid, "ip": ip}}).
+		SetResult(&Response{}).
+		ForceContentType("application/json").
+		Post(path)
+
+	response, err := c.parseResponse(res, path, err)
+	if err != nil {
+		return false, err
+	}
+
+	var payload struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal(response.Data, &payload); err != nil {
+		return false, fmt.Errorf("unmarshal ipreclaim failed: %s", err)
+	}
+	return payload.OK, nil
 }
 
 // ReportUserTraffic reports the user traffic

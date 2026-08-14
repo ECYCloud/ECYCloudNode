@@ -19,25 +19,35 @@ func PurgeStaleDeviceIPs(onlineIPs map[string]struct{}, activeMap map[string]tim
 	return fresh
 }
 
-// AdmitDeviceIP 在协议侧本地在线表登记 IP；名额满时踢最旧活跃 IP。
-func AdmitDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time, ip string, uid, deviceLimit int) bool {
+// AdmitDeviceIP 在协议侧本地在线表登记 IP；名额满时须有官方客户端确认才踢最旧活跃 IP。
+// 第二个返回值表示本次已消耗确认，供全局限制复用，避免再查一次授权。
+func AdmitDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time, ip string, uid, deviceLimit int) (allowed bool, granted bool) {
 	if ip == "" {
-		return false
+		return false, false
 	}
 	fresh := PurgeStaleDeviceIPs(onlineIPs, activeMap, OnlineIPExpiry)
 	if _, exists := onlineIPs[ip]; exists {
 		activeMap[ip] = time.Now()
-		return true
+		return true, false
 	}
-	for deviceLimit > 0 && fresh >= deviceLimit {
-		evicted, ok := EvictOldestDeviceIP(onlineIPs, activeMap)
-		if !ok {
-			return false
+	if deviceLimit > 0 && fresh >= deviceLimit {
+		if _, ok := peekOldestDeviceIP(activeMap); !ok {
+			return false, false
 		}
-		NoteDeviceKick(uid, evicted)
-		fresh--
+		if !ConsumeReclaimGrant(uid, ip) {
+			return false, false
+		}
+		granted = true
+		for deviceLimit > 0 && fresh >= deviceLimit {
+			evicted, ok := EvictOldestDeviceIP(onlineIPs, activeMap)
+			if !ok {
+				return false, false
+			}
+			NoteDeviceKick(uid, evicted)
+			fresh--
+		}
 	}
 	onlineIPs[ip] = struct{}{}
 	activeMap[ip] = time.Now()
-	return true
+	return true, granted
 }

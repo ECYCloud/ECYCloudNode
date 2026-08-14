@@ -64,8 +64,8 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 }
 
 // Allow 判定 uid 的 ip 是否允许在线（全局口径）。
-// 已在线 IP 刷新活跃时间并放行；新 IP 在名额未满时登记放行，超限则踢最旧 IP 后放行。
-func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int) bool {
+// 已在线 IP 刷新活跃时间并放行；新 IP 在名额未满时登记放行，超限须已有官方确认才踢最旧。
+func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int, granted bool) bool {
 	if g == nil || deviceLimit <= 0 {
 		return true
 	}
@@ -95,7 +95,13 @@ func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int) bool {
 	}
 
 	lastSeen, online := (*ipMap)[ip]
-	if !online {
+	if !online && len(*ipMap) >= deviceLimit {
+		if _, ok := peekOldestGlobalIP(*ipMap); !ok {
+			return false
+		}
+		if !granted && !ConsumeReclaimGrant(uid, ip) {
+			return false
+		}
 		for len(*ipMap) >= deviceLimit {
 			oldestIP, ok := evictOldestGlobalIP(*ipMap)
 			if !ok {
@@ -152,7 +158,7 @@ func (g *GlobalDeviceChecker) Refresh(uid int, ip string, deviceLimit int) bool 
 	return true
 }
 
-func evictOldestGlobalIP(ipMap map[string]int64) (string, bool) {
+func peekOldestGlobalIP(ipMap map[string]int64) (string, bool) {
 	oldestIP := ""
 	oldestSeen := int64(math.MaxInt64)
 	for ip, lastSeen := range ipMap {
@@ -162,6 +168,14 @@ func evictOldestGlobalIP(ipMap map[string]int64) (string, bool) {
 		}
 	}
 	if oldestIP == "" {
+		return "", false
+	}
+	return oldestIP, true
+}
+
+func evictOldestGlobalIP(ipMap map[string]int64) (string, bool) {
+	oldestIP, ok := peekOldestGlobalIP(ipMap)
+	if !ok {
 		return "", false
 	}
 	delete(ipMap, oldestIP)

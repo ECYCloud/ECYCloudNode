@@ -29,8 +29,7 @@ func TakeDeviceKicks() []api.OnlineUser {
 	return out
 }
 
-// EvictOldestDeviceIP 从 activeMap 中移除最旧活跃 IP，同步清理 onlineIPs，返回被踢 IP。
-func EvictOldestDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time) (string, bool) {
+func peekOldestDeviceIP(activeMap map[string]time.Time) (string, bool) {
 	if len(activeMap) == 0 {
 		return "", false
 	}
@@ -45,6 +44,15 @@ func EvictOldestDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]tim
 		}
 	}
 	if oldestIP == "" {
+		return "", false
+	}
+	return oldestIP, true
+}
+
+// EvictOldestDeviceIP 从 activeMap 中移除最旧活跃 IP，同步清理 onlineIPs，返回被踢 IP。
+func EvictOldestDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time) (string, bool) {
+	oldestIP, ok := peekOldestDeviceIP(activeMap)
+	if !ok {
 		return "", false
 	}
 	delete(activeMap, oldestIP)

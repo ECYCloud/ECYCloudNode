@@ -21,8 +21,9 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/api/sspanel"
 	"github.com/ECYCloud/ECYCloudNode/app/mydispatcher"
 	_ "github.com/ECYCloud/ECYCloudNode/cmd/distro/all"
-	"github.com/ECYCloud/ECYCloudNode/common/unlockcheck"
+	"github.com/ECYCloud/ECYCloudNode/common/limiter"
 	"github.com/ECYCloud/ECYCloudNode/common/mylego"
+	"github.com/ECYCloud/ECYCloudNode/common/unlockcheck"
 	"github.com/ECYCloud/ECYCloudNode/service"
 	"github.com/ECYCloud/ECYCloudNode/service/anytls"
 	"github.com/ECYCloud/ECYCloudNode/service/controller"
@@ -328,6 +329,15 @@ func (p *Panel) Start() {
 		default:
 			log.Panicf("Unsupport panel type: %s", nodeConfig.PanelType)
 		}
+
+		limiter.SetReclaimConsumer(func(uid int, ip string) bool {
+			ok, err := apiClient.ConsumeIpReclaim(uid, ip)
+			if err != nil {
+				log.Warnf("ConsumeIpReclaim uid=%d ip=%s: %v", uid, ip, err)
+				return false
+			}
+			return ok
+		})
 
 		// Register service for this node
 		controllerConfig := getDefaultControllerConfig()
