@@ -17,7 +17,7 @@ require (
 	github.com/pires/go-proxyproto v0.15.0
 	github.com/r3labs/diff/v2 v2.15.1
 	github.com/redis/go-redis/v9 v9.22.0
-	github.com/sagernet/sing v0.8.12
+	github.com/sagernet/sing v0.8.13
 	github.com/sagernet/sing-box v1.13.18
 	github.com/sagernet/sing-shadowsocks v0.2.9
 	github.com/shirou/gopsutil/v3 v3.24.5
