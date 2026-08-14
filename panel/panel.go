@@ -314,6 +314,17 @@ func (p *Panel) Start() {
 		switch nodeConfig.PanelType {
 		case "SSPanel":
 			apiClient = sspanel.New(nodeConfig.ApiConfig)
+			if webAPI, err := apiClient.GetWebAPIConfig(); err != nil {
+				log.Warnf("Failed to get webapi config from panel: %v", err)
+			} else if webAPI != nil && nodeConfig.ApiConfig != nil {
+				newHost := strings.TrimSpace(webAPI.APIHost)
+				oldHost := strings.TrimSpace(nodeConfig.ApiConfig.APIHost)
+				if newHost != "" && strings.TrimRight(newHost, "/") != strings.TrimRight(oldHost, "/") {
+					log.Infof("ApiHost updated from panel: %s -> %s", oldHost, newHost)
+					nodeConfig.ApiConfig.APIHost = newHost
+					apiClient = sspanel.New(nodeConfig.ApiConfig)
+				}
+			}
 		default:
 			log.Panicf("Unsupport panel type: %s", nodeConfig.PanelType)
 		}

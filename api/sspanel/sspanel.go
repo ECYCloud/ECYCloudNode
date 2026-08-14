@@ -350,6 +350,33 @@ func (c *APIClient) GetGlobalLimitConfig() (*api.GlobalLimitConfig, error) {
 	return cfg, nil
 }
 
+// GetWebAPIConfig fetches the current panel API host (设置中心「订阅域名」)
+// via /mod_mu/nodes/config with type = webapi.
+func (c *APIClient) GetWebAPIConfig() (*api.WebAPIConfig, error) {
+	path := "/mod_mu/nodes/config"
+	payload := map[string]string{
+		"type": "webapi",
+	}
+
+	res, err := c.client.R().
+		SetBody(payload).
+		SetResult(&Response{}).
+		ForceContentType("application/json").
+		Post(path)
+
+	response, err := c.parseResponse(res, path, err)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := new(api.WebAPIConfig)
+	if err := json.Unmarshal(response.Data, cfg); err != nil {
+		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(cfg), err)
+	}
+
+	return cfg, nil
+}
+
 // GetUserList will pull user form ssPanel
 func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	path := "/mod_mu/users"

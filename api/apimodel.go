@@ -139,6 +139,11 @@ type GlobalLimitConfig struct {
 	RedisPassword string `json:"redis_password"`
 }
 
+// WebAPIConfig is the panel-managed API host (设置中心「订阅域名」subUrl).
+type WebAPIConfig struct {
+	APIHost string `json:"api_host"`
+}
+
 type Hysteria2Config struct {
 	Obfs                  string
 	ObfsPassword          string

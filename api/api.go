@@ -13,6 +13,8 @@ type API interface {
 	// GetGlobalLimitConfig returns the panel-managed Redis connection
 	// info (site IP and Redis password) for the global device limit.
 	GetGlobalLimitConfig() (globalLimitConfig *GlobalLimitConfig, err error)
+	// GetWebAPIConfig returns the current panel API host (订阅域名).
+	GetWebAPIConfig() (webAPIConfig *WebAPIConfig, err error)
 	GetUserList() (userList *[]UserInfo, err error)
 	ReportNodeStatus(nodeStatus *NodeStatus) (err error)
 	ReportNodeOnlineUsers(onlineUser *[]OnlineUser) (err error)
