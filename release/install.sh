@@ -223,7 +223,7 @@ EOF
     echo "ECYCloudNode config             - 显示配置文件内容"
     echo "ECYCloudNode install            - 安装 ECYCloudNode"
     echo "ECYCloudNode uninstall          - 卸载 ECYCloudNode"
-    echo "ECYCloudNode version            - 查看 ECYCloudNode 版本"
+    echo "ECYCloudNode version            - 查看 ECYCloudNode 与各内核版本"
     echo "ECYCloudNode unlockcheck         - 节点解锁检测"
     echo "ECYCloudNode enable_firewall    - 开启防火墙"
     echo "ECYCloudNode disable_firewall   - 关闭防火墙"

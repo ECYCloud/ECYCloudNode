@@ -23,13 +23,6 @@ func init() {
 			showVersion()
 		},
 	})
-	rootCmd.AddCommand(&cobra.Command{
-		Use:   "kernels",
-		Short: "Print embedded kernel versions",
-		Run: func(cmd *cobra.Command, args []string) {
-			showKernels()
-		},
-	})
 }
 
 func showVersion() {

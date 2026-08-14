@@ -697,15 +697,6 @@ show_ECYCloudNode_version() {
     fi
 }
 
-show_kernel_version() {
-    echo -e "${green}各内核版本：${plain}"
-    /usr/local/ECYCloudNode/ECYCloudNode kernels
-    echo ""
-    if [[ $# == 0 ]]; then
-        before_show_menu
-    fi
-}
-
 run_unlockcheck() {
     echo -e "${green}正在执行节点解锁检测...${plain}"
     echo ""
@@ -733,7 +724,6 @@ show_usage() {
     echo "ECYCloudNode install            - 安装 ECYCloudNode"
     echo "ECYCloudNode uninstall          - 卸载 ECYCloudNode"
     echo "ECYCloudNode version            - 查看 ECYCloudNode 与各内核版本"
-    echo "ECYCloudNode kernels            - 查看各内核版本"
     echo "ECYCloudNode unlockcheck         - 节点解锁检测"
     echo "ECYCloudNode enable_firewall    - 开启防火墙"
     echo "ECYCloudNode disable_firewall   - 关闭防火墙"
@@ -770,11 +760,10 @@ show_menu() {
  ${green}16.${plain} 关闭防火墙
  ${green}17.${plain} 开启 IPv6
  ${green}18.${plain} 关闭 IPv6
- ${green}19.${plain} 查看各内核版本
  "
  #后续更新可加入上方字符串中
     show_status
-    echo && read -p "请输入选择 [0-19]: " num
+    echo && read -p "请输入选择 [0-18]: " num
 
     case "${num}" in
         0) config
@@ -815,9 +804,7 @@ show_menu() {
         ;;
         18) disable_ipv6
         ;;
-        19) check_install && show_kernel_version
-        ;;
-        *) echo -e "${red}请输入正确的数字 [0-19]${plain}"
+        *) echo -e "${red}请输入正确的数字 [0-18]${plain}"
         ;;
     esac
 }
@@ -848,8 +835,6 @@ if [[ $# > 0 ]]; then
         "uninstall") check_install 0 && uninstall 0
         ;;
         "version") check_install 0 && show_ECYCloudNode_version 0
-        ;;
-        "kernels") check_install 0 && show_kernel_version 0
         ;;
         "update_shell") update_shell
         ;;

@@ -80,7 +80,6 @@ ECYCloudNode update       更新到最新 Release
 ECYCloudNode update x.y.z 更新到指定版本
 ECYCloudNode config       查看配置文件
 ECYCloudNode version      版本与内嵌内核版本
-ECYCloudNode kernels      仅打印内嵌内核版本
 ECYCloudNode uninstall    卸载
 ```
 
