@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/eko/gocache/lib/v4/cache"
@@ -21,15 +22,28 @@ import (
 // 所有指向同一 Redis 的节点共同维护一份用户在线 IP 集合。
 // 供 Xray 系 limiter 与 Hysteria2 / AnyTLS / TUIC 服务共用。
 type GlobalDeviceChecker struct {
-	config *GlobalDeviceLimitConfig
+	config GlobalDeviceLimitConfig
 	store  *marshaler.Marshaler
 	expiry int64 // second
 }
 
+var (
+	globalCheckerMu sync.Mutex
+	globalCheckers  = make(map[GlobalDeviceLimitConfig]*GlobalDeviceChecker)
+)
+
 // NewGlobalDeviceChecker 未启用全局限制时返回 nil；nil 检查器的 Allow / Refresh 恒放行。
+// 配置相同时必须返回同一实例：Redis 客户端的连接池与 cache.NewChain 的后台 goroutine
+// 都没有关闭时机，节点信息每次变化重建就会持续泄漏连接与 goroutine。
 func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecker {
 	if config == nil || !config.Enable {
 		return nil
+	}
+
+	globalCheckerMu.Lock()
+	defer globalCheckerMu.Unlock()
+	if checker, ok := globalCheckers[*config]; ok {
+		return checker
 	}
 
 	expiry := config.Expiry
@@ -56,11 +70,13 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 		cache.New[any](rs),
 	)
 
-	return &GlobalDeviceChecker{
-		config: config,
+	checker := &GlobalDeviceChecker{
+		config: *config,
 		store:  marshaler.New(cacheManager),
 		expiry: int64(expiry),
 	}
+	globalCheckers[*config] = checker
+	return checker
 }
 
 // Allow 判定 uid 的 ip 是否允许在线（全局口径）。

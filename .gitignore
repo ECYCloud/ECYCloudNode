@@ -9,6 +9,9 @@ gen
 *.dylib
 *.test
 *.out
+# 测试代码只在本地保留，不进这个公开仓库
+*_test.go
+testdata/
 go.work
 # 仅忽略仓库根目录本地编译产物，勿用 ECYCloudNode*（会误伤 release/ECYCloudNode.sh|.service）
 /main
