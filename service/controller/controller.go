@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/app/router"
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/task"
@@ -23,10 +23,10 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/api"
 	"github.com/ECYCloud/ECYCloudNode/app/mydispatcher"
 	"github.com/ECYCloud/ECYCloudNode/common/limiter"
-	"github.com/ECYCloud/ECYCloudNode/common/unlockcheck"
 	"github.com/ECYCloud/ECYCloudNode/common/mylego"
 	"github.com/ECYCloud/ECYCloudNode/common/rule"
 	"github.com/ECYCloud/ECYCloudNode/common/serverstatus"
+	"github.com/ECYCloud/ECYCloudNode/common/unlockcheck"
 )
 
 type LimitInfo struct {
@@ -46,7 +46,6 @@ type Controller struct {
 	tasks        []periodicTask
 	limitedUsers map[api.UserInfo]LimitInfo
 	warnedUsers  map[api.UserInfo]int
-	panelType    string
 	ibm          inbound.Manager
 	obm          outbound.Manager
 	stm          stats.Manager
@@ -55,6 +54,12 @@ type Controller struct {
 	dispatcher   *mydispatcher.DefaultDispatcher
 	startAt      time.Time
 	logger       *log.Entry
+	// monitorMu 串行化节点与用户两个周期任务：它们同为独立 goroutine、同一间隔，
+	// 却共同读写 nodeInfo / Tag / userList / limitedUsers 等状态。
+	monitorMu sync.Mutex
+	// rebuildPending 记录「inbound 尚未按 nodeInfo 装好」。面板随后会返回 304，
+	// 届时 newNodeInfo 等于当前缓存，只靠 DeepEqual 判不出重建没走完。
+	rebuildPending bool
 	// Unlock check related fields
 	unlockChecker       *unlockcheck.Checker
 	lastUnlockCheckTime time.Time
@@ -72,7 +77,7 @@ type periodicTask struct {
 }
 
 // New return a Controller service with default parameters.
-func New(server *core.Instance, api api.API, config *Config, panelType string) *Controller {
+func New(server *core.Instance, api api.API, config *Config) *Controller {
 	clientInfo := api.Describe()
 	logger := log.NewEntry(log.StandardLogger()).WithFields(log.Fields{
 		"Host": clientInfo.APIHost,
@@ -104,7 +109,6 @@ func New(server *core.Instance, api api.API, config *Config, panelType string) *
 		server:     server,
 		config:     config,
 		apiClient:  api,
-		panelType:  panelType,
 		ibm:        server.GetFeature(inbound.ManagerType()).(inbound.Manager),
 		obm:        server.GetFeature(outbound.ManagerType()).(outbound.Manager),
 		stm:        server.GetFeature(stats.ManagerType()).(stats.Manager),
@@ -240,19 +244,20 @@ func (c *Controller) Start() error {
 func (c *Controller) Close() error {
 	for i := range c.tasks {
 		if c.tasks[i].Periodic != nil {
+			// 关停途中 panic 会让后续任务、路由规则与 xray core 都来不及释放
 			if err := c.tasks[i].Periodic.Close(); err != nil {
-				c.logger.Panicf("%s periodic task close failed: %s", c.tasks[i].tag, err)
+				c.logger.Errorf("%s periodic task close failed: %s", c.tasks[i].tag, err)
 			}
 		}
 	}
 
-	// Remove VLESS same-node routing rule if it was added
-	if strings.HasPrefix(c.Tag, "VLESS_") && c.router != nil {
-		ruleTag := "vless-same-node-" + c.Tag
+	// Remove the same-node routing rule if it was added
+	if isECYCloudNodeManagedTag(c.Tag) && c.router != nil {
+		ruleTag := sameNodeRuleTag(c.Tag)
 		if err := c.router.RemoveRule(ruleTag); err != nil {
-			c.logger.Warnf("Failed to remove VLESS same-node routing rule %s: %v", ruleTag, err)
+			c.logger.Warnf("Failed to remove same-node routing rule %s: %v", ruleTag, err)
 		} else {
-			c.logger.Infof("Removed VLESS same-node routing rule: %s", ruleTag)
+			c.logger.Infof("Removed same-node routing rule: %s", ruleTag)
 		}
 	}
 
@@ -264,6 +269,9 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
 	}
+
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
 
 	// First fetch Node Info
 	var nodeInfoChanged = true
@@ -326,46 +334,38 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	}
 
 	// If nodeInfo changed
+	nodeInfoChanged = c.rebuildPending || (nodeInfoChanged && !reflect.DeepEqual(c.nodeInfo, newNodeInfo))
 	if nodeInfoChanged {
-		if !reflect.DeepEqual(c.nodeInfo, newNodeInfo) {
-			// Remove old tag
-			oldTag := c.Tag
-			err := c.removeOldTag(oldTag)
-			if err != nil {
-				c.logger.Print(err)
-				return nil
-			}
-			if c.nodeInfo.NodeType == "Shadowsocks-Plugin" {
-				err = c.removeOldTag(fmt.Sprintf("dokodemo-door_%s+1", c.Tag))
-			}
-			if err != nil {
-				c.logger.Print(err)
-				return nil
-			}
-			// Add new tag
-			c.nodeInfo = newNodeInfo
-			c.Tag = c.buildNodeTag()
-			c.logger.Infof("Node info changed, rebuild tag: oldTag=%s newTag=%s NodeID=%d NodeType=%s ListenIP=%s Port=%d",
-				oldTag,
-				c.Tag,
-				c.nodeInfo.NodeID,
-				c.nodeInfo.NodeType,
-				c.config.ListenIP,
-				c.nodeInfo.Port,
-			)
-			err = c.addNewTag(newNodeInfo)
-			if err != nil {
-				c.logger.Print(err)
-				return nil
-			}
-			nodeInfoChanged = true
-			// Remove Old limiter
-			if err = c.DeleteInboundLimiter(oldTag); err != nil {
-				c.logger.Print(err)
-				return nil
-			}
-		} else {
-			nodeInfoChanged = false
+		// 置位要早于摘掉旧 inbound：中途任何一步失败都得让下一轮重来，
+		// 否则节点会停在「没有 inbound」的状态上不再自愈。
+		c.rebuildPending = true
+		// Remove old tag
+		oldTag := c.Tag
+		err := c.removeOldTag(oldTag)
+		if err != nil {
+			c.logger.Print(err)
+			return nil
+		}
+		// Add new tag
+		c.nodeInfo = newNodeInfo
+		c.Tag = c.buildNodeTag()
+		c.logger.Infof("Node info changed, rebuild tag: oldTag=%s newTag=%s NodeID=%d NodeType=%s ListenIP=%s Port=%d",
+			oldTag,
+			c.Tag,
+			c.nodeInfo.NodeID,
+			c.nodeInfo.NodeType,
+			c.config.ListenIP,
+			c.nodeInfo.Port,
+		)
+		err = c.addNewTag(newNodeInfo)
+		if err != nil {
+			c.logger.Print(err)
+			return nil
+		}
+		// Remove Old limiter
+		// 旧 tag 的限速记账清不掉不影响新 inbound 收用户，不能因此中断重建
+		if err = c.DeleteInboundLimiter(oldTag); err != nil {
+			c.logger.Print(err)
 		}
 	}
 
@@ -400,9 +400,10 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			c.logger.Print(err)
 			return nil
 		}
-
+		c.rebuildPending = false
 	} else {
 		var deleted, added []api.UserInfo
+		syncFailed := false
 		if usersChanged {
 			deleted, added = compareUserList(c.userList, newUserInfo)
 			if len(deleted) > 0 {
@@ -413,20 +414,28 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				err := c.removeUsers(deletedEmail, c.Tag)
 				if err != nil {
 					c.logger.Print(err)
+					syncFailed = true
 				}
 			}
 			if len(added) > 0 {
 				err = c.addNewUser(&added, c.nodeInfo)
 				if err != nil {
 					c.logger.Print(err)
+					syncFailed = true
 				}
 				// Update Limiter
 				if err := c.UpdateInboundLimiter(c.Tag, &added); err != nil {
 					c.logger.Print(err)
+					syncFailed = true
 				}
 			}
 		}
 		c.logger.Printf("%d user deleted, %d user added", len(deleted), len(added))
+		if syncFailed {
+			// 不推进缓存：否则这批没落地的增删会被当作已完成，
+			// 下一轮的 compareUserList 再也算不出它们。
+			return nil
+		}
 	}
 	c.userList = newUserInfo
 	return nil
@@ -474,76 +483,34 @@ func (c *Controller) triggerRecovery() {
 	}()
 }
 
+// sameNodeRuleTag 是同节点路由规则的 RuleTag。添加与移除必须用同一个名字，
+// 分散成字面量曾导致 Close 删的规则和 addNewTag 加的规则对不上。
+func sameNodeRuleTag(tag string) string {
+	return "ecycloudnode-same-node-" + tag
+}
+
 func (c *Controller) removeOldTag(oldTag string) (err error) {
-	err = c.removeInbound(oldTag)
-	if err != nil {
+	// 节点信息变化会换 tag，旧规则的 InboundTag 再也匹配不到任何 inbound，
+	// 不摘掉就会随每次重建在路由表里堆积。
+	if c.router != nil {
+		if err := c.router.RemoveRule(sameNodeRuleTag(oldTag)); err != nil {
+			c.logger.Warnf("Failed to remove routing rule for old tag %s: %v", oldTag, err)
+		}
+	}
+	// 重建重试时 handler 可能已被上一次尝试摘掉，xray 对不存在的 tag 返回
+	// ErrNoClue。缺失即视为已移除，否则节点会卡在「inbound 已删、又判定删除
+	// 失败」的状态里永远出不来。
+	if err = c.removeInbound(oldTag); err != nil && !errors.Is(err, common.ErrNoClue) {
 		return err
 	}
-	err = c.removeOutbound(oldTag)
-	if err != nil {
+	if err = c.removeOutbound(oldTag); err != nil && !errors.Is(err, common.ErrNoClue) {
 		return err
 	}
 	return nil
 }
 
 func (c *Controller) addNewTag(newNodeInfo *api.NodeInfo) (err error) {
-	if newNodeInfo.NodeType != "Shadowsocks-Plugin" {
-		inboundConfig, err := InboundBuilder(c.config, newNodeInfo, c.Tag)
-		if err != nil {
-			return err
-		}
-		err = c.addInbound(inboundConfig)
-		if err != nil {
-
-			return err
-		}
-		outBoundConfig, err := OutboundBuilder(c.config, newNodeInfo, c.Tag)
-		if err != nil {
-
-			return err
-		}
-		err = c.addOutbound(outBoundConfig)
-		if err != nil {
-
-			return err
-		}
-
-		// For all ECYCloudNode-managed nodes, add a routing rule to enforce same-node routing.
-		// This ensures the official dispatcher routes traffic directly to the corresponding
-		// outbound without needing post-dispatch correction.
-		// Supported protocols: VLESS, Trojan, Vmess, Shadowsocks
-		if isECYCloudNodeManagedTag(c.Tag) && c.router != nil {
-			routingRule := &router.RoutingRule{
-				InboundTag: []string{c.Tag},
-				TargetTag:  &router.RoutingRule_Tag{Tag: c.Tag},
-				RuleTag:    "ecycloudnode-same-node-" + c.Tag,
-			}
-			// AddRule expects *router.Config, not *router.RoutingRule
-			routerConfig := &router.Config{
-				Rule: []*router.RoutingRule{routingRule},
-			}
-			ruleMsg := serial.ToTypedMessage(routerConfig)
-			// Prepend the rule (shouldAppend=false) so it takes priority
-			if err := c.router.AddRule(ruleMsg, false); err != nil {
-				c.logger.Warnf("Failed to add ECYCloudNode same-node routing rule for %s: %v", c.Tag, err)
-			} else {
-				c.logger.Infof("Added ECYCloudNode same-node routing rule: inboundTag=%s -> outboundTag=%s", c.Tag, c.Tag)
-			}
-		}
-
-	} else {
-		return c.addInboundForSSPlugin(*newNodeInfo)
-	}
-	return nil
-}
-
-func (c *Controller) addInboundForSSPlugin(newNodeInfo api.NodeInfo) (err error) {
-	// Shadowsocks-Plugin require a separate inbound for other TransportProtocol likes: ws, grpc
-	fakeNodeInfo := newNodeInfo
-	fakeNodeInfo.TransportProtocol = "tcp"
-	fakeNodeInfo.EnableTLS = false
-	// Add a regular Shadowsocks inbound and outbound
-	inboundConfig, err := InboundBuilder(c.config, &fakeNodeInfo, c.Tag)
+	inboundConfig, err := InboundBuilder(c.config, newNodeInfo, c.Tag)
 	if err != nil {
 		return err
 	}
@@ -552,7 +519,7 @@ func (c *Controller) addInboundForSSPlugin(newNodeInfo api.NodeInfo) (err error)
 
 		return err
 	}
-	outBoundConfig, err := OutboundBuilder(c.config, &fakeNodeInfo, c.Tag)
+	outBoundConfig, err := OutboundBuilder(c.config, newNodeInfo, c.Tag)
 	if err != nil {
 
 		return err
@@ -562,30 +529,36 @@ func (c *Controller) addInboundForSSPlugin(newNodeInfo api.NodeInfo) (err error)
 
 		return err
 	}
-	// Add an inbound for upper streaming protocol
-	fakeNodeInfo = newNodeInfo
-	fakeNodeInfo.Port++
-	fakeNodeInfo.NodeType = "dokodemo-door"
-	dokodemoTag := fmt.Sprintf("dokodemo-door_%s+1", c.Tag)
-	inboundConfig, err = InboundBuilder(c.config, &fakeNodeInfo, dokodemoTag)
-	if err != nil {
-		return err
-	}
-	err = c.addInbound(inboundConfig)
-	if err != nil {
 
-		return err
+	// For all ECYCloudNode-managed nodes, add a routing rule to enforce same-node routing.
+	// This ensures the official dispatcher routes traffic directly to the corresponding
+	// outbound without needing post-dispatch correction.
+	// Supported protocols: VLESS, Trojan, Vmess, Shadowsocks
+	if isECYCloudNodeManagedTag(c.Tag) && c.router != nil {
+		ruleTag := sameNodeRuleTag(c.Tag)
+		routingRule := &router.RoutingRule{
+			InboundTag: []string{c.Tag},
+			TargetTag:  &router.RoutingRule_Tag{Tag: c.Tag},
+			RuleTag:    ruleTag,
+		}
+		// AddRule expects *router.Config, not *router.RoutingRule
+		routerConfig := &router.Config{
+			Rule: []*router.RoutingRule{routingRule},
+		}
+		ruleMsg := serial.ToTypedMessage(routerConfig)
+		// shouldAppend 必须为 true：xray 的 ReloadRules 在 false 时先清空整张
+		// 路由表，多节点部署下每个节点启动都会抹掉其它节点的规则。同名 RuleTag
+		// 重复添加会被 xray 拒绝，因此先移除再追加。
+		if err := c.router.RemoveRule(ruleTag); err != nil {
+			c.logger.Warnf("Failed to drop stale routing rule %s: %v", ruleTag, err)
+		}
+		if err := c.router.AddRule(ruleMsg, true); err != nil {
+			c.logger.Warnf("Failed to add ECYCloudNode same-node routing rule for %s: %v", c.Tag, err)
+		} else {
+			c.logger.Infof("Added ECYCloudNode same-node routing rule: inboundTag=%s -> outboundTag=%s", c.Tag, c.Tag)
+		}
 	}
-	outBoundConfig, err = OutboundBuilder(c.config, &fakeNodeInfo, dokodemoTag)
-	if err != nil {
 
-		return err
-	}
-	err = c.addOutbound(outBoundConfig)
-	if err != nil {
-
-		return err
-	}
 	return nil
 }
 
@@ -604,8 +577,6 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 		users = c.buildTrojanUser(userInfo)
 	case "Shadowsocks":
 		users = c.buildSSUser(userInfo, nodeInfo.CypherMethod)
-	case "Shadowsocks-Plugin":
-		users = c.buildSSPluginUser(userInfo)
 	default:
 		return fmt.Errorf("unsupported node type: %s", nodeInfo.NodeType)
 	}
@@ -672,6 +643,9 @@ func (c *Controller) userInfoMonitor() (err error) {
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
 	}
+
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
 
 	// Get server status
 	CPU, Mem, Disk, Uptime, err := serverstatus.GetSystemInfo()

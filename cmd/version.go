@@ -12,7 +12,6 @@ var (
 	// version will be overridden by -ldflags "-X" during CI build
 	version  = "dev"
 	codename = "ECYCloudNode"
-	intro    = "A Xray backend that supports many panels"
 )
 
 func init() {
@@ -26,7 +25,7 @@ func init() {
 }
 
 func showVersion() {
-	fmt.Printf("%s %s (%s)\n", codename, version, intro)
+	fmt.Printf("%s %s\n", codename, version)
 	showKernels()
 }
 

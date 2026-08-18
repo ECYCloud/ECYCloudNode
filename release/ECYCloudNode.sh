@@ -356,7 +356,7 @@ install_bbr() {
     echo ""
     echo -e "${green}开始安装 BBR...${plain}"
     # 使用 teddysun 的 BBR 脚本
-    wget -N --no-check-certificate https://raw.githubusercontent.com/teddysun/across/master/bbr.sh && chmod +x bbr.sh && bash bbr.sh
+    wget -N https://raw.githubusercontent.com/teddysun/across/master/bbr.sh && chmod +x bbr.sh && bash bbr.sh
     local bbr_status=$?
     rm -f bbr.sh 2>/dev/null
 
@@ -374,7 +374,7 @@ install_bbr() {
 }
 
 update_shell() {
-    wget -O /usr/bin/ECYCloudNode -N --no-check-certificate https://raw.githubusercontent.com/ECYCloud/ECYCloudNode/main/release/ECYCloudNode.sh
+    wget -O /usr/bin/ECYCloudNode -N https://raw.githubusercontent.com/ECYCloud/ECYCloudNode/main/release/ECYCloudNode.sh
     if [[ $? != 0 ]]; then
         echo ""
         echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"

@@ -3,7 +3,6 @@
 
 package api
 
-// API is the interface for different panel's api.
 type API interface {
 	GetNodeInfo() (nodeInfo *NodeInfo, err error)
 	// GetECYCloudNodeCertConfig returns optional global ECYCloudNode certificate

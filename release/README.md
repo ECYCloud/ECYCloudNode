@@ -2,8 +2,6 @@
 
 本目录为 [ECYCloud/ECYCloudNode](https://github.com/ECYCloud/ECYCloudNode) 主仓库的一部分，提供一键安装脚本、systemd unit 与配置示例。
 
-上游使用教程：[XrayR-doc](https://xrayr-project.github.io/XrayR-doc/)
-
 ## 一键安装
 
 ```
@@ -28,8 +26,7 @@ ConnectionConfig:
   DownlinkOnly: 4 # Time limit when the connection is closed after the uplink is closed, Second
   BufferSize: 64 # The internal cache size of each connection, kB
 Nodes:
-  - PanelType: "SSPanel" # Panel type: SSPanel
-    ApiConfig:
+  - ApiConfig:
       ApiHost: "http://127.0.0.1:667"
       ApiKey: "123"
       NodeID: 41,42,43   # 启动多个节点 41,42,43
@@ -37,7 +34,6 @@ Nodes:
       SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
       DeviceLimit: 0 # Local settings will replace remote settings, 0 means disable
       RuleListPath: # /etc/ECYCloudNode/rulelist Path to local rulelist file
-      DisableCustomConfig: false # disable custom config for sspanel
     ControllerConfig:
       ListenIP: 0.0.0.0 # IP address you want to listen
       SendIP: 0.0.0.0 # IP address you want to send pacakage
@@ -67,8 +63,7 @@ Nodes:
           ProxyProtocolVer: 0 # Send PROXY protocol version, 0 for disable
       # CertConfig is managed by panel and not configured here.
 
-	    #  - PanelType: "SSPanel" # Panel type: SSPanel
-	    #    ApiConfig:
+	    #  - ApiConfig:
 	    #      ApiHost: "http://127.0.0.1:667"
 	    #      ApiKey: "123"
 	    #      NodeID: 41
@@ -76,7 +71,6 @@ Nodes:
 	    #      SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
 	    #      DeviceLimit: 0 # Local settings will replace remote settings, 0 means disable
 	    #      RuleListPath: # /etc/ECYCloudNode/rulelist Path to local rulelist file
-	    #      DisableCustomConfig: false # disable custom config for sspanel
 	    #    ControllerConfig:
 	    #      ListenIP: 0.0.0.0 # IP address you want to listen
 	    #      SendIP: 0.0.0.0 # IP address you want to send pacakage
@@ -110,8 +104,6 @@ Nodes:
 
 * [Project X](https://github.com/XTLS/)
 * [V2Fly](https://github.com/v2fly)
-* [VNet-V2ray](https://github.com/ProxyPanel/VNet-V2ray)
-* [Air-Universe](https://github.com/crossfw/Air-Universe)
 
 ## Licence
 

@@ -23,10 +23,7 @@ import (
 func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.InboundHandlerConfig, error) {
 	inboundDetourConfig := &conf.InboundDetourConfig{}
 	// Build Listen IP address
-	if nodeInfo.NodeType == "Shadowsocks-Plugin" {
-		// Shdowsocks listen in 127.0.0.1 for safety
-		inboundDetourConfig.ListenOn = &conf.Address{Address: net.ParseAddress("127.0.0.1")}
-	} else if config.ListenIP != "" {
+	if config.ListenIP != "" {
 		ipAddress := net.ParseAddress(config.ListenIP)
 		inboundDetourConfig.ListenOn = &conf.Address{Address: ipAddress}
 	}
@@ -103,7 +100,7 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 		} else {
 			proxySetting = &conf.TrojanServerConfig{}
 		}
-	case "Shadowsocks", "Shadowsocks-Plugin":
+	case "Shadowsocks":
 		protocol = "shadowsocks"
 		cipher := strings.ToLower(nodeInfo.CypherMethod)
 
@@ -128,17 +125,8 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 
 		proxySetting.NetworkList = &conf.NetworkList{"tcp", "udp"}
 
-	case "dokodemo-door":
-		protocol = "dokodemo-door"
-		proxySetting = struct {
-			Host        string   `json:"address"`
-			NetworkList []string `json:"network"`
-		}{
-			Host:        "v1.mux.cool",
-			NetworkList: []string{"tcp", "udp"},
-		}
 	default:
-		return nil, fmt.Errorf("unsupported node type: %s, Only support: Vmess, VLESS, Trojan, Shadowsocks, and Shadowsocks-Plugin", nodeInfo.NodeType)
+		return nil, fmt.Errorf("unsupported node type: %s, Only support: Vmess, VLESS, Trojan, and Shadowsocks", nodeInfo.NodeType)
 	}
 
 	setting, err := json.Marshal(proxySetting)
@@ -163,6 +151,16 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 			HeaderConfig:        nodeInfo.Header,
 		}
 		streamSetting.TCPSettings = tcpSetting
+	case "mkcp":
+		// xray 已移除 mKCP 的伪装头与 seed，两者只要非空就会构建失败。
+		// 这里照原样下发，让内核报出移除原因，而不是起一个客户端连不上的 inbound。
+		kcpSetting := &conf.KCPConfig{
+			HeaderConfig: nodeInfo.Header,
+		}
+		if nodeInfo.Seed != "" {
+			kcpSetting.Seed = &nodeInfo.Seed
+		}
+		streamSetting.KCPSettings = kcpSetting
 	case "websocket":
 		headers := make(map[string]string)
 		headers["Host"] = nodeInfo.Host
@@ -176,7 +174,6 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 	case "grpc":
 		grpcSettings := &conf.GRPCConfig{
 			ServiceName: nodeInfo.ServiceName,
-			Authority:   nodeInfo.Authority,
 		}
 		streamSetting.GRPCSettings = grpcSettings
 	case "httpupgrade":

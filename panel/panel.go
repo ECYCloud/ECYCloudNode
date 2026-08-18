@@ -278,7 +278,7 @@ func (p *Panel) Start() {
 			log.Printf("  raw node[%d]: <nil>", i)
 			continue
 		}
-		log.Printf("  raw node[%d]: PanelType=%s, ApiHost=%s, NodeID=%q", i, n.PanelType, n.ApiConfig.APIHost, n.ApiConfig.NodeID)
+		log.Printf("  raw node[%d]: ApiHost=%s, NodeID=%q", i, n.ApiConfig.APIHost, n.ApiConfig.NodeID)
 	}
 
 	// 在启动之前先展开可能包含多个 NodeID 的节点配置；为了避免修改原始配置，
@@ -288,6 +288,7 @@ func (p *Panel) Start() {
 
 	// 预先注册所有节点 ID 用于媒体检测共享
 	// 这必须在任何节点启动之前完成，确保第一个执行检测的节点能为所有节点上报结果
+	unlockcheck.ResetNodeIDs()
 	for _, nodeConfig := range nodes {
 		if nodeConfig == nil || nodeConfig.ApiConfig == nil {
 			continue
@@ -311,23 +312,17 @@ func (p *Panel) Start() {
 
 	// Load Nodes config
 	for _, nodeConfig := range nodes {
-		var apiClient api.API
-		switch nodeConfig.PanelType {
-		case "SSPanel":
-			apiClient = sspanel.New(nodeConfig.ApiConfig)
-			if webAPI, err := apiClient.GetWebAPIConfig(); err != nil {
-				log.Warnf("Failed to get webapi config from panel: %v", err)
-			} else if webAPI != nil && nodeConfig.ApiConfig != nil {
-				newHost := strings.TrimSpace(webAPI.APIHost)
-				oldHost := strings.TrimSpace(nodeConfig.ApiConfig.APIHost)
-				if newHost != "" && strings.TrimRight(newHost, "/") != strings.TrimRight(oldHost, "/") {
-					log.Infof("ApiHost updated from panel: %s -> %s", oldHost, newHost)
-					nodeConfig.ApiConfig.APIHost = newHost
-					apiClient = sspanel.New(nodeConfig.ApiConfig)
-				}
+		apiClient := sspanel.New(nodeConfig.ApiConfig)
+		if webAPI, err := apiClient.GetWebAPIConfig(); err != nil {
+			log.Warnf("Failed to get webapi config from panel: %v", err)
+		} else if webAPI != nil && nodeConfig.ApiConfig != nil {
+			newHost := strings.TrimSpace(webAPI.APIHost)
+			oldHost := strings.TrimSpace(nodeConfig.ApiConfig.APIHost)
+			if newHost != "" && strings.TrimRight(newHost, "/") != strings.TrimRight(oldHost, "/") {
+				log.Infof("ApiHost updated from panel: %s -> %s", oldHost, newHost)
+				nodeConfig.ApiConfig.APIHost = newHost
+				apiClient = sspanel.New(nodeConfig.ApiConfig)
 			}
-		default:
-			log.Panicf("Unsupport panel type: %s", nodeConfig.PanelType)
 		}
 
 		limiter.SetReclaimConsumer(func(uid int, ip string) bool {
@@ -349,9 +344,7 @@ func (p *Panel) Start() {
 		// 证书相关配置改为完全由面板下发和自动推导，不再支持通过
 		// config.yml 的 ControllerConfig.CertConfig 手动填写。为避免旧
 		// 配置产生干扰，这里直接丢弃来自本地配置文件的 CertConfig。
-		if nodeConfig.PanelType == "SSPanel" {
-			controllerConfig.CertConfig = nil
-		}
+		controllerConfig.CertConfig = nil
 
 		var svc service.Service
 		var nodeInfo *api.NodeInfo
@@ -361,33 +354,31 @@ func (p *Panel) Start() {
 		// from config.yml (which is common now that certificate settings are
 		// managed from the panel), allocate a minimal struct on demand and
 		// default CertMode to "dns" so that TLS nodes work out-of-the-box.
-		if nodeConfig.PanelType == "SSPanel" {
-			panelCert, err := apiClient.GetECYCloudNodeCertConfig()
-			if err != nil {
-				log.Warnf("Failed to get ECYCloudNode cert config from panel: %v", err)
-			} else if panelCert != nil {
-				if controllerConfig.CertConfig == nil {
-					controllerConfig.CertConfig = &mylego.CertConfig{}
+		panelCert, err := apiClient.GetECYCloudNodeCertConfig()
+		if err != nil {
+			log.Warnf("Failed to get ECYCloudNode cert config from panel: %v", err)
+		} else if panelCert != nil {
+			if controllerConfig.CertConfig == nil {
+				controllerConfig.CertConfig = &mylego.CertConfig{}
+			}
+			// panel 仅下发 Provider/Email/DNSEnv，不关心 CertMode，若此时
+			// 仍为空则默认使用 DNS-01 ACME（"dns"），避免后续出现
+			// "unsupported certmode: " 之类错误。
+			if controllerConfig.CertConfig.CertMode == "" {
+				controllerConfig.CertConfig.CertMode = "dns"
+			}
+			if panelCert.Provider != "" {
+				controllerConfig.CertConfig.Provider = panelCert.Provider
+			}
+			if panelCert.Email != "" {
+				controllerConfig.CertConfig.Email = panelCert.Email
+			}
+			if len(panelCert.DNSEnv) > 0 {
+				if controllerConfig.CertConfig.DNSEnv == nil {
+					controllerConfig.CertConfig.DNSEnv = make(map[string]string)
 				}
-				// panel 仅下发 Provider/Email/DNSEnv，不关心 CertMode，若此时
-				// 仍为空则默认使用 DNS-01 ACME（"dns"），避免后续出现
-				// "unsupported certmode: " 之类错误。
-				if controllerConfig.CertConfig.CertMode == "" {
-					controllerConfig.CertConfig.CertMode = "dns"
-				}
-				if panelCert.Provider != "" {
-					controllerConfig.CertConfig.Provider = panelCert.Provider
-				}
-				if panelCert.Email != "" {
-					controllerConfig.CertConfig.Email = panelCert.Email
-				}
-				if len(panelCert.DNSEnv) > 0 {
-					if controllerConfig.CertConfig.DNSEnv == nil {
-						controllerConfig.CertConfig.DNSEnv = make(map[string]string)
-					}
-					for k, v := range panelCert.DNSEnv {
-						controllerConfig.CertConfig.DNSEnv[k] = v
-					}
+				for k, v := range panelCert.DNSEnv {
+					controllerConfig.CertConfig.DNSEnv[k] = v
 				}
 			}
 		}
@@ -395,127 +386,119 @@ func (p *Panel) Start() {
 		// 全局设备限制的 Redis 连接信息由面板下发（设置中心-节点相关：
 		// 站点IP、RedisPassword）。config.yml 中 RedisAddr/RedisPassword
 		// 留空时自动读取面板值；本地填写值优先，便于特殊网络拓扑覆盖。
-		if nodeConfig.PanelType == "SSPanel" {
-			if glc := controllerConfig.GlobalDeviceLimitConfig; glc != nil && glc.Enable && (glc.RedisAddr == "" || glc.RedisPassword == "") {
-				panelGlobal, err := apiClient.GetGlobalLimitConfig()
-				if err != nil {
-					log.Warnf("Failed to get global limit config from panel: %v", err)
-				} else if panelGlobal != nil {
-					if glc.RedisAddr == "" && panelGlobal.SiteIP != "" {
-						glc.RedisAddr = panelGlobal.SiteIP + ":6379"
-					}
-					if glc.RedisPassword == "" && panelGlobal.RedisPassword != "" {
-						glc.RedisPassword = panelGlobal.RedisPassword
-					}
+		if glc := controllerConfig.GlobalDeviceLimitConfig; glc != nil && glc.Enable && (glc.RedisAddr == "" || glc.RedisPassword == "") {
+			panelGlobal, err := apiClient.GetGlobalLimitConfig()
+			if err != nil {
+				log.Warnf("Failed to get global limit config from panel: %v", err)
+			} else if panelGlobal != nil {
+				if glc.RedisAddr == "" && panelGlobal.SiteIP != "" {
+					glc.RedisAddr = panelGlobal.SiteIP + ":6379"
 				}
-				if glc.RedisAddr == "" {
-					log.Warn("GlobalDeviceLimitConfig enabled but RedisAddr is empty (config.yml 未填且面板“站点IP”为空), global device limit will not work")
+				if glc.RedisPassword == "" && panelGlobal.RedisPassword != "" {
+					glc.RedisPassword = panelGlobal.RedisPassword
 				}
+			}
+			if glc.RedisAddr == "" {
+				log.Warn("GlobalDeviceLimitConfig enabled but RedisAddr is empty (config.yml 未填且面板“站点IP”为空), global device limit will not work")
 			}
 		}
 
-		// Hysteria2 and AnyTLS are implemented as independent services and
-		// currently only supported for SSPanel.
-		if nodeConfig.PanelType == "SSPanel" {
-			var err error
-			nodeInfo, err = apiClient.GetNodeInfo()
-			if err != nil {
-				// 对于单个节点的拉取失败，不再直接 panic 终止整个进程，而是
-				// 打印错误并跳过该节点，保证其它已正确配置的节点仍然可以正常
-				// 启动和提供服务。
-				apiCfg := nodeConfig.ApiConfig
-				log.Errorf("Get node info failed, skip this node (PanelType=%s, ApiHost=%s, NodeID=%s): %v",
-					nodeConfig.PanelType,
-					func() string {
-						if apiCfg != nil {
-							return apiCfg.APIHost
-						}
-						return ""
-					}(),
-					func() string {
-						if apiCfg != nil {
-							return apiCfg.NodeID
-						}
-						return ""
-					}(),
-					err,
-				)
-				continue
-			}
-
-			// Derive per-node certificate configuration from panel SNI / Host
-			// when TLS is enabled and REALITY is not in use. This allows using
-			// different certificates per node without duplicating config.yml.
-			if nodeInfo != nil && nodeInfo.EnableTLS && !nodeInfo.EnableREALITY {
-				// When CertConfig is missing, create one; if CertMode is still
-				// empty at this point, default it to dns so that DNS-01 ACME is
-				// used by default for TLS nodes.
-				if controllerConfig.CertConfig == nil {
-					controllerConfig.CertConfig = &mylego.CertConfig{}
-				}
-				if controllerConfig.CertConfig.CertMode == "" {
-					controllerConfig.CertConfig.CertMode = "dns"
-				}
-
-				sni := nodeInfo.SNI
-				if sni == "" {
-					// Fallback to Host when SNI is not explicitly provided
-					sni = nodeInfo.Host
-				}
-				if sni != "" {
-					baseCert := *controllerConfig.CertConfig // copy value
-					nodeCert := &baseCert
-
-					switch nodeCert.CertMode {
-					case "file":
-						// When CertFile/KeyFile are not explicitly configured, use a
-						// simple convention based on SNI under /etc/ECYCloudNode/cert.
-						if nodeCert.CertFile == "" && nodeCert.KeyFile == "" {
-							nodeCert.CertDomain = sni
-							nodeCert.CertFile = "/etc/ECYCloudNode/cert/" + sni + ".cert"
-							nodeCert.KeyFile = "/etc/ECYCloudNode/cert/" + sni + ".key"
-						} else if nodeCert.CertDomain == "" {
-							// If a static path is configured but CertDomain is empty,
-							// still record the logical domain for ACME/renewal logs.
-							nodeCert.CertDomain = sni
-						}
-					case "dns", "http", "tls":
-						// For ACME modes, prefer panel SNI as CertDomain when it is
-						// not explicitly specified in config.yml.
-						if nodeCert.CertDomain == "" {
-							nodeCert.CertDomain = sni
-						}
+		nodeInfo, err = apiClient.GetNodeInfo()
+		if err != nil {
+			// 对于单个节点的拉取失败，不再直接 panic 终止整个进程，而是
+			// 打印错误并跳过该节点，保证其它已正确配置的节点仍然可以正常
+			// 启动和提供服务。
+			apiCfg := nodeConfig.ApiConfig
+			log.Errorf("Get node info failed, skip this node (ApiHost=%s, NodeID=%s): %v",
+				func() string {
+					if apiCfg != nil {
+						return apiCfg.APIHost
 					}
+					return ""
+				}(),
+				func() string {
+					if apiCfg != nil {
+						return apiCfg.NodeID
+					}
+					return ""
+				}(),
+				err,
+			)
+			continue
+		}
 
-					controllerConfig.CertConfig = nodeCert
-				}
+		// Derive per-node certificate configuration from panel SNI / Host
+		// when TLS is enabled and REALITY is not in use. This allows using
+		// different certificates per node without duplicating config.yml.
+		if nodeInfo != nil && nodeInfo.EnableTLS && !nodeInfo.EnableREALITY {
+			// When CertConfig is missing, create one; if CertMode is still
+			// empty at this point, default it to dns so that DNS-01 ACME is
+			// used by default for TLS nodes.
+			if controllerConfig.CertConfig == nil {
+				controllerConfig.CertConfig = &mylego.CertConfig{}
+			}
+			if controllerConfig.CertConfig.CertMode == "" {
+				controllerConfig.CertConfig.CertMode = "dns"
 			}
 
-			if nodeInfo != nil {
-				switch nodeInfo.NodeType {
-				case "Hysteria2":
-					// For Hysteria2 we don't use xray-core controller, instead we
-					// start a dedicated Hysteria2 service.
-					serviceConfig := *controllerConfig // shallow copy
-					serviceConfig.CertConfig = controllerConfig.CertConfig
-					svc = hysteria2.New(apiClient, &serviceConfig)
-				case "AnyTLS":
-					// AnyTLS uses a sing-box based independent service.
-					serviceConfig := *controllerConfig // shallow copy
-					serviceConfig.CertConfig = controllerConfig.CertConfig
-					svc = anytls.New(apiClient, &serviceConfig)
-				case "Tuic":
-					// TUIC uses a sing-box based independent service.
-					serviceConfig := *controllerConfig // shallow copy
-					serviceConfig.CertConfig = controllerConfig.CertConfig
-					svc = tuic.New(apiClient, &serviceConfig)
+			sni := nodeInfo.SNI
+			if sni == "" {
+				// Fallback to Host when SNI is not explicitly provided
+				sni = nodeInfo.Host
+			}
+			if sni != "" {
+				baseCert := *controllerConfig.CertConfig // copy value
+				nodeCert := &baseCert
+
+				switch nodeCert.CertMode {
+				case "file":
+					// When CertFile/KeyFile are not explicitly configured, use a
+					// simple convention based on SNI under /etc/ECYCloudNode/cert.
+					if nodeCert.CertFile == "" && nodeCert.KeyFile == "" {
+						nodeCert.CertDomain = sni
+						nodeCert.CertFile = "/etc/ECYCloudNode/cert/" + sni + ".cert"
+						nodeCert.KeyFile = "/etc/ECYCloudNode/cert/" + sni + ".key"
+					} else if nodeCert.CertDomain == "" {
+						// If a static path is configured but CertDomain is empty,
+						// still record the logical domain for ACME/renewal logs.
+						nodeCert.CertDomain = sni
+					}
+				case "dns", "http", "tls":
+					// For ACME modes, prefer panel SNI as CertDomain when it is
+					// not explicitly specified in config.yml.
+					if nodeCert.CertDomain == "" {
+						nodeCert.CertDomain = sni
+					}
 				}
+
+				controllerConfig.CertConfig = nodeCert
+			}
+		}
+
+		if nodeInfo != nil {
+			switch nodeInfo.NodeType {
+			case "Hysteria2":
+				// For Hysteria2 we don't use xray-core controller, instead we
+				// start a dedicated Hysteria2 service.
+				serviceConfig := *controllerConfig // shallow copy
+				serviceConfig.CertConfig = controllerConfig.CertConfig
+				svc = hysteria2.New(apiClient, &serviceConfig)
+			case "AnyTLS":
+				// AnyTLS uses a sing-box based independent service.
+				serviceConfig := *controllerConfig // shallow copy
+				serviceConfig.CertConfig = controllerConfig.CertConfig
+				svc = anytls.New(apiClient, &serviceConfig)
+			case "Tuic":
+				// TUIC uses a sing-box based independent service.
+				serviceConfig := *controllerConfig // shallow copy
+				serviceConfig.CertConfig = controllerConfig.CertConfig
+				svc = tuic.New(apiClient, &serviceConfig)
 			}
 		}
 
 		if svc == nil {
 			// Default behaviour: use the original controller service.
-			svc = controller.New(server, apiClient, controllerConfig, nodeConfig.PanelType)
+			svc = controller.New(server, apiClient, controllerConfig)
 		}
 
 		p.Service = append(p.Service, svc)
@@ -543,13 +526,19 @@ func (p *Panel) Close() {
 	p.access.Lock()
 	defer p.access.Unlock()
 	for _, s := range p.Service {
-		err := s.Close()
-		if err != nil {
-			log.Panicf("Panel Close failed: %s", err)
+		// 单个 service 关闭失败不能中断后续关闭：否则 xray core 与其子
+		// goroutine 会被留下，热重载时新旧实例还会抢同一个端口。
+		if err := s.Close(); err != nil {
+			log.Errorf("Panel Close failed for a service: %s", err)
 		}
 	}
 	p.Service = nil
-	p.Server.Close()
+	// Start() 在 loadCore 失败时会 panic，此时 cmd 的 defer p.Close() 仍会执行，
+	// Server 尚未赋值。
+	if p.Server != nil {
+		p.Server.Close()
+		p.Server = nil
+	}
 	p.Running = false
 	return
 }

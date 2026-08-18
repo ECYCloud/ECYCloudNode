@@ -106,6 +106,18 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 	}
 }
 
+// hasUnbuiltAuthUser 报告是否存在运行中的 inbound 还不认识的凭据。
+func (s *AnyTLSService) hasUnbuiltAuthUser() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, u := range s.authUsers {
+		if _, ok := s.builtAuthUsers[u.Name]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *AnyTLSService) addTraffic(uuid string, up, down int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -350,6 +362,13 @@ func (s *AnyTLSService) userMonitor() error {
 	}
 	if usersChanged {
 		s.syncUsers(newUserInfo)
+		// 被删用户已由 allowConnection 拦住，但新增凭据过不了 sing-box 的认证，
+		// 必须重建 inbound 才能连上。
+		if s.hasUnbuiltAuthUser() {
+			if err := s.reloadNode(s.currentNodeInfo()); err != nil {
+				s.logger.Errorf("AnyTLS rebuild for new users failed: %v", err)
+			}
+		}
 	}
 
 	// Check Rule
@@ -453,7 +472,7 @@ func (s *AnyTLSService) nodeMonitor() error {
 	// Same as TUIC/Hysteria2: protect against noisy panel-side metadata updates
 	// that change the ETag without altering the actual AnyTLS node configuration
 	// by skipping reload when the effective NodeInfo is unchanged.
-	if s.nodeInfo != nil && reflect.DeepEqual(s.nodeInfo, nodeInfo) {
+	if current := s.currentNodeInfo(); current != nil && reflect.DeepEqual(current, nodeInfo) {
 		return nil
 	}
 

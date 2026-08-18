@@ -21,29 +21,36 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/api"
 )
 
-var (
-	firstPortRe  = regexp.MustCompile(`(?m)port=(?P<outport>\d+)#?`) // First Port
-	secondPortRe = regexp.MustCompile(`(?m)port=\d+#(\d+)`)          // Second Port
-	hostRe       = regexp.MustCompile(`(?m)host=([\w.]+)\|?`)        // Host
-)
-
 // APIClient create a api client to the panel.
 type APIClient struct {
-	client              *resty.Client
-	trafficClient       *resty.Client // 流量上报专用，禁用重试避免超时重试导致流量重复提交
-	APIHost             string
-	NodeID              int
-	Key                 string
-	SpeedLimit          float64
-	DeviceLimit         int
-	DisableCustomConfig bool
-	LocalRuleList       []api.DetectRule
-	LastReportOnline    map[int]int
-	access              sync.Mutex
-	version             string
-	eTags               map[string]string
+	client           *resty.Client
+	trafficClient    *resty.Client // 流量上报专用，禁用重试避免超时重试导致流量重复提交
+	APIHost          string
+	NodeID           int
+	Key              string
+	SpeedLimit       float64
+	DeviceLimit      int
+	LocalRuleList    []api.DetectRule
+	LastReportOnline map[int]int
+	access           sync.Mutex
+	// eTags 被节点与用户两个周期任务的 goroutine 共用，必须全程持锁访问：
+	// 裸 map 的并发读写是 Go 运行时 fatal error，recover 拦不住。
+	eTagsMu sync.Mutex
+	eTags   map[string]string
 	// exemptUsers caches the latest exempt user list from the panel
 	exemptUsers []api.ExemptUser
+}
+
+func (c *APIClient) eTag(key string) string {
+	c.eTagsMu.Lock()
+	defer c.eTagsMu.Unlock()
+	return c.eTags[key]
+}
+
+func (c *APIClient) setETag(key, value string) {
+	c.eTagsMu.Lock()
+	defer c.eTagsMu.Unlock()
+	c.eTags[key] = value
 }
 
 // mapSortToNodeType
@@ -132,17 +139,16 @@ func New(apiConfig *api.Config) *APIClient {
 	}
 
 	return &APIClient{
-		client:              client,
-		trafficClient:       trafficClient,
-		NodeID:              nodeID,
-		Key:                 apiConfig.Key,
-		APIHost:             apiConfig.APIHost,
-		SpeedLimit:          apiConfig.SpeedLimit,
-		DeviceLimit:         apiConfig.DeviceLimit,
-		LocalRuleList:       localRuleList,
-		DisableCustomConfig: apiConfig.DisableCustomConfig,
-		LastReportOnline:    make(map[int]int),
-		eTags:               make(map[string]string),
+		client:           client,
+		trafficClient:    trafficClient,
+		NodeID:           nodeID,
+		Key:              apiConfig.Key,
+		APIHost:          apiConfig.APIHost,
+		SpeedLimit:       apiConfig.SpeedLimit,
+		DeviceLimit:      apiConfig.DeviceLimit,
+		LocalRuleList:    localRuleList,
+		LastReportOnline: make(map[int]int),
+		eTags:            make(map[string]string),
 	}
 }
 
@@ -169,9 +175,19 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 
 		// read line by line
 		for fileScanner.Scan() {
+			// 空行编译出的正则匹配一切，会让该规则拒绝全部流量
+			line := strings.TrimSpace(fileScanner.Text())
+			if line == "" {
+				continue
+			}
+			pattern, err := regexp.Compile(line)
+			if err != nil {
+				log.Printf("Invalid local rule pattern %q, skipped: %s", line, err)
+				continue
+			}
 			LocalRuleList = append(LocalRuleList, api.DetectRule{
 				ID:      -1,
-				Pattern: regexp.MustCompile(fileScanner.Text()),
+				Pattern: pattern,
 			})
 		}
 		// handle first encountered error while reading
@@ -221,7 +237,7 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	path := fmt.Sprintf("/mod_mu/nodes/%d/info", c.NodeID)
 	res, err := c.client.R().
 		SetResult(&Response{}).
-		SetHeader("If-None-Match", c.eTags["node"]).
+		SetHeader("If-None-Match", c.eTag("node")).
 		ForceContentType("application/json").
 		Get(path)
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
@@ -229,8 +245,8 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		return nil, errors.New(api.NodeNotModified)
 	}
 
-	if res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["node"] {
-		c.eTags["node"] = res.Header().Get("ETag")
+	if eTag := res.Header().Get("ETag"); eTag != "" {
+		c.setETag("node", eTag)
 	}
 
 	response, err := c.parseResponse(res, path, err)
@@ -244,43 +260,7 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(nodeInfoResponse), err)
 	}
 
-	// determine ssPanel version, if disable custom config or version < 2021.11, then use old api
-	c.version = nodeInfoResponse.Version
-	var isExpired bool
-	if compareVersion(c.version, "2021.11") == -1 {
-		isExpired = true
-	}
-
-	if c.DisableCustomConfig || isExpired {
-		if isExpired {
-			log.Print("The panel version is expired, it is recommended to update immediately")
-		}
-
-		legacyNodeType := mapSortToNodeType(nodeInfoResponse.Sort)
-		if legacyNodeType == "" {
-			return nil, fmt.Errorf("unsupported node sort: %d", nodeInfoResponse.Sort)
-		}
-
-		switch legacyNodeType {
-		case "Vmess":
-			nodeInfo, err = c.ParseVmessNodeResponse(nodeInfoResponse)
-		case "Trojan":
-			nodeInfo, err = c.ParseTrojanNodeResponse(nodeInfoResponse)
-		case "Shadowsocks":
-			nodeInfo, err = c.ParseSSNodeResponse(nodeInfoResponse)
-		case "Shadowsocks-Plugin":
-			nodeInfo, err = c.ParseSSPluginNodeResponse(nodeInfoResponse)
-		default:
-			return nil, fmt.Errorf("unsupported Node type for legacy mode: %s", legacyNodeType)
-		}
-	} else {
-		nodeInfo, err = c.ParseSSPanelNodeInfo(nodeInfoResponse)
-		if err != nil {
-			res, _ := json.Marshal(nodeInfoResponse)
-			return nil, fmt.Errorf("parse node info failed: %s, \nError: %s, \nPlease check the doc of custom_config for help: https://xrayr-project.github.io/XrayR-doc/dui-jie-sspanel/sspanel/sspanel_custom_config", string(res), err)
-		}
-	}
-
+	nodeInfo, err = c.ParseSSPanelNodeInfo(nodeInfoResponse)
 	if err != nil {
 		res, _ := json.Marshal(nodeInfoResponse)
 		return nil, fmt.Errorf("parse node info failed: %s, \nError: %s", string(res), err)
@@ -383,7 +363,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	path := "/mod_mu/users"
 	res, err := c.client.R().
 		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
-		SetHeader("If-None-Match", c.eTags["users"]).
+		SetHeader("If-None-Match", c.eTag("users")).
 		SetResult(&Response{}).
 		ForceContentType("application/json").
 		Get(path)
@@ -392,8 +372,8 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		return nil, errors.New(api.UserNotModified)
 	}
 
-	if res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["users"] {
-		c.eTags["users"] = res.Header().Get("ETag")
+	if eTag := res.Header().Get("ETag"); eTag != "" {
+		c.setETag("users", eTag)
 	}
 
 	response, err := c.parseResponse(res, path, err)
@@ -569,7 +549,7 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	ruleList := c.LocalRuleList
 	path := "/mod_mu/func/detect_rules"
 	res, err := c.client.R().
-		SetHeader("If-None-Match", c.eTags["rules"]).
+		SetHeader("If-None-Match", c.eTag("rules")).
 		ForceContentType("application/json").
 		Get(path)
 
@@ -586,8 +566,8 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 		return nil, fmt.Errorf("request %s failed with status: %d", c.assembleURL(path), res.StatusCode())
 	}
 
-	if res.Header().Get("ETag") != "" && res.Header().Get("ETag") != c.eTags["rules"] {
-		c.eTags["rules"] = res.Header().Get("ETag")
+	if eTag := res.Header().Get("ETag"); eTag != "" {
+		c.setETag("rules", eTag)
 	}
 
 	// Parse the full response including exempt_users
@@ -606,9 +586,15 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	}
 
 	for _, r := range *ruleListResponse {
+		// 规则内容由面板管理员填写，一条写坏不能连带整个节点崩溃
+		pattern, err := regexp.Compile(r.Content)
+		if err != nil {
+			log.Printf("Invalid detect rule %d pattern %q, skipped: %s", r.ID, r.Content, err)
+			continue
+		}
 		ruleList = append(ruleList, api.DetectRule{
 			ID:      r.ID,
-			Pattern: regexp.MustCompile(r.Content),
+			Pattern: pattern,
 		})
 	}
 
@@ -719,280 +705,6 @@ func (c *APIClient) ReportIllegal(detectResultList *[]api.DetectResult) error {
 	return nil
 }
 
-// ParseVmessNodeResponse parses the legacy SSPanel node response format
-// for VMess nodes.
-func (c *APIClient) ParseVmessNodeResponse(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
-	var enableTLS bool
-	var path, host, transportProtocol, serviceName, HeaderType string
-	var header json.RawMessage
-	var speedLimit uint64 = 0
-	if nodeInfoResponse.RawServerString == "" {
-		return nil, fmt.Errorf("no server info in response")
-	}
-	// nodeInfo.RawServerString = strings.ToLower(nodeInfo.RawServerString)
-	serverConf := strings.Split(nodeInfoResponse.RawServerString, ";")
-
-	parsedPort, err := strconv.ParseInt(serverConf[1], 10, 32)
-	if err != nil {
-		return nil, err
-	}
-	port := uint32(parsedPort)
-
-	parsedAlterID, err := strconv.ParseInt(serverConf[2], 10, 16)
-	if err != nil {
-		return nil, err
-	}
-	alterID := uint16(parsedAlterID)
-
-	// Compatible with more node types config
-	for _, value := range serverConf[3:5] {
-		switch value {
-		case "tls":
-			enableTLS = true
-		default:
-			if value != "" {
-				transportProtocol = value
-			}
-		}
-	}
-	extraServerConf := strings.Split(serverConf[5], "|")
-	serviceName = ""
-	for _, item := range extraServerConf {
-		conf := strings.Split(item, "=")
-		key := conf[0]
-		if key == "" {
-			continue
-		}
-		value := conf[1]
-		switch key {
-		case "path":
-			rawPath := strings.Join(conf[1:], "=") // In case of the path strings contains the "="
-			path = rawPath
-		case "host":
-			host = value
-		case "servicename":
-			serviceName = value
-		case "headerType":
-			HeaderType = value
-		}
-	}
-	if c.SpeedLimit > 0 {
-		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
-	} else {
-		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
-	}
-
-	if HeaderType != "" {
-		headers := map[string]string{"type": HeaderType}
-		header, err = json.Marshal(headers)
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("marshal Header Type %s into config failed: %s", header, err)
-	}
-
-	// Create GeneralNodeInfo
-	nodeInfo := &api.NodeInfo{
-		NodeType:          "Vmess",
-		NodeID:            c.NodeID,
-		Port:              port,
-		SpeedLimit:        speedLimit,
-		AlterID:           alterID,
-		TransportProtocol: transportProtocol,
-		EnableTLS:         enableTLS,
-		Path:              path,
-		Host:              host,
-		SNI:               host,
-		ServiceName:       serviceName,
-		Header:            header,
-	}
-
-	return nodeInfo, nil
-}
-
-// ParseSSNodeResponse parse the response for the given node info format
-func (c *APIClient) ParseSSNodeResponse(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
-	var port uint32 = 0
-	var speedLimit uint64 = 0
-	var method string
-	path := "/mod_mu/users"
-	res, err := c.client.R().
-		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
-		SetResult(&Response{}).
-		ForceContentType("application/json").
-		Get(path)
-
-	response, err := c.parseResponse(res, path, err)
-	if err != nil {
-		return nil, err
-	}
-
-	userListResponse := new([]UserResponse)
-
-	if err := json.Unmarshal(response.Data, userListResponse); err != nil {
-		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(userListResponse), err)
-	}
-
-	// init server port
-	if len(*userListResponse) != 0 {
-		port = (*userListResponse)[0].Port
-	}
-
-	if c.SpeedLimit > 0 {
-		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
-	} else {
-		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
-	}
-	// Create GeneralNodeInfo
-	nodeInfo := &api.NodeInfo{
-		NodeType:          "Shadowsocks",
-		NodeID:            c.NodeID,
-		Port:              port,
-		SpeedLimit:        speedLimit,
-		TransportProtocol: "tcp",
-		CypherMethod:      method,
-	}
-
-	return nodeInfo, nil
-}
-
-// ParseSSPluginNodeResponse parse the response for the given node info format
-func (c *APIClient) ParseSSPluginNodeResponse(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
-	var enableTLS bool
-	var path, host, transportProtocol string
-	var speedLimit uint64 = 0
-
-	serverConf := strings.Split(nodeInfoResponse.RawServerString, ";")
-	parsedPort, err := strconv.ParseInt(serverConf[1], 10, 32)
-	if err != nil {
-		return nil, err
-	}
-	port := uint32(parsedPort)
-	port = port - 1 // Shadowsocks-Plugin requires two ports, one for ss the other for other stream protocol
-	if port <= 0 {
-		return nil, fmt.Errorf("Shadowsocks-Plugin listen port must bigger than 1")
-	}
-	// Compatible with more node types config
-	for _, value := range serverConf[3:5] {
-		switch value {
-		case "tls":
-			enableTLS = true
-		case "ws":
-			transportProtocol = "ws"
-		case "obfs":
-			transportProtocol = "tcp"
-		}
-	}
-
-	extraServerConf := strings.Split(serverConf[5], "|")
-	for _, item := range extraServerConf {
-		conf := strings.Split(item, "=")
-		key := conf[0]
-		if key == "" {
-			continue
-		}
-		value := conf[1]
-		switch key {
-		case "path":
-			rawPath := strings.Join(conf[1:], "=") // In case of the path strings contains the "="
-			path = rawPath
-		case "host":
-			host = value
-		}
-	}
-	if c.SpeedLimit > 0 {
-		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
-	} else {
-		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
-	}
-
-	// Create GeneralNodeInfo
-	nodeInfo := &api.NodeInfo{
-		NodeType:          "Trojan",
-		NodeID:            c.NodeID,
-		Port:              port,
-		SpeedLimit:        speedLimit,
-		TransportProtocol: transportProtocol,
-		EnableTLS:         enableTLS,
-		Path:              path,
-		Host:              host,
-	}
-
-	return nodeInfo, nil
-}
-
-// ParseTrojanNodeResponse parse the response for the given node info format
-func (c *APIClient) ParseTrojanNodeResponse(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
-	// 域名或IP;port=连接端口#偏移端口|host=xx
-	// gz.aaa.com;port=443#12345|host=hk.aaa.com
-	var p, host, outsidePort, insidePort, transportProtocol, serviceName string
-	var speedLimit uint64 = 0
-
-	if nodeInfoResponse.RawServerString == "" {
-		return nil, fmt.Errorf("no server info in response")
-	}
-	if result := firstPortRe.FindStringSubmatch(nodeInfoResponse.RawServerString); len(result) > 1 {
-		outsidePort = result[1]
-	}
-	if result := secondPortRe.FindStringSubmatch(nodeInfoResponse.RawServerString); len(result) > 1 {
-		insidePort = result[1]
-	}
-	if result := hostRe.FindStringSubmatch(nodeInfoResponse.RawServerString); len(result) > 1 {
-		host = result[1]
-	}
-
-	if insidePort != "" {
-		p = insidePort
-	} else {
-		p = outsidePort
-	}
-
-	parsedPort, err := strconv.ParseInt(p, 10, 32)
-	if err != nil {
-		return nil, err
-	}
-	port := uint32(parsedPort)
-
-	serverConf := strings.Split(nodeInfoResponse.RawServerString, ";")
-	extraServerConf := strings.Split(serverConf[1], "|")
-	transportProtocol = "tcp"
-	serviceName = ""
-	for _, item := range extraServerConf {
-		conf := strings.Split(item, "=")
-		key := conf[0]
-		if key == "" {
-			continue
-		}
-		value := conf[1]
-		switch key {
-		case "grpc":
-			transportProtocol = "grpc"
-		case "servicename":
-			serviceName = value
-		}
-	}
-
-	if c.SpeedLimit > 0 {
-		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
-	} else {
-		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
-	}
-	// Create GeneralNodeInfo
-	nodeInfo := &api.NodeInfo{
-		NodeType:          "Shadowsocks-Plugin",
-		NodeID:            c.NodeID,
-		Port:              port,
-		SpeedLimit:        speedLimit,
-		TransportProtocol: transportProtocol,
-		EnableTLS:         true,
-		Host:              host,
-		SNI:               host,
-		ServiceName:       serviceName,
-	}
-
-	return nodeInfo, nil
-}
-
 // ParseUserListResponse parse the response for the given node info format
 func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]api.UserInfo, error) {
 	// Lock while reading LastReportOnline snapshot; do NOT clear it here.
@@ -1047,7 +759,6 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 	var (
 		speedLimit        uint64 = 0
 		enableTLS         bool
-		alterID           uint16 = 0
 		transportProtocol string
 	)
 
@@ -1158,6 +869,19 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		}
 	}
 
+	// 伪装头只有 tcp 与 mKCP 两种传输认，none 与不设置等价。
+	// xray 的 tcp 伪装头只接受 http，其余取值（srtp / utp / wechat-video /
+	// dtls / wireguard）属 mKCP，原样下发交由内核判定合法性。
+	var header json.RawMessage
+	switch {
+	case transportProtocol == "tcp" && nodeConfig.HeaderType == "http",
+		transportProtocol == "kcp" && nodeConfig.HeaderType != "" && nodeConfig.HeaderType != "none":
+		header, err = json.Marshal(map[string]string{"type": nodeConfig.HeaderType})
+		if err != nil {
+			return nil, fmt.Errorf("marshal header type %s failed: %v", nodeConfig.HeaderType, err)
+		}
+	}
+
 	// Derive SNI from custom_config. Prefer explicit SNI / server_name,
 	// fall back to Host when those are empty.
 	sni := ""
@@ -1175,7 +899,6 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		NodeID:              c.NodeID,
 		Port:                port,
 		SpeedLimit:          speedLimit,
-		AlterID:             alterID,
 		TransportProtocol:   transportProtocol,
 		Host:                nodeConfig.Host,
 		Path:                nodeConfig.Path,
@@ -1186,7 +909,8 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		CypherMethod:        nodeConfig.Method,
 		ServerKey:           nodeConfig.ServerKey,
 		ServiceName:         nodeConfig.Servicename,
-		Header:              nodeConfig.Header,
+		Header:              header,
+		Seed:                nodeConfig.Seed,
 		EnableREALITY:       nodeConfig.EnableREALITY,
 		REALITYConfig:       realityConfig,
 		AcceptProxyProtocol: nodeConfig.EnableProxyProtocol,
@@ -1354,31 +1078,6 @@ func splitPortsExprString(s string) []string {
 		segments = append(segments, p)
 	}
 	return segments
-}
-
-// compareVersion, version1 > version2 return 1, version1 < version2 return -1, 0 means equal
-func compareVersion(version1, version2 string) int {
-	n, m := len(version1), len(version2)
-	i, j := 0, 0
-	for i < n || j < m {
-		x := 0
-		for ; i < n && version1[i] != '.'; i++ {
-			x = x*10 + int(version1[i]-'0')
-		}
-		i++ // jump dot
-		y := 0
-		for ; j < m && version2[j] != '.'; j++ {
-			y = y*10 + int(version2[j]-'0')
-		}
-		j++ // jump dot
-		if x > y {
-			return 1
-		}
-		if x < y {
-			return -1
-		}
-	}
-	return 0
 }
 
 // GetUnlockCheckConfig fetches the streaming unlock check configuration from the panel.

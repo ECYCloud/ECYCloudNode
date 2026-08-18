@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
-
-	"github.com/xtls/xray-core/infra/conf"
 )
 
 const (
@@ -55,13 +53,12 @@ type Config struct {
 	// 当 NodeID 为空字符串时，视为未配置；
 	// 当仅为数字时表示单个节点；当包含逗号时会在 Panel.expandNodesConfig
 	// 中被拆分为多个逻辑节点，每个逻辑节点拥有独立的 NodeID。
-	NodeID              string  `mapstructure:"NodeID"`
-	Key                 string  `mapstructure:"ApiKey"`
-	Timeout             int     `mapstructure:"Timeout"`
-	SpeedLimit          float64 `mapstructure:"SpeedLimit"`
-	DeviceLimit         int     `mapstructure:"DeviceLimit"`
-	RuleListPath        string  `mapstructure:"RuleListPath"`
-	DisableCustomConfig bool    `mapstructure:"DisableCustomConfig"`
+	NodeID       string  `mapstructure:"NodeID"`
+	Key          string  `mapstructure:"ApiKey"`
+	Timeout      int     `mapstructure:"Timeout"`
+	SpeedLimit   float64 `mapstructure:"SpeedLimit"`
+	DeviceLimit  int     `mapstructure:"DeviceLimit"`
+	RuleListPath string  `mapstructure:"RuleListPath"`
 }
 
 // NodeStatus Node status
@@ -74,14 +71,11 @@ type NodeStatus struct {
 
 type NodeInfo struct {
 	AcceptProxyProtocol bool
-	Authority           string
 	NodeType            string // Must be Vmess, VLESS, Trojan, Shadowsocks, Hysteria2, AnyTLS, Tuic
 	NodeID              int
 	Port                uint32
 	SpeedLimit          uint64 // Bps
-	AlterID             uint16
 	TransportProtocol   string
-	FakeType            string
 	Host                string
 	Path                string
 	// SNI is the Server Name Indication derived from panel configuration.
@@ -89,7 +83,6 @@ type NodeInfo struct {
 	// nodes it falls back to the parsed Host when available.
 	SNI              string
 	EnableTLS        bool
-	EnableSniffing   bool
 	RouteOnly        bool
 	VlessFlow        string
 	VlessDecryption  string
@@ -98,13 +91,10 @@ type NodeInfo struct {
 	ServiceName      string
 	Method           string
 	Header           json.RawMessage
-	HttpHeaders      map[string]*conf.StringList
 	Headers          map[string]string
-	NameServerConfig []*conf.NameServerConfig
+	Seed             string
 	EnableREALITY    bool
 	REALITYConfig    *REALITYConfig
-	Show             bool
-	EnableTFO        bool
 	Dest             string
 	ProxyProtocolVer uint64
 	ServerNames      []string
@@ -113,11 +103,9 @@ type NodeInfo struct {
 	MaxClientVer     string
 	MaxTimeDiff      uint64
 	ShortIds         []string
-	Xver             uint64
 	Flow             string
 	Security         string
 	Key              string
-	RejectUnknownSni bool
 	Hysteria2Config  *Hysteria2Config
 	AnyTLSConfig     *AnyTLSConfig
 	TuicConfig       *TuicConfig
@@ -178,7 +166,6 @@ type UserInfo struct {
 	UUID        string
 	Passwd      string
 	Port        uint32
-	AlterID     uint16
 	Method      string
 	SpeedLimit  uint64 // Bps
 	DeviceLimit int

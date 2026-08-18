@@ -114,7 +114,7 @@ install_ECYCloudNode() {
             exit 1
         fi
         echo -e "检测到 ECYCloudNode 最新版本：${last_version}，开始安装"
-        wget -q -N --no-check-certificate -O /usr/local/ECYCloudNode/ECYCloudNode-linux.zip https://github.com/ECYCloud/ECYCloudNode/releases/download/${last_version}/ECYCloudNode-linux-${arch}.zip
+        wget -q -N -O /usr/local/ECYCloudNode/ECYCloudNode-linux.zip https://github.com/ECYCloud/ECYCloudNode/releases/download/${last_version}/ECYCloudNode-linux-${arch}.zip
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 ECYCloudNode 失败，请确保你的服务器能够下载 Github 的文件${plain}"
             exit 1
@@ -127,7 +127,7 @@ install_ECYCloudNode() {
 	fi
         url="https://github.com/ECYCloud/ECYCloudNode/releases/download/${last_version}/ECYCloudNode-linux-${arch}.zip"
         echo -e "开始安装 ECYCloudNode ${last_version}"
-        wget -q -N --no-check-certificate -O /usr/local/ECYCloudNode/ECYCloudNode-linux.zip ${url}
+        wget -q -N -O /usr/local/ECYCloudNode/ECYCloudNode-linux.zip ${url}
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 ECYCloudNode ${last_version} 失败，请确保此版本存在${plain}"
             exit 1
@@ -140,7 +140,7 @@ install_ECYCloudNode() {
     mkdir /etc/ECYCloudNode/ -p
     rm /etc/systemd/system/ECYCloudNode.service -f
     file="https://github.com/ECYCloud/ECYCloudNode/raw/main/release/ECYCloudNode.service"
-    wget -q -N --no-check-certificate -O /etc/systemd/system/ECYCloudNode.service ${file}
+    wget -q -N -O /etc/systemd/system/ECYCloudNode.service ${file}
     #cp -f ECYCloudNode.service /etc/systemd/system/
     systemctl daemon-reload
     systemctl stop ECYCloudNode

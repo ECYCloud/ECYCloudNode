@@ -4,45 +4,44 @@ import "encoding/json"
 
 // NodeInfoResponse is the response of node
 type NodeInfoResponse struct {
-	Group           int             `json:"node_group"`
-	Class           int             `json:"node_class"`
-	SpeedLimit      float64         `json:"node_speedlimit"`
-	TrafficRate     float64         `json:"traffic_rate"`
-	Sort            int             `json:"sort"`
-	RawServerString string          `json:"server"`
-	Type            string          `json:"type"`
-	CustomConfig    json.RawMessage `json:"custom_config"`
-	Version         string          `json:"version"`
+	Group        int             `json:"node_group"`
+	Class        int             `json:"node_class"`
+	SpeedLimit   float64         `json:"node_speedlimit"`
+	TrafficRate  float64         `json:"traffic_rate"`
+	Sort         int             `json:"sort"`
+	Type         string          `json:"type"`
+	CustomConfig json.RawMessage `json:"custom_config"`
 }
 
 type CustomConfig struct {
-	OffsetPortNode        string          `json:"offset_port_node"`
-	Host                  string          `json:"host"`
-	Method                string          `json:"method"`
-	ServerKey             string          `json:"server_key"`
-	TLS                   string          `json:"tls"`
-	Network               string          `json:"network"`
-	Security              string          `json:"security"`
-	Path                  string          `json:"path"`
-	VerifyCert            bool            `json:"verify_cert"`
-	Obfs                  string          `json:"obfs"`
-	Header                json.RawMessage `json:"header"`
-	AllowInsecure         string          `json:"allow_insecure"`
-	Servicename           string          `json:"servicename"`
-	EnableXtls            string          `json:"enable_xtls"`
-	Flow                  string          `json:"flow"`
-	EnableREALITY         bool            `json:"enable_reality"`
-	RealityOpts           *REALITYConfig  `json:"reality-opts"`
-	OffsetPortUser        string          `json:"offset_port_user"`
-	ObfsPassword          string          `json:"obfs_password"`
-	UpMbps                string          `json:"up_mbps"`
-	DownMbps              string          `json:"down_mbps"`
-	ServerName            string          `json:"server_name"`
-	Sni                   string          `json:"sni"`
-	Alpn                  []string        `json:"alpn"`
-	Fingerprint           string          `json:"fingerprint"`
-	IgnoreClientBandwidth bool            `json:"ignore_client_bandwidth"`
-	PaddingScheme         []string        `json:"padding_scheme"`
+	OffsetPortNode        string         `json:"offset_port_node"`
+	Host                  string         `json:"host"`
+	Method                string         `json:"method"`
+	ServerKey             string         `json:"server_key"`
+	TLS                   string         `json:"tls"`
+	Network               string         `json:"network"`
+	Security              string         `json:"security"`
+	Path                  string         `json:"path"`
+	VerifyCert            bool           `json:"verify_cert"`
+	Obfs                  string         `json:"obfs"`
+	HeaderType            string         `json:"header_type"`
+	Seed                  string         `json:"seed"`
+	AllowInsecure         string         `json:"allow_insecure"`
+	Servicename           string         `json:"servicename"`
+	EnableXtls            string         `json:"enable_xtls"`
+	Flow                  string         `json:"flow"`
+	EnableREALITY         bool           `json:"enable_reality"`
+	RealityOpts           *REALITYConfig `json:"reality-opts"`
+	OffsetPortUser        string         `json:"offset_port_user"`
+	ObfsPassword          string         `json:"obfs_password"`
+	UpMbps                string         `json:"up_mbps"`
+	DownMbps              string         `json:"down_mbps"`
+	ServerName            string         `json:"server_name"`
+	Sni                   string         `json:"sni"`
+	Alpn                  []string       `json:"alpn"`
+	Fingerprint           string         `json:"fingerprint"`
+	IgnoreClientBandwidth bool           `json:"ignore_client_bandwidth"`
+	PaddingScheme         []string       `json:"padding_scheme"`
 	// Hysteria2 port hopping specific fields. We keep them as RawMessage so
 	// that the panel can store booleans, numbers or strings without breaking
 	// JSON decoding, mirroring the loose handling in the PHP panel

@@ -167,6 +167,14 @@ func (s *TuicService) Close() error {
 	return nil
 }
 
+// currentNodeInfo 读取当前节点信息。nodeMonitor、userMonitor 与 certMonitor 是
+// 三个独立 goroutine，而 reloadNode 会在 s.mu 下整体替换它。
+func (s *TuicService) currentNodeInfo() *api.NodeInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.nodeInfo
+}
+
 // reloadNode replaces in-memory node information and rebuilds the underlying
 // sing-box TUIC instance so that changes from the panel (port, TLS/SNI,
 // congestion control, etc.) and renewed certificates take effect without
@@ -191,8 +199,11 @@ func (s *TuicService) reloadNode(nodeInfo *api.NodeInfo) error {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 
+	// nodeInfo 同时被 userMonitor 读取（syncUsers 取 SpeedLimit），必须与其同锁
+	s.mu.Lock()
 	oldInfo := s.nodeInfo
 	s.nodeInfo = nodeInfo
+	s.mu.Unlock()
 
 	// Keep CertDomain in sync with the panel SNI when originally derived from
 	// SNI/Host.
@@ -234,6 +245,25 @@ func (s *TuicService) reloadNode(nodeInfo *api.NodeInfo) error {
 
 	boxInstance, inboundTag, err := s.buildSingBox()
 	if err != nil {
+		// 旧 box 已经关掉了。若不回滚 nodeInfo，面板随后返回 304 或 DeepEqual
+		// 判定相等，节点就永远停在没有监听的状态上不再重试。
+		s.mu.Lock()
+		s.nodeInfo = oldInfo
+		s.mu.Unlock()
+		if oldInfo != nil {
+			if rollback, rollbackTag, rollbackErr := s.buildSingBox(); rollbackErr != nil {
+				s.logger.Errorf("TUIC rollback to previous config failed: %v", rollbackErr)
+			} else {
+				s.box = rollback
+				s.inboundTag = rollbackTag
+				go func() {
+					if startErr := s.box.Start(); startErr != nil {
+						s.logger.Errorf("TUIC box start error after rollback: %v", startErr)
+					}
+				}()
+				s.logger.Warnf("TUIC reload failed, rolled back to previous config: %v", err)
+			}
+		}
 		return err
 	}
 	s.box = boxInstance

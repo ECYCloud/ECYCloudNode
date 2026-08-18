@@ -37,6 +37,15 @@ var (
 	reportedDate      string       // The date when reportedNodeIDs was last reset
 )
 
+// ResetNodeIDs 清空节点注册表。注册表是包级状态，热重载会重新注册当前节点列表；
+// 不先清空的话，配置里已删掉的节点仍会被当成共享检测的上报对象。
+func ResetNodeIDs() {
+	nodeRegistryMutex.Lock()
+	defer nodeRegistryMutex.Unlock()
+
+	registeredNodeIDs = nil
+}
+
 // RegisterNodeID registers a node ID for unlock check result sharing.
 // All registered nodes will receive the same detection results.
 func RegisterNodeID(nodeID int) {

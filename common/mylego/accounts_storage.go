@@ -186,7 +186,9 @@ func generatePrivateKey(file string, keyType certcrypto.KeyType) (crypto.Private
 		return nil, err
 	}
 
-	certOut, err := os.Create(file)
+	// os.Create 会按 0666&~umask 建文件，默认落成 0644：ACME 账户私钥可被同机
+	// 其它用户读到，进而为已验证域名签发或吊销证书。
+	certOut, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, filePerm)
 	if err != nil {
 		return nil, err
 	}

@@ -59,10 +59,15 @@ func (s *TuicService) buildSingBox() (*box.Box, string, error) {
 		tlsOpt.ALPN = s.nodeInfo.TuicConfig.ALPN
 	}
 
-	s.mu.RLock()
+	s.mu.Lock()
 	users := make([]option.TUICUser, len(s.authUsers))
 	copy(users, s.authUsers)
-	s.mu.RUnlock()
+	built := make(map[string]struct{}, len(users))
+	for _, u := range users {
+		built[u.Name] = struct{}{}
+	}
+	s.builtAuthUsers = built
+	s.mu.Unlock()
 
 	if len(users) == 0 {
 		return nil, "", fmt.Errorf("no users available for TUIC authentication")
@@ -157,7 +162,8 @@ func (s *TuicService) certMonitor() error {
 		return nil
 	}
 
-	if !s.nodeInfo.EnableTLS {
+	current := s.currentNodeInfo()
+	if current == nil || !current.EnableTLS {
 		return nil
 	}
 
@@ -175,7 +181,7 @@ func (s *TuicService) certMonitor() error {
 		}
 		if ok {
 			s.logger.Infof("TUIC certificate renewed for %s, reloading node (cert=%s, key=%s)", s.config.CertConfig.CertDomain, certPath, keyPath)
-			if err := s.reloadNode(s.nodeInfo); err != nil {
+			if err := s.reloadNode(current); err != nil {
 				s.logger.Printf("TUIC certificate reload failed: %v", err)
 			}
 		}

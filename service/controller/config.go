@@ -15,7 +15,6 @@ type Config struct {
 	DisableUploadTraffic    bool                             `mapstructure:"DisableUploadTraffic"`
 	DisableGetRule          bool                             `mapstructure:"DisableGetRule"`
 	EnableFallback          bool                             `mapstructure:"EnableFallback"`
-	DisableIVCheck          bool                             `mapstructure:"DisableIVCheck"`
 	DisableSniffing         bool                             `mapstructure:"DisableSniffing"`
 	AutoSpeedLimitConfig    *AutoSpeedLimitConfig            `mapstructure:"AutoSpeedLimitConfig"`
 	GlobalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig `mapstructure:"GlobalDeviceLimitConfig"`

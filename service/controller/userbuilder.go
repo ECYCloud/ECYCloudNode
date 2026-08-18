@@ -1,14 +1,11 @@
 package controller
 
 import (
-	"context"
-	"encoding/base64"
 	"fmt"
 	"strings"
 
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	C "github.com/sagernet/sing/common"
-	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
@@ -80,17 +77,11 @@ func (c *Controller) buildSSUser(userInfo *[]api.UserInfo, method string) (users
 	for i, user := range *userInfo {
 		// shadowsocks2022 Key = "openssl rand -base64 32" and multi users needn't cipher method
 		if C.Contains(shadowaead_2022.List, strings.ToLower(method)) {
-			e := c.buildUserTag(&user)
-			userKey, err := c.checkShadowsocksPassword(user.Passwd, method)
-			if err != nil {
-				errors.LogError(context.Background(), "[UID: %d] %s", user.UID, err)
-				continue
-			}
 			users[i] = &protocol.User{
 				Level: 0,
-				Email: e,
+				Email: c.buildUserTag(&user),
 				Account: serial.ToTypedMessage(&shadowsocks_2022.Account{
-					Key: userKey,
+					Key: user.Passwd,
 				}),
 			}
 		} else {
@@ -101,43 +92,6 @@ func (c *Controller) buildSSUser(userInfo *[]api.UserInfo, method string) (users
 					Password:   user.Passwd,
 					CipherType: cipherFromString(method),
 				}),
-			}
-		}
-	}
-	return users
-}
-
-func (c *Controller) buildSSPluginUser(userInfo *[]api.UserInfo) (users []*protocol.User) {
-	users = make([]*protocol.User, len(*userInfo))
-
-	for i, user := range *userInfo {
-		// shadowsocks2022 Key = openssl rand -base64 32 and multi users needn't cipher method
-		if C.Contains(shadowaead_2022.List, strings.ToLower(user.Method)) {
-			e := c.buildUserTag(&user)
-			userKey, err := c.checkShadowsocksPassword(user.Passwd, user.Method)
-			if err != nil {
-				errors.LogError(context.Background(), "[UID: %d] %s", user.UID, err)
-				continue
-			}
-			users[i] = &protocol.User{
-				Level: 0,
-				Email: e,
-				Account: serial.ToTypedMessage(&shadowsocks_2022.Account{
-					Key: userKey,
-				}),
-			}
-		} else {
-			// Check if the cypher method is AEAD
-			cypherMethod := cipherFromString(user.Method)
-			if _, ok := AEADMethod[cypherMethod]; ok {
-				users[i] = &protocol.User{
-					Level: 0,
-					Email: c.buildUserTag(&user),
-					Account: serial.ToTypedMessage(&shadowsocks.Account{
-						Password:   user.Passwd,
-						CipherType: cypherMethod,
-					}),
-				}
 			}
 		}
 	}
@@ -166,24 +120,4 @@ func (c *Controller) buildUserTag(user *api.UserInfo) string {
 	// This ensures each node has its own independent traffic counters.
 	// Note: limiter.go must use the same format for UserInfo storage keys.
 	return fmt.Sprintf("%s|%d", c.Tag, user.UID)
-}
-
-func (c *Controller) checkShadowsocksPassword(password string, method string) (string, error) {
-	if strings.Contains(c.panelType, "V2board") {
-		var userKey string
-		if len(password) < 16 {
-			return "", newError("shadowsocks2022 key's length must be greater than 16").AtWarning()
-		}
-		if method == "2022-blake3-aes-128-gcm" {
-			userKey = password[:16]
-		} else {
-			if len(password) < 32 {
-				return "", newError("shadowsocks2022 key's length must be greater than 32").AtWarning()
-			}
-			userKey = password[:32]
-		}
-		return base64.StdEncoding.EncodeToString([]byte(userKey)), nil
-	} else {
-		return password, nil
-	}
 }

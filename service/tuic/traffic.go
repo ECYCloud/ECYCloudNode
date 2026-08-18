@@ -102,6 +102,18 @@ func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 	}
 }
 
+// hasUnbuiltAuthUser 报告是否存在运行中的 inbound 还不认识的凭据。
+func (s *TuicService) hasUnbuiltAuthUser() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, u := range s.authUsers {
+		if _, ok := s.builtAuthUsers[u.Name]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *TuicService) addTraffic(uuid string, up, down int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,6 +360,13 @@ func (s *TuicService) userMonitor() error {
 	}
 	if usersChanged {
 		s.syncUsers(newUserInfo)
+		// 被删用户已由 allowConnection 拦住，但新增凭据过不了 sing-box 的认证，
+		// 必须重建 inbound 才能连上。
+		if s.hasUnbuiltAuthUser() {
+			if err := s.reloadNode(s.currentNodeInfo()); err != nil {
+				s.logger.Errorf("TUIC rebuild for new users failed: %v", err)
+			}
+		}
 	}
 
 	// Check Rule
@@ -452,7 +471,7 @@ func (s *TuicService) nodeMonitor() error {
 	// actual TUIC configuration, which may cause the ETag to change on every
 	// poll. Guard against unnecessary hot-reloads by comparing the new NodeInfo
 	// with the current in-memory value, similar to controller.nodeInfoMonitor.
-	if s.nodeInfo != nil && reflect.DeepEqual(s.nodeInfo, nodeInfo) {
+	if current := s.currentNodeInfo(); current != nil && reflect.DeepEqual(current, nodeInfo) {
 		return nil
 	}
 

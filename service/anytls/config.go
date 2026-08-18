@@ -68,10 +68,15 @@ func (s *AnyTLSService) buildSingBox() (*box.Box, string, error) {
 		padding = s.nodeInfo.AnyTLSConfig.PaddingScheme
 	}
 
-	s.mu.RLock()
+	s.mu.Lock()
 	users := make([]option.AnyTLSUser, len(s.authUsers))
 	copy(users, s.authUsers)
-	s.mu.RUnlock()
+	built := make(map[string]struct{}, len(users))
+	for _, u := range users {
+		built[u.Name] = struct{}{}
+	}
+	s.builtAuthUsers = built
+	s.mu.Unlock()
 
 	inOpts := &option.AnyTLSInboundOptions{
 		ListenOptions: listen,
@@ -155,7 +160,8 @@ func (s *AnyTLSService) certMonitor() error {
 		return nil
 	}
 
-	if !s.nodeInfo.EnableTLS {
+	current := s.currentNodeInfo()
+	if current == nil || !current.EnableTLS {
 		return nil
 	}
 
@@ -173,7 +179,7 @@ func (s *AnyTLSService) certMonitor() error {
 		}
 		if ok {
 			s.logger.Infof("AnyTLS certificate renewed for %s, reloading node (cert=%s, key=%s)", s.config.CertConfig.CertDomain, certPath, keyPath)
-			if err := s.reloadNode(s.nodeInfo); err != nil {
+			if err := s.reloadNode(current); err != nil {
 				s.logger.Printf("AnyTLS certificate reload failed: %v", err)
 			}
 		}

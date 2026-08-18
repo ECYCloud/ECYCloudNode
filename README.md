@@ -21,7 +21,7 @@ ECY Cloud 节点后端。基于 [XrayR](https://github.com/XrayR-project/XrayR) 
 
 ## 特点
 
-* 对接 SSPanel WebAPI（`PanelType: SSPanel`）
+* 对接 SSPanel WebAPI
 * 单进程可挂载多个节点 ID（`NodeID: 41,42,43`）
 * 支持协议：VLESS、VMess、Trojan、Shadowsocks、Hysteria2、AnyTLS、TUIC
 * 在线设备限制、节点/用户限速、审计规则、流量与节点状态上报
@@ -89,7 +89,6 @@ ECYCloudNode uninstall    卸载
 
 常用项：
 
-* `Nodes[].PanelType`：固定为 `SSPanel`
 * `Nodes[].ApiConfig.ApiHost` / `ApiKey` / `NodeID`：面板地址、MuKey、节点 ID
 * `DnsConfigPath` / `RouteConfigPath` 等：可选；留空（注释）则不加载对应 JSON
 * 证书：优先由面板 `ecycloudnode_cert` 下发；也可在节点侧自行配置 CertConfig
