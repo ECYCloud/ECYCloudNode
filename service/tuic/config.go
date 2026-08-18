@@ -62,11 +62,6 @@ func (s *TuicService) buildSingBox() (*box.Box, string, error) {
 	s.mu.Lock()
 	users := make([]option.TUICUser, len(s.authUsers))
 	copy(users, s.authUsers)
-	built := make(map[string]struct{}, len(users))
-	for _, u := range users {
-		built[u.Name] = struct{}{}
-	}
-	s.builtAuthUsers = built
 	s.mu.Unlock()
 
 	if len(users) == 0 {
@@ -122,6 +117,14 @@ func (s *TuicService) buildSingBox() (*box.Box, string, error) {
 
 	tracker := &tuicTracker{svc: s}
 	boxInstance.Router().AppendTracker(tracker)
+
+	built := make(map[string]struct{}, len(users))
+	for _, u := range users {
+		built[u.Name] = struct{}{}
+	}
+	s.mu.Lock()
+	s.builtAuthUsers = built
+	s.mu.Unlock()
 
 	return boxInstance, s.inboundTag, nil
 }

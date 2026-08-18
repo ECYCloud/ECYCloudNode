@@ -29,6 +29,9 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/common/unlockcheck"
 )
 
+// rebuildRetryBackoffMax 是待重建重试的退避上限。
+const rebuildRetryBackoffMax = 30 * time.Minute
+
 type LimitInfo struct {
 	end               int64
 	currentSpeedLimit int
@@ -60,6 +63,10 @@ type Controller struct {
 	// rebuildPending 记录「inbound 尚未按 nodeInfo 装好」。面板随后会返回 304，
 	// 届时 newNodeInfo 等于当前缓存，只靠 DeepEqual 判不出重建没走完。
 	rebuildPending bool
+	// rebuildRetryAt / rebuildBackoff 给重试加退避。证书缺失时装 inbound 会真的
+	// 向 ACME 发起签发，每个巡检周期重试一次会撞签发方的失败限额。
+	rebuildRetryAt time.Time
+	rebuildBackoff time.Duration
 	// Unlock check related fields
 	unlockChecker       *unlockcheck.Checker
 	lastUnlockCheckTime time.Time
@@ -264,6 +271,35 @@ func (c *Controller) Close() error {
 	return nil
 }
 
+// needsRebuild 报告是否该重试上一轮没走完的重建。退避未到就先不动。
+// 只在持有 monitorMu 的 nodeInfoMonitor 内调用，因此不另加锁。
+func (c *Controller) needsRebuild() bool {
+	return c.rebuildPending && !time.Now().Before(c.rebuildRetryAt)
+}
+
+// setRebuildPending 置位或清除待重建。置位时按退避推后下一次重试：首次失败仍是
+// 下一轮立刻重试，之后逐次翻倍到 rebuildRetryBackoffMax，清除时归零。
+// 与 needsRebuild 一样只在持有 monitorMu 的 nodeInfoMonitor 内调用，因此不另加锁。
+func (c *Controller) setRebuildPending(pending bool) {
+	if !pending {
+		c.rebuildPending = false
+		c.rebuildRetryAt = time.Time{}
+		c.rebuildBackoff = 0
+		return
+	}
+
+	c.rebuildPending = true
+	c.rebuildRetryAt = time.Now().Add(c.rebuildBackoff)
+	next := 2 * c.rebuildBackoff
+	if next == 0 {
+		next = time.Duration(c.config.UpdatePeriodic) * time.Second
+	}
+	if next > rebuildRetryBackoffMax {
+		next = rebuildRetryBackoffMax
+	}
+	c.rebuildBackoff = next
+}
+
 func (c *Controller) nodeInfoMonitor() (err error) {
 	// delay to start
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
@@ -334,11 +370,11 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	}
 
 	// If nodeInfo changed
-	nodeInfoChanged = c.rebuildPending || (nodeInfoChanged && !reflect.DeepEqual(c.nodeInfo, newNodeInfo))
+	nodeInfoChanged = c.needsRebuild() || (nodeInfoChanged && !reflect.DeepEqual(c.nodeInfo, newNodeInfo))
 	if nodeInfoChanged {
 		// 置位要早于摘掉旧 inbound：中途任何一步失败都得让下一轮重来，
 		// 否则节点会停在「没有 inbound」的状态上不再自愈。
-		c.rebuildPending = true
+		c.setRebuildPending(true)
 		// Remove old tag
 		oldTag := c.Tag
 		err := c.removeOldTag(oldTag)
@@ -400,7 +436,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			c.logger.Print(err)
 			return nil
 		}
-		c.rebuildPending = false
+		c.setRebuildPending(false)
 	} else {
 		var deleted, added []api.UserInfo
 		syncFailed := false

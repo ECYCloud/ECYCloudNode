@@ -19,6 +19,9 @@ import (
 
 var _ service.Service = (*Hysteria2Service)(nil)
 
+// rebuildRetryBackoffMax 是待重建重试的退避上限。
+const rebuildRetryBackoffMax = 30 * time.Minute
+
 // New creates a new Hysteria2 service bound to a SSPanel node.
 func New(apiClient api.API, cfg *controller.Config) *Hysteria2Service {
 	clientInfo := apiClient.Describe()
@@ -99,21 +102,12 @@ func (h *Hysteria2Service) Start() error {
 	}
 
 	// Build Hysteria2 server.
-	cfg, err := h.buildServerConfig()
-	if err != nil {
-		return err
-	}
-	srv, err := server.NewServer(cfg)
+	srv, err := h.newServer()
 	if err != nil {
 		return err
 	}
 	h.server = srv
-
-	go func() {
-		if err := h.server.Serve(); err != nil {
-			h.logger.Errorf("Hysteria2 Serve error: %v", err)
-		}
-	}()
+	h.serve(srv, "start")
 
 	// Apply Hysteria2 port hopping iptables rules for the initial node
 	// configuration, if the panel enabled port hopping for this node.
@@ -167,6 +161,9 @@ func (h *Hysteria2Service) Close() error {
 		deletePortHopIptablesRules(h.portHopRules, h.logger)
 		h.portHopRules = nil
 	}
+	// 摘下来再关：serve 靠 h.server 是否还是自己来区分「我们关的」和「自己挂的」
+	srv := h.server
+	h.server = nil
 	h.reloadMu.Unlock()
 
 	for _, t := range h.tasks {
@@ -175,10 +172,77 @@ func (h *Hysteria2Service) Close() error {
 		}
 	}
 	h.tasks = nil
-	if h.server != nil {
-		return h.server.Close()
+	if srv != nil {
+		return srv.Close()
 	}
 	return nil
+}
+
+// needsRebuild 报告是否该重试上一轮没走完的重建。退避未到就先不动。
+func (h *Hysteria2Service) needsRebuild() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.rebuildPending && !time.Now().Before(h.rebuildRetryAt)
+}
+
+// setRebuildPending 置位或清除待重建。置位时按退避推后下一次重试：首次失败仍是
+// 下一轮立刻重试，之后逐次翻倍到 rebuildRetryBackoffMax，清除时归零。
+func (h *Hysteria2Service) setRebuildPending(pending bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if !pending {
+		h.rebuildPending = false
+		h.rebuildRetryAt = time.Time{}
+		h.rebuildBackoff = 0
+		return
+	}
+
+	h.rebuildPending = true
+	h.rebuildRetryAt = time.Now().Add(h.rebuildBackoff)
+	next := 2 * h.rebuildBackoff
+	if next == 0 {
+		next = time.Duration(h.config.UpdatePeriodic) * time.Second
+	}
+	if next > rebuildRetryBackoffMax {
+		next = rebuildRetryBackoffMax
+	}
+	h.rebuildBackoff = next
+}
+
+// serve 后台跑指定的 server。Serve 返回就意味着这份 server 不再收连接，但 reload
+// 与 Close 都会主动关掉它，只有它仍挂在 h.server 上才算故障；reloadMu 保证这里读
+// 到的是那些操作完成之后的状态。
+func (h *Hysteria2Service) serve(srv server.Server, phase string) {
+	go func() {
+		err := srv.Serve()
+
+		h.reloadMu.Lock()
+		superseded := h.server != srv
+		h.reloadMu.Unlock()
+		if superseded {
+			return
+		}
+
+		h.logger.Errorf("Hysteria2 serve stopped unexpectedly (%s): %v", phase, err)
+		h.setRebuildPending(true)
+	}()
+}
+
+// newServer 组装并创建 Hysteria2 server。buildServerConfig 里已经把 UDP 端口绑上，
+// 而 server.NewServer 失败时不会关掉这个 conn，必须在这里关掉，否则端口一直被占、
+// 后续重建再也绑不上。
+func (h *Hysteria2Service) newServer() (server.Server, error) {
+	cfg, err := h.buildServerConfig()
+	if err != nil {
+		return nil, err
+	}
+	srv, err := server.NewServer(cfg)
+	if err != nil {
+		cfg.Conn.Close()
+		return nil, err
+	}
+	return srv, nil
 }
 
 // reloadNode replaces the in-memory node information and rebuilds the
@@ -251,21 +315,31 @@ func (h *Hysteria2Service) reloadNode(nodeInfo *api.NodeInfo) error {
 		h.server = nil
 	}
 
-	cfg, err := h.buildServerConfig()
+	srv, err := h.newServer()
 	if err != nil {
-		return err
-	}
-	srv, err := server.NewServer(cfg)
-	if err != nil {
+		// nodeInfo 必须退回实际跑着的那份，端口跳跃规则跟着一起退，否则
+		// syncUsers、nodeMonitor 与 iptables 都会按一份没生效的配置判断。
+		h.nodeInfo = oldInfo
+		h.updatePortHopRulesLocked()
+
+		rebuilt := false
+		// 重试与证书重载传进来的就是缓存那份配置，回滚等于把同一份再造一次
+		if oldInfo != nil && oldInfo != nodeInfo {
+			if rollback, rollbackErr := h.newServer(); rollbackErr != nil {
+				h.logger.Errorf("Hysteria2 rollback to previous config failed: %v", rollbackErr)
+			} else {
+				h.server = rollback
+				h.serve(rollback, "rollback")
+				h.logger.Warnf("Hysteria2 reload failed, rolled back to previous config: %v", err)
+				rebuilt = true
+			}
+		}
+		h.setRebuildPending(!rebuilt)
 		return err
 	}
 	h.server = srv
-
-	go func() {
-		if err := h.server.Serve(); err != nil {
-			h.logger.Errorf("Hysteria2 Serve error after reload: %v", err)
-		}
-	}()
+	h.setRebuildPending(false)
+	h.serve(srv, "reload")
 
 	h.logger.Infof("Hysteria2 node reloaded on %s:%d", h.config.ListenIP, h.nodeInfo.Port)
 	return nil

@@ -361,8 +361,9 @@ func (s *TuicService) userMonitor() error {
 	if usersChanged {
 		s.syncUsers(newUserInfo)
 		// 被删用户已由 allowConnection 拦住，但新增凭据过不了 sing-box 的认证，
-		// 必须重建 inbound 才能连上。
-		if s.hasUnbuiltAuthUser() {
+		// 必须重建 inbound 才能连上；已置位待重建时交给 nodeMonitor 按退避重试，
+		// 那次重建同样会带上最新凭据，这里再触发一次只会绕开退避。
+		if s.hasUnbuiltAuthUser() && !s.awaitingRebuild() {
 			if err := s.reloadNode(s.currentNodeInfo()); err != nil {
 				s.logger.Errorf("TUIC rebuild for new users failed: %v", err)
 			}
@@ -434,6 +435,12 @@ func (s *TuicService) nodeMonitor() error {
 		if err.Error() == api.NodeNotModified {
 			// Reset failure counter on successful "not modified" response
 			s.consecutiveFailures = 0
+			// 304 不带配置，上一轮重建没走完时只能拿缓存的 nodeInfo 重试
+			if s.needsRebuild() {
+				if err := s.reloadNode(s.currentNodeInfo()); err != nil {
+					s.logger.Printf("TUIC node rebuild retry failed: %v", err)
+				}
+			}
 			return nil
 		}
 		s.logger.Print(err)
@@ -471,7 +478,7 @@ func (s *TuicService) nodeMonitor() error {
 	// actual TUIC configuration, which may cause the ETag to change on every
 	// poll. Guard against unnecessary hot-reloads by comparing the new NodeInfo
 	// with the current in-memory value, similar to controller.nodeInfoMonitor.
-	if current := s.currentNodeInfo(); current != nil && reflect.DeepEqual(current, nodeInfo) {
+	if current := s.currentNodeInfo(); current != nil && !s.needsRebuild() && reflect.DeepEqual(current, nodeInfo) {
 		return nil
 	}
 

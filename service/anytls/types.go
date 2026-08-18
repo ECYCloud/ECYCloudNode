@@ -49,6 +49,13 @@ type AnyTLSService struct {
 	// builtAuthUsers 是运行中的 inbound 实际认识的凭据。sing-box 的 AnyTLS
 	// inbound 在构造时就固化用户表且没有在线更新入口，靠它判断是否必须重建。
 	builtAuthUsers map[string]struct{}
+	// rebuildPending 记录「inbound 尚未按 nodeInfo 跑起来」。面板随后会返回 304，
+	// 届时既没有新配置可比，DeepEqual 也判不出重建没走完。
+	rebuildPending bool
+	// rebuildRetryAt / rebuildBackoff 给重试加退避。证书缺失时构建会真的向 ACME
+	// 发起签发，每个巡检周期重试一次会撞签发方的失败限额。
+	rebuildRetryAt time.Time
+	rebuildBackoff time.Duration
 
 	// reloadMu prevents concurrent rebuilds of the underlying sing-box
 	// instance when node configuration or certificates change.

@@ -42,6 +42,13 @@ type Hysteria2Service struct {
 	ipLastActive map[string]map[string]time.Time // uuid -> ip -> last active time
 	blockedIDs   map[string]bool                 // connection id -> blocked by audit
 	rateLimiters map[string]*rate.Limiter        // uuid -> per-user speed limiter
+	// rebuildPending 记录「server 尚未按 nodeInfo 装好」。面板随后会返回 304，
+	// 届时既没有新配置可比，DeepEqual 也判不出重建没走完。
+	rebuildPending bool
+	// rebuildRetryAt / rebuildBackoff 给重试加退避。证书缺失时构建会真的向 ACME
+	// 发起签发，每个巡检周期重试一次会撞签发方的失败限额。
+	rebuildRetryAt time.Time
+	rebuildBackoff time.Duration
 
 	// reloadMu serializes hot-reload operations (node / cert changes) so that
 	// we never rebuild the underlying Hysteria2 server concurrently from

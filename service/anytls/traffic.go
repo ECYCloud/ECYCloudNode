@@ -363,8 +363,9 @@ func (s *AnyTLSService) userMonitor() error {
 	if usersChanged {
 		s.syncUsers(newUserInfo)
 		// 被删用户已由 allowConnection 拦住，但新增凭据过不了 sing-box 的认证，
-		// 必须重建 inbound 才能连上。
-		if s.hasUnbuiltAuthUser() {
+		// 必须重建 inbound 才能连上；已置位待重建时交给 nodeMonitor 按退避重试，
+		// 那次重建同样会带上最新凭据，这里再触发一次只会绕开退避。
+		if s.hasUnbuiltAuthUser() && !s.awaitingRebuild() {
 			if err := s.reloadNode(s.currentNodeInfo()); err != nil {
 				s.logger.Errorf("AnyTLS rebuild for new users failed: %v", err)
 			}
@@ -436,6 +437,12 @@ func (s *AnyTLSService) nodeMonitor() error {
 		if err.Error() == api.NodeNotModified {
 			// Reset failure counter on successful "not modified" response
 			s.consecutiveFailures = 0
+			// 304 不带配置，上一轮重建没走完时只能拿缓存的 nodeInfo 重试
+			if s.needsRebuild() {
+				if err := s.reloadNode(s.currentNodeInfo()); err != nil {
+					s.logger.Printf("AnyTLS node rebuild retry failed: %v", err)
+				}
+			}
 			return nil
 		}
 		s.logger.Print(err)
@@ -472,7 +479,7 @@ func (s *AnyTLSService) nodeMonitor() error {
 	// Same as TUIC/Hysteria2: protect against noisy panel-side metadata updates
 	// that change the ETag without altering the actual AnyTLS node configuration
 	// by skipping reload when the effective NodeInfo is unchanged.
-	if current := s.currentNodeInfo(); current != nil && reflect.DeepEqual(current, nodeInfo) {
+	if current := s.currentNodeInfo(); current != nil && !s.needsRebuild() && reflect.DeepEqual(current, nodeInfo) {
 		return nil
 	}
 

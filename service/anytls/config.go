@@ -71,11 +71,6 @@ func (s *AnyTLSService) buildSingBox() (*box.Box, string, error) {
 	s.mu.Lock()
 	users := make([]option.AnyTLSUser, len(s.authUsers))
 	copy(users, s.authUsers)
-	built := make(map[string]struct{}, len(users))
-	for _, u := range users {
-		built[u.Name] = struct{}{}
-	}
-	s.builtAuthUsers = built
 	s.mu.Unlock()
 
 	inOpts := &option.AnyTLSInboundOptions{
@@ -120,6 +115,14 @@ func (s *AnyTLSService) buildSingBox() (*box.Box, string, error) {
 	} else {
 		s.frontListener = nil
 	}
+
+	built := make(map[string]struct{}, len(users))
+	for _, u := range users {
+		built[u.Name] = struct{}{}
+	}
+	s.mu.Lock()
+	s.builtAuthUsers = built
+	s.mu.Unlock()
 
 	return boxInstance, s.inboundTag, nil
 }

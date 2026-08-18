@@ -390,6 +390,12 @@ func (h *Hysteria2Service) nodeMonitor() error {
 		if err.Error() == api.NodeNotModified {
 			// Reset failure counter on successful "not modified" response
 			h.consecutiveFailures = 0
+			// 304 不带配置，上一轮重建没走完时只能拿缓存的 nodeInfo 重试
+			if h.needsRebuild() {
+				if err := h.reloadNode(h.nodeInfo); err != nil {
+					h.logger.Printf("Hysteria2 node rebuild retry failed: %v", err)
+				}
+			}
 			return nil
 		}
 		h.logger.Print(err)
@@ -428,7 +434,7 @@ func (h *Hysteria2Service) nodeMonitor() error {
 	// to change and GetNodeInfo to return 200 each time, leading to unnecessary
 	// server restarts. Avoid that by comparing the new NodeInfo with the current
 	// one and only reloading when there is a real config change.
-	if h.nodeInfo != nil && reflect.DeepEqual(h.nodeInfo, nodeInfo) {
+	if h.nodeInfo != nil && !h.needsRebuild() && reflect.DeepEqual(h.nodeInfo, nodeInfo) {
 		return nil
 	}
 

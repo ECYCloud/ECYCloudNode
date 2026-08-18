@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	box "github.com/sagernet/sing-box"
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/common/task"
 
@@ -17,6 +18,9 @@ import (
 )
 
 var _ service.Service = (*TuicService)(nil)
+
+// rebuildRetryBackoffMax 是待重建重试的退避上限。
+const rebuildRetryBackoffMax = 30 * time.Minute
 
 func New(apiClient api.API, cfg *controller.Config) *TuicService {
 	clientInfo := apiClient.Describe()
@@ -111,12 +115,7 @@ func (s *TuicService) Start() error {
 		return err
 	}
 	s.box = boxInstance
-
-	go func() {
-		if err := s.box.Start(); err != nil {
-			s.logger.Errorf("TUIC sing-box start error: %v", err)
-		}
-	}()
+	s.startBox(boxInstance, "start")
 
 	interval := time.Duration(s.config.UpdatePeriodic) * time.Second
 	s.tasks = []periodicTask{
@@ -155,14 +154,20 @@ func (s *TuicService) Start() error {
 }
 
 func (s *TuicService) Close() error {
+	// 摘下来再关：startBox 靠 s.box 是否还是自己来区分「我们关的」和「它自己没起来」
+	s.reloadMu.Lock()
+	instance := s.box
+	s.box = nil
+	s.reloadMu.Unlock()
+
 	for _, t := range s.tasks {
 		if t.Periodic != nil {
 			t.Periodic.Close()
 		}
 	}
 	s.tasks = nil
-	if s.box != nil {
-		return s.box.Close()
+	if instance != nil {
+		return instance.Close()
 	}
 	return nil
 }
@@ -173,6 +178,67 @@ func (s *TuicService) currentNodeInfo() *api.NodeInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.nodeInfo
+}
+
+// awaitingRebuild 报告节点是否已置位待重建，不看退避。
+func (s *TuicService) awaitingRebuild() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rebuildPending
+}
+
+// needsRebuild 报告是否该重试上一轮没走完的重建。退避未到就先不动。
+func (s *TuicService) needsRebuild() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rebuildPending && !time.Now().Before(s.rebuildRetryAt)
+}
+
+// setRebuildPending 置位或清除待重建。置位时按退避推后下一次重试：首次失败仍是
+// 下一轮立刻重试，之后逐次翻倍到 rebuildRetryBackoffMax，清除时归零。
+func (s *TuicService) setRebuildPending(pending bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !pending {
+		s.rebuildPending = false
+		s.rebuildRetryAt = time.Time{}
+		s.rebuildBackoff = 0
+		return
+	}
+
+	s.rebuildPending = true
+	s.rebuildRetryAt = time.Now().Add(s.rebuildBackoff)
+	next := 2 * s.rebuildBackoff
+	if next == 0 {
+		next = time.Duration(s.config.UpdatePeriodic) * time.Second
+	}
+	if next > rebuildRetryBackoffMax {
+		next = rebuildRetryBackoffMax
+	}
+	s.rebuildBackoff = next
+}
+
+// startBox 后台启动 box。sing-box 的入站在 Start 才绑定端口，端口被占之类的错误
+// 不会在构造阶段暴露，因此启动失败必须重新置位待重建；但这个 goroutine 可能晚到，
+// 只有它启动的仍是当前 box 才算故障，reloadMu 保证读到的是 reload 之后的状态。
+func (s *TuicService) startBox(instance *box.Box, phase string) {
+	go func() {
+		err := instance.Start()
+		if err == nil {
+			return
+		}
+
+		s.reloadMu.Lock()
+		superseded := s.box != instance
+		s.reloadMu.Unlock()
+		if superseded {
+			return
+		}
+
+		s.logger.Errorf("TUIC box start error (%s): %v", phase, err)
+		s.setRebuildPending(true)
+	}()
 }
 
 // reloadNode replaces in-memory node information and rebuilds the underlying
@@ -245,35 +311,32 @@ func (s *TuicService) reloadNode(nodeInfo *api.NodeInfo) error {
 
 	boxInstance, inboundTag, err := s.buildSingBox()
 	if err != nil {
-		// 旧 box 已经关掉了。若不回滚 nodeInfo，面板随后返回 304 或 DeepEqual
-		// 判定相等，节点就永远停在没有监听的状态上不再重试。
+		// nodeInfo 必须退回实际跑着的那份，否则 syncUsers 与 nodeMonitor 的
+		// DeepEqual 都会按一份没生效的配置判断。
 		s.mu.Lock()
 		s.nodeInfo = oldInfo
 		s.mu.Unlock()
-		if oldInfo != nil {
+
+		rebuilt := false
+		// 重试与证书重载传进来的就是缓存那份配置，回滚等于把同一份再造一次
+		if oldInfo != nil && oldInfo != nodeInfo {
 			if rollback, rollbackTag, rollbackErr := s.buildSingBox(); rollbackErr != nil {
 				s.logger.Errorf("TUIC rollback to previous config failed: %v", rollbackErr)
 			} else {
 				s.box = rollback
 				s.inboundTag = rollbackTag
-				go func() {
-					if startErr := s.box.Start(); startErr != nil {
-						s.logger.Errorf("TUIC box start error after rollback: %v", startErr)
-					}
-				}()
+				s.startBox(rollback, "rollback")
 				s.logger.Warnf("TUIC reload failed, rolled back to previous config: %v", err)
+				rebuilt = true
 			}
 		}
+		s.setRebuildPending(!rebuilt)
 		return err
 	}
 	s.box = boxInstance
 	s.inboundTag = inboundTag
-
-	go func() {
-		if err := s.box.Start(); err != nil {
-			s.logger.Errorf("TUIC box start error after reload: %v", err)
-		}
-	}()
+	s.setRebuildPending(false)
+	s.startBox(boxInstance, "reload")
 
 	s.logger.Infof("TUIC node reloaded on %s:%d", s.config.ListenIP, s.nodeInfo.Port)
 	return nil
