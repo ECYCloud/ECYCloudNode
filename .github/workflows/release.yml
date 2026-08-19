@@ -203,12 +203,20 @@ jobs:
           name: ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}
           path: |
             ./ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}/*
+      # 23 个矩阵作业并发调用 Release API，偶发 “other side closed”（对端关连接）。
+      # svenstaro/upload-release-action 无重试入参，首个请求失败即整步失败，故改用 gh + 重试。
+      # --clobber 让重试幂等，否则第二次会因资产已存在而失败。
       - name: Upload binaries to release
-        uses: svenstaro/upload-release-action@v2
         if: github.event_name == 'release'
+        uses: nick-fields/retry@v4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ./ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
-          # 对于 release 事件，显式使用 release 的 tag_name，避免出现“Input required and not supplied: tag”
-          tag: ${{ github.event.release.tag_name }}
-          file_glob: true
+          timeout_minutes: 10
+          retry_wait_seconds: 30
+          max_attempts: 5
+          command: |
+            gh release upload "${{ github.event.release.tag_name }}" \
+              ./ECYCloudNode-$ASSET_NAME.zip \
+              ./ECYCloudNode-$ASSET_NAME.zip.dgst \
+              --repo "$GITHUB_REPOSITORY" --clobber
