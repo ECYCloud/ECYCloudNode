@@ -488,9 +488,9 @@ func (c *APIClient) ReportKickedUsers(kickedUserList *[]api.OnlineUser) error {
 	return err
 }
 
-func (c *APIClient) ConsumeIpReclaim(uid int, ip string) (bool, error) {
+func (c *APIClient) ConsumeIpReclaim(uid int, ip string) (bool, string, error) {
 	if uid <= 0 || ip == "" {
-		return false, nil
+		return false, "", nil
 	}
 
 	path := "/mod_mu/users/ipreclaim"
@@ -506,16 +506,17 @@ func (c *APIClient) ConsumeIpReclaim(uid int, ip string) (bool, error) {
 
 	response, err := c.parseResponse(res, path, err)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	var payload struct {
-		OK bool `json:"ok"`
+		OK       bool   `json:"ok"`
+		TargetIP string `json:"target_ip"`
 	}
 	if err := json.Unmarshal(response.Data, &payload); err != nil {
-		return false, fmt.Errorf("unmarshal ipreclaim failed: %s", err)
+		return false, "", fmt.Errorf("unmarshal ipreclaim failed: %s", err)
 	}
-	return payload.OK, nil
+	return payload.OK, payload.TargetIP, nil
 }
 
 // ReportUserTraffic reports the user traffic

@@ -49,15 +49,20 @@ func peekOldestDeviceIP(activeMap map[string]time.Time) (string, bool) {
 	return oldestIP, true
 }
 
-// EvictOldestDeviceIP 从 activeMap 中移除最旧活跃 IP，同步清理 onlineIPs，返回被踢 IP。
-func EvictOldestDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time) (string, bool) {
-	oldestIP, ok := peekOldestDeviceIP(activeMap)
-	if !ok {
-		return "", false
+// EvictDeviceIP 移除用户选定的 target，同步清理 onlineIPs，返回被踢 IP。
+// target 为空或已不在线时退回最旧活跃 IP。
+func EvictDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time, target string) (string, bool) {
+	victim := target
+	if _, online := activeMap[victim]; !online {
+		oldestIP, ok := peekOldestDeviceIP(activeMap)
+		if !ok {
+			return "", false
+		}
+		victim = oldestIP
 	}
-	delete(activeMap, oldestIP)
+	delete(activeMap, victim)
 	if onlineIPs != nil {
-		delete(onlineIPs, oldestIP)
+		delete(onlineIPs, victim)
 	}
-	return oldestIP, true
+	return victim, true
 }

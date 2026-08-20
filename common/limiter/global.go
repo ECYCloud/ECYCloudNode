@@ -30,7 +30,7 @@ var (
 // 垫本地缓存，否则节点会拿过期副本写回。
 //
 // sweepPrelude 是三个脚本共用的前置片段：清掉过期 field，算出按活跃时间升序的存活
-// 列表与本次 IP 的活跃时间。ARGV 顺序固定为 now / expiry / ip / deviceLimit / touch。
+// 列表与本次 IP 的活跃时间。ARGV 顺序固定为 now / expiry / ip / deviceLimit / touch / target。
 const sweepPrelude = `
 local now = tonumber(ARGV[1])
 local expiry = tonumber(ARGV[2])
@@ -72,12 +72,23 @@ end
 return 0
 `)
 
-// evictScript 挤掉最旧的 IP 直到腾出名额，再登记本次 IP，返回被挤下线的 IP 列表。
+// evictScript 先挤掉用户选定的 target（不在线则跳过），不够再从最旧的开始补，
+// 腾出名额后登记本次 IP，返回被挤下线的 IP 列表。
 // 名额在两次往返之间被别的节点释放时不挤任何人，直接登记。
 var evictScript = redis.NewScript(sweepPrelude + `
 local limit = tonumber(ARGV[4])
+local target = ARGV[6]
 local kicked = {}
 if mine == nil then
+	if target ~= '' and target ~= ip and redis.call('HDEL', KEYS[1], target) == 1 then
+		kicked[#kicked + 1] = target
+		for i = 1, #live do
+			if live[i][1] == target then
+				table.remove(live, i)
+				break
+			end
+		end
+	end
 	for i = 1, #live - limit + 1 do
 		redis.call('HDEL', KEYS[1], live[i][1])
 		kicked[#kicked + 1] = live[i][1]
@@ -143,13 +154,13 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 }
 
 // Allow 判定 uid 的 ip 是否允许在线（全局口径）。
-// 已在线 IP 刷新活跃时间并放行；新 IP 在名额未满时登记放行，超限须已有官方确认才踢最旧。
-func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int, granted bool) bool {
+// 已在线 IP 刷新活跃时间并放行；新 IP 在名额未满时登记放行，超限须已有官方确认才踢人。
+func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int, grant ReclaimGrant) bool {
 	if g == nil || deviceLimit <= 0 {
 		return true
 	}
 
-	admitted, err := g.eval(admitScript, uid, ip, deviceLimit).Int()
+	admitted, err := g.eval(admitScript, uid, ip, deviceLimit, "").Int()
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "cache service")
 		return true
@@ -161,11 +172,13 @@ func (g *GlobalDeviceChecker) Allow(uid int, ip string, deviceLimit int, granted
 	// 名额已满。踢人要先拿到官方客户端的确认，而那是一次对面板的 HTTP 调用，
 	// 放不进 Lua，只能拆成「判满 → 取确认 → 原子腾位并登记」三步。判满与腾位
 	// 各自原子，所以中途被别的节点占了名额也不会超额登记。
-	if !granted && !ConsumeReclaimGrant(uid, ip) {
-		return false
+	if !grant.Granted {
+		if grant = ConsumeReclaimGrant(uid, ip); !grant.Granted {
+			return false
+		}
 	}
 
-	kicked, err := g.eval(evictScript, uid, ip, deviceLimit).StringSlice()
+	kicked, err := g.eval(evictScript, uid, ip, deviceLimit, grant.TargetIP).StringSlice()
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "cache service")
 		return true
@@ -182,7 +195,7 @@ func (g *GlobalDeviceChecker) Refresh(uid int, ip string, deviceLimit int) bool 
 		return true
 	}
 
-	online, err := g.eval(refreshScript, uid, ip, deviceLimit).Int()
+	online, err := g.eval(refreshScript, uid, ip, deviceLimit, "").Int()
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "cache service")
 		return true
@@ -190,11 +203,11 @@ func (g *GlobalDeviceChecker) Refresh(uid int, ip string, deviceLimit int) bool 
 	return online == 1
 }
 
-func (g *GlobalDeviceChecker) eval(script *redis.Script, uid int, ip string, deviceLimit int) *redis.Cmd {
+func (g *GlobalDeviceChecker) eval(script *redis.Script, uid int, ip string, deviceLimit int, target string) *redis.Cmd {
 	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 	defer cancel()
 
 	// Run 是同步的，返回时结果已落到 Cmd 上，随后取消 context 不影响取值。
 	return script.Run(ctx, g.client, []string{fmt.Sprintf("UID|%d", uid)},
-		time.Now().Unix(), g.expiry, ip, deviceLimit, onlineTouchSec)
+		time.Now().Unix(), g.expiry, ip, deviceLimit, onlineTouchSec, target)
 }

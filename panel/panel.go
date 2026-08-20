@@ -325,13 +325,13 @@ func (p *Panel) Start() {
 			}
 		}
 
-		limiter.SetReclaimConsumer(func(uid int, ip string) bool {
-			ok, err := apiClient.ConsumeIpReclaim(uid, ip)
+		limiter.SetReclaimConsumer(func(uid int, ip string) (bool, string) {
+			ok, targetIP, err := apiClient.ConsumeIpReclaim(uid, ip)
 			if err != nil {
 				log.Warnf("ConsumeIpReclaim uid=%d ip=%s: %v", uid, ip, err)
-				return false
+				return false, ""
 			}
-			return ok
+			return ok, targetIP
 		})
 
 		// Register service for this node

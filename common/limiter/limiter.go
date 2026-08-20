@@ -195,7 +195,7 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 	v, _ := inboundInfo.UserOnlineIP.LoadOrStore(userKey, new(sync.Map))
 	ipMap := v.(*sync.Map)
 
-	granted := false
+	var grant ReclaimGrant
 	if _, online := ipMap.Load(ip); online {
 		ipMap.Store(ip, onlineEntry{UID: uid, LastSeen: now})
 	} else {
@@ -212,16 +212,19 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 			if _, ok := peekOldestOnlineIP(ipMap, now); !ok {
 				return false
 			}
-			if !ConsumeReclaimGrant(uid, ip) {
+			grant = ConsumeReclaimGrant(uid, ip)
+			if !grant.Granted {
 				return false
 			}
-			granted = true
+			// 用户只选了一个，名额缺口不止一个时其余继续踢最旧的
+			target := grant.TargetIP
 			for deviceLimit > 0 && counter >= deviceLimit {
-				oldestIP, ok := evictOldestOnlineIP(ipMap, now)
+				evicted, ok := evictOnlineIP(ipMap, now, target)
 				if !ok {
 					return false
 				}
-				NoteDeviceKick(uid, oldestIP)
+				NoteDeviceKick(uid, evicted)
+				target = ""
 				counter--
 			}
 		}
@@ -229,7 +232,7 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 	}
 
 	// 全局（跨节点）限制
-	if !inboundInfo.GlobalLimit.Allow(uid, ip, deviceLimit, granted) {
+	if !inboundInfo.GlobalLimit.Allow(uid, ip, deviceLimit, grant) {
 		ipMap.Delete(ip)
 		return false
 	}
@@ -257,13 +260,18 @@ func peekOldestOnlineIP(ipMap *sync.Map, now int64) (string, bool) {
 	return oldestIP, true
 }
 
-func evictOldestOnlineIP(ipMap *sync.Map, now int64) (string, bool) {
-	oldestIP, ok := peekOldestOnlineIP(ipMap, now)
-	if !ok {
-		return "", false
+// evictOnlineIP 踢掉用户选定的 target；target 为空或已不在线时退回最旧活跃 IP。
+func evictOnlineIP(ipMap *sync.Map, now int64, target string) (string, bool) {
+	victim := target
+	if _, online := ipMap.Load(victim); !online {
+		oldestIP, ok := peekOldestOnlineIP(ipMap, now)
+		if !ok {
+			return "", false
+		}
+		victim = oldestIP
 	}
-	ipMap.Delete(oldestIP)
-	return oldestIP, true
+	ipMap.Delete(victim)
+	return victim, true
 }
 
 // EnsureOnline 供上行方向（客户端→服务端有真实数据）周期性复查：
