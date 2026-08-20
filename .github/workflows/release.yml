@@ -135,8 +135,15 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      # 23 个矩阵作业并发拉包，proxy.golang.org 偶发 INTERNAL_ERROR 断流，
+      # go mod download 首个模块失败即整步失败。已下好的模块留在本地缓存，重试只补缺口。
       - name: Get project dependencies
-        run: go mod download
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 15
+          retry_wait_seconds: 30
+          max_attempts: 3
+          command: go mod download
 
 
       - name: Build ECYCloudNode
