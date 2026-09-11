@@ -3,6 +3,7 @@ package anytls
 import (
 	"net"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/sagernet/sing-box/option"
@@ -25,6 +26,8 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 	newUsers := make(map[string]userRecord, len(*userInfo))
 	authUsers := make([]option.AnyTLSUser, 0, len(*userInfo)*2)
 	newRateLimiters := make(map[string]*rate.Limiter)
+	accountLimiters := make(map[int]*rate.Limiter)
+	accountSlots := make(map[int]limiter.DeviceSlots)
 
 	var nodeLimit uint64
 	if s.nodeInfo != nil {
@@ -35,10 +38,12 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 		keys := []string{u.UUID, u.Passwd}
 		rec := userRecord{
 			UID:         u.UID,
+			ClientID:    u.ClientID,
 			Email:       u.Email,
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
 		}
+		limiter.ShareAccountSlots(accountSlots, u.UID, u.ClientID, keys, s.onlineIPs, s.ipLastActive)
 
 		limit := determineRate(nodeLimit, u.SpeedLimit)
 		var limiter *rate.Limiter
@@ -58,6 +63,12 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 			if limiter == nil {
 				limiter = rate.NewLimiter(rate.Limit(limit), int(limit))
 			}
+		}
+
+		if shared := accountLimiters[u.UID]; shared != nil {
+			limiter = shared
+		} else if limiter != nil {
+			accountLimiters[u.UID] = limiter
 		}
 
 		for _, k := range keys {
@@ -153,6 +164,9 @@ func (s *AnyTLSService) allowConnection(uuid, ip string) bool {
 		return false
 	}
 
+	// 官方客户端按设备标识占名额，换网络不重复占用；第三方仍按出口 IP
+	slot := limiter.OnlineKey(user.ClientID, host)
+
 	ips, ok := s.onlineIPs[uuid]
 	if !ok {
 		ips = make(map[string]struct{})
@@ -166,7 +180,7 @@ func (s *AnyTLSService) allowConnection(uuid, ip string) bool {
 		s.ipLastActive[uuid] = activeMap
 	}
 
-	allowed, grant := limiter.AdmitDeviceIP(ips, activeMap, host, user.UID, user.DeviceLimit)
+	allowed, grant := limiter.AdmitDeviceIP(ips, activeMap, slot, user.UID, user.DeviceLimit)
 	s.mu.Unlock()
 	if !allowed {
 		s.logger.WithFields(log.Fields{
@@ -178,11 +192,11 @@ func (s *AnyTLSService) allowConnection(uuid, ip string) bool {
 	}
 
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if !s.globalChecker.Allow(user.UID, host, user.DeviceLimit, grant) {
+	if !s.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant) {
 		s.mu.Lock()
-		delete(s.onlineIPs[uuid], host)
+		delete(s.onlineIPs[uuid], slot)
 		if am, ok := s.ipLastActive[uuid]; ok {
-			delete(am, host)
+			delete(am, slot)
 		}
 		s.mu.Unlock()
 		s.logger.WithFields(log.Fields{
@@ -211,19 +225,10 @@ func (s *AnyTLSService) updateOnlineIP(uuid string, addr net.Addr) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if ipSet, exists := s.onlineIPs[uuid]; exists {
-		if _, online := ipSet[host]; online {
-			if activeMap, ok := s.ipLastActive[uuid]; ok {
-				activeMap[host] = time.Now()
-			}
-		}
-	}
+	s.updateOnlineIPSimple(uuid, host)
 }
 
-// updateOnlineIPSimple 仅刷新仍持有名额的 IP（UDP 路径，host 已解析）。
+// updateOnlineIPSimple 仅刷新仍持有名额的条目（UDP 路径，host 已解析）。
 func (s *AnyTLSService) updateOnlineIPSimple(uuid, host string) {
 	if host == "" || uuid == "" {
 		return
@@ -232,10 +237,14 @@ func (s *AnyTLSService) updateOnlineIPSimple(uuid, host string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	slot := host
+	if user, ok := s.users[uuid]; ok {
+		slot = limiter.OnlineKey(user.ClientID, host)
+	}
 	if ipSet, exists := s.onlineIPs[uuid]; exists {
-		if _, online := ipSet[host]; online {
+		if _, online := ipSet[slot]; online {
 			if activeMap, ok := s.ipLastActive[uuid]; ok {
-				activeMap[host] = time.Now()
+				activeMap[slot] = time.Now()
 			}
 		}
 	}
@@ -289,13 +298,20 @@ func (s *AnyTLSService) collectUsage() ([]api.UserTraffic, []api.OnlineUser, map
 	}
 
 	var online []api.OnlineUser
+	// 同账号的官方设备共用一份账本，多个认证键指向同一张表，按「账号+名额标识」去重
+	seen := make(map[string]struct{})
 	for uuid, ipSet := range s.onlineIPs {
 		user, ok := s.users[uuid]
 		if !ok {
 			continue
 		}
 		for ip := range ipSet {
-			online = append(online, api.OnlineUser{UID: user.UID, IP: ip})
+			key := strconv.Itoa(user.UID) + "|" + ip
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			online = append(online, api.OnlineUser{UID: user.UID, IP: ip, ClientID: limiter.ClientIDFromOnlineKey(ip)})
 		}
 	}
 

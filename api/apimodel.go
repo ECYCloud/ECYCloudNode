@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -162,6 +163,7 @@ type TuicConfig struct {
 
 type UserInfo struct {
 	UID         int
+	ClientID    int
 	Email       string
 	UUID        string
 	Passwd      string
@@ -171,9 +173,17 @@ type UserInfo struct {
 	DeviceLimit int
 }
 
+func (u UserInfo) Key(tag string) string {
+	if u.ClientID != 0 {
+		return fmt.Sprintf("%s|client-%d|%d", tag, u.ClientID, u.UID)
+	}
+	return fmt.Sprintf("%s|%d", tag, u.UID)
+}
+
 type OnlineUser struct {
-	UID int
-	IP  string
+	UID      int
+	IP       string
+	ClientID int
 }
 
 type UserTraffic struct {

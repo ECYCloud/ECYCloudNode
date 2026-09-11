@@ -207,7 +207,13 @@ func (g *GlobalDeviceChecker) eval(script *redis.Script, uid int, ip string, dev
 	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 	defer cancel()
 
+	// 官方客户端与第三方分开记账：两组各自独立使用同一个上限，不互相挤占名额
+	redisKey := fmt.Sprintf("UID|%d", uid)
+	if IsClientOnlineKey(ip) {
+		redisKey += "|client"
+	}
+
 	// Run 是同步的，返回时结果已落到 Cmd 上，随后取消 context 不影响取值。
-	return script.Run(ctx, g.client, []string{fmt.Sprintf("UID|%d", uid)},
+	return script.Run(ctx, g.client, []string{redisKey},
 		time.Now().Unix(), g.expiry, ip, deviceLimit, onlineTouchSec, target)
 }

@@ -32,7 +32,9 @@ type APIClient struct {
 	DeviceLimit      int
 	LocalRuleList    []api.DetectRule
 	LastReportOnline map[int]int
-	access           sync.Mutex
+	// LastReportOnlineClients 本节点上报的官方在线客户端数，与 LastReportOnline 分开记
+	LastReportOnlineClients map[int]int
+	access                  sync.Mutex
 	// eTags 被节点与用户两个周期任务的 goroutine 共用，必须全程持锁访问：
 	// 裸 map 的并发读写是 Go 运行时 fatal error，recover 拦不住。
 	eTagsMu sync.Mutex
@@ -148,7 +150,8 @@ func New(apiConfig *api.Config) *APIClient {
 		DeviceLimit:      apiConfig.DeviceLimit,
 		LocalRuleList:    localRuleList,
 		LastReportOnline: make(map[int]int),
-		eTags:            make(map[string]string),
+		LastReportOnlineClients: make(map[int]int),
+		eTags:                   make(map[string]string),
 	}
 }
 
@@ -423,17 +426,23 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 	defer c.access.Unlock()
 
 	reportOnline := make(map[int]int)
+	reportOnlineClients := make(map[int]int)
 	var data []OnlineUser
 	if onlineUserList != nil {
 		data = make([]OnlineUser, len(*onlineUserList))
 		for i, user := range *onlineUserList {
-			data[i] = OnlineUser{UID: user.UID, IP: user.IP}
-			reportOnline[user.UID]++
+			data[i] = OnlineUser{UID: user.UID, IP: user.IP, ClientID: user.ClientID}
+			if user.ClientID != 0 {
+				reportOnlineClients[user.UID]++
+			} else {
+				reportOnline[user.UID]++
+			}
 		}
 	}
 	// 空列表也必须上报并重置 LastReportOnline，否则下线 IP 后本节点仍保留旧计数，
 	// 面板 alive_ip 也无法按节点全量同步清除，导致名额长期被占。
 	c.LastReportOnline = reportOnline
+	c.LastReportOnlineClients = reportOnlineClients
 
 	if len(data) > 0 {
 		first := data[0]
@@ -722,11 +731,14 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 			deviceLimit = user.DeviceLimit
 		}
 
-		// 超限时由节点本地/Redis 踢最旧 IP，不再因全局已满而跳过下发用户。
+		// 超限时由节点本地/Redis 踢最旧的一个，不再因全局已满而跳过下发用户。
+		// 官方客户端与第三方各自一套计数：alive_ip 分别是账号的在线客户端数 / 在线 IP 数。
 		if deviceLimit > 0 && user.AliveIP > 0 {
 			lastOnline := 0
-			if v, ok := c.LastReportOnline[user.ID]; ok {
-				lastOnline = v
+			if user.ClientID != 0 {
+				lastOnline = c.LastReportOnlineClients[user.ID]
+			} else {
+				lastOnline = c.LastReportOnline[user.ID]
 			}
 			if localDeviceLimit = deviceLimit - user.AliveIP + lastOnline; localDeviceLimit > 0 {
 				deviceLimit = localDeviceLimit
@@ -742,6 +754,7 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 		}
 		userList = append(userList, api.UserInfo{
 			UID:         user.ID,
+			ClientID:    user.ClientID,
 			UUID:        user.UUID,
 			Passwd:      user.Passwd,
 			SpeedLimit:  speedLimit,

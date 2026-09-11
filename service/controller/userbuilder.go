@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
@@ -114,10 +113,5 @@ func cipherFromString(c string) shadowsocks.CipherType {
 }
 
 func (c *Controller) buildUserTag(user *api.UserInfo) string {
-	// Include node Tag in the user identifier to prevent cross-node traffic mixing
-	// when multiple nodes run in the same ECYCloudNode process.
-	// Format: NodeTag|UID
-	// This ensures each node has its own independent traffic counters.
-	// Note: limiter.go must use the same format for UserInfo storage keys.
-	return fmt.Sprintf("%s|%d", c.Tag, user.UID)
+	return user.Key(c.Tag)
 }

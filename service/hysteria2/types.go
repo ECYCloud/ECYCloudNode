@@ -68,6 +68,7 @@ type Hysteria2Service struct {
 }
 
 type userRecord struct {
+	ClientID    int
 	UID         int
 	Email       string
 	DeviceLimit int

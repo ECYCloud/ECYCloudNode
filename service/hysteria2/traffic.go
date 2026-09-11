@@ -3,6 +3,7 @@ package hysteria2
 import (
 	"context"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
@@ -43,7 +44,7 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 
 	if _, ok := t.svc.users[id]; !ok {
 		t.svc.mu.Unlock()
-		return true
+		return false
 	}
 	counter, ok := t.svc.traffic[id]
 	if !ok {
@@ -88,6 +89,8 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 
 	newUsers := make(map[string]userRecord, len(*userInfo))
 	newRateLimiters := make(map[string]*rate.Limiter)
+	accountLimiters := make(map[int]*rate.Limiter)
+	accountSlots := make(map[int]limiter.DeviceSlots)
 
 	var nodeLimit uint64
 	if h.nodeInfo != nil {
@@ -100,10 +103,12 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 		keys := []string{u.UUID, u.Passwd}
 		rec := userRecord{
 			UID:         u.UID,
+			ClientID:    u.ClientID,
 			Email:       u.Email,
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
 		}
+		limiter.ShareAccountSlots(accountSlots, u.UID, u.ClientID, keys, h.onlineIPs, h.ipLastActive)
 
 		limit := determineRate(nodeLimit, u.SpeedLimit)
 		var limiter *rate.Limiter
@@ -123,6 +128,12 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 			if limiter == nil {
 				limiter = rate.NewLimiter(rate.Limit(limit), int(limit))
 			}
+		}
+
+		if shared := accountLimiters[u.UID]; shared != nil {
+			limiter = shared
+		} else if limiter != nil {
+			accountLimiters[u.UID] = limiter
 		}
 
 		for _, k := range keys {
@@ -233,13 +244,20 @@ func (h *Hysteria2Service) collectUsage() ([]api.UserTraffic, []api.OnlineUser, 
 	}
 
 	var onlineUsers []api.OnlineUser
+	// 同账号的官方设备共用一份账本，多个认证键指向同一张表，按「账号+名额标识」去重
+	seen := make(map[string]struct{})
 	for uuid, ipSet := range h.onlineIPs {
 		user, ok := h.users[uuid]
 		if !ok {
 			continue
 		}
 		for ip := range ipSet {
-			onlineUsers = append(onlineUsers, api.OnlineUser{UID: user.UID, IP: ip})
+			key := strconv.Itoa(user.UID) + "|" + ip
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			onlineUsers = append(onlineUsers, api.OnlineUser{UID: user.UID, IP: ip, ClientID: limiter.ClientIDFromOnlineKey(ip)})
 		}
 	}
 

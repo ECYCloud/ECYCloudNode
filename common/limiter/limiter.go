@@ -23,6 +23,7 @@ const (
 
 type UserInfo struct {
 	UID         int
+	ClientID    int
 	SpeedLimit  uint64
 	DeviceLimit int
 }
@@ -38,8 +39,17 @@ type InboundInfo struct {
 	NodeSpeedLimit uint64
 	UserInfo       *sync.Map // Key: user identifier (usually UID string) -> UserInfo
 	BucketHub      *sync.Map // Key: user identifier -> *rate.Limiter
-	UserOnlineIP   *sync.Map // Key: user identifier -> *sync.Map (Key: IP, Value: onlineEntry)
+	UserOnlineIP   *sync.Map // Key: onlineBucket() -> *sync.Map (Key: OnlineKey(), Value: onlineEntry)
 	GlobalLimit    *GlobalDeviceChecker
+}
+
+// onlineBucket 名额账本的分桶键。官方客户端每台设备有独立 userKey，必须并到账号级
+// 桶里才数得出「该账号几台在线」；官方与第三方分桶，两组各自独立使用同一个上限。
+func onlineBucket(tag string, uid, clientID int) string {
+	if clientID != 0 {
+		return fmt.Sprintf("%s|%d|client", tag, uid)
+	}
+	return fmt.Sprintf("%s|%d", tag, uid)
 }
 
 type Limiter struct {
@@ -63,11 +73,10 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 
 	userMap := new(sync.Map)
 	for _, u := range *userList {
-		// Use tag|UID format to match buildUserTag() in controller
-		// This ensures consistent key format across limiter and traffic counter
-		userKey := fmt.Sprintf("%s|%d", tag, u.UID)
+		userKey := u.Key(tag)
 		userMap.Store(userKey, UserInfo{
 			UID:         u.UID,
+			ClientID:    u.ClientID,
 			SpeedLimit:  u.SpeedLimit,
 			DeviceLimit: u.DeviceLimit,
 		})
@@ -82,14 +91,16 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 		inboundInfo := value.(*InboundInfo)
 		// Update User info
 		for _, u := range *updatedUserList {
-			// Use tag|UID format to match buildUserTag() in controller
-			// This ensures consistent key format across limiter and traffic counter
-			userKey := fmt.Sprintf("%s|%d", tag, u.UID)
+			userKey := u.Key(tag)
 			inboundInfo.UserInfo.Store(userKey, UserInfo{
 				UID:         u.UID,
+				ClientID:    u.ClientID,
 				SpeedLimit:  u.SpeedLimit,
 				DeviceLimit: u.DeviceLimit,
 			})
+			if u.ClientID != 0 {
+				userKey = fmt.Sprintf("%s|%d", tag, u.UID)
+			}
 			// Update old limiter bucket
 			limit := determineRate(inboundInfo.NodeSpeedLimit, u.SpeedLimit)
 			if limit > 0 {
@@ -132,7 +143,8 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 					return true
 				}
 				active++
-				onlineUser = append(onlineUser, api.OnlineUser{UID: entry.UID, IP: ipKey.(string)})
+				slot := ipKey.(string)
+				onlineUser = append(onlineUser, api.OnlineUser{UID: entry.UID, IP: slot, ClientID: ClientIDFromOnlineKey(slot)})
 				return true
 			})
 			if active == 0 {
@@ -152,8 +164,8 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 func (l *Limiter) GetUserBucket(tag string, userKey string, ip string) (limiter *rate.Limiter, SpeedLimit bool, Reject bool) {
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		var (
-			userLimit        uint64
-			deviceLimit, uid int
+			userLimit                  uint64
+			deviceLimit, uid, clientID int
 		)
 
 		inboundInfo := value.(*InboundInfo)
@@ -164,13 +176,16 @@ func (l *Limiter) GetUserBucket(tag string, userKey string, ip string) (limiter 
 			uid = u.UID
 			userLimit = u.SpeedLimit
 			deviceLimit = u.DeviceLimit
+			clientID = u.ClientID
 		}
 
-		// Local + global device limit (registers the IP as online on success)
 		if !admitIP(inboundInfo, userKey, ip, uid, deviceLimit) {
 			return nil, false, true
 		}
 
+		if clientID != 0 {
+			userKey = fmt.Sprintf("%s|%d", tag, uid)
+		}
 		// Speed limit
 		limit := determineRate(nodeLimit, userLimit) // Determine the speed limit rate
 		if limit > 0 {
@@ -188,16 +203,22 @@ func (l *Limiter) GetUserBucket(tag string, userKey string, ip string) (limiter 
 	return nil, false, false
 }
 
-// admitIP 登记/刷新用户的在线 IP；名额满时须有官方客户端确认才踢最旧 IP。
-// 已在线 IP 刷新活跃时间放行；新 IP 在清理过期条目后按剩余名额判定，不足则拒绝。
+// admitIP 登记/刷新用户占用的在线名额；名额满时须有官方客户端确认才踢最旧的一个。
+// 已在线的名额刷新活跃时间放行；新名额在清理过期条目后按剩余额度判定，不足则拒绝。
+// 官方客户端按设备标识占名额，第三方按出口 IP 占名额，两组各自独立计数。
 func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int) bool {
+	clientID := 0
+	if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
+		clientID = v.(UserInfo).ClientID
+	}
+	slot := OnlineKey(clientID, ip)
 	now := time.Now().Unix()
-	v, _ := inboundInfo.UserOnlineIP.LoadOrStore(userKey, new(sync.Map))
+	v, _ := inboundInfo.UserOnlineIP.LoadOrStore(onlineBucket(inboundInfo.Tag, uid, clientID), new(sync.Map))
 	ipMap := v.(*sync.Map)
 
 	var grant ReclaimGrant
-	if _, online := ipMap.Load(ip); online {
-		ipMap.Store(ip, onlineEntry{UID: uid, LastSeen: now})
+	if _, online := ipMap.Load(slot); online {
+		ipMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
 	} else {
 		counter := 0
 		ipMap.Range(func(key, value interface{}) bool {
@@ -212,7 +233,7 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 			if _, ok := peekOldestOnlineIP(ipMap, now); !ok {
 				return false
 			}
-			grant = ConsumeReclaimGrant(uid, ip)
+			grant = ConsumeReclaimGrant(uid, slot)
 			if !grant.Granted {
 				return false
 			}
@@ -228,12 +249,12 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 				counter--
 			}
 		}
-		ipMap.Store(ip, onlineEntry{UID: uid, LastSeen: now})
+		ipMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
 	}
 
 	// 全局（跨节点）限制
-	if !inboundInfo.GlobalLimit.Allow(uid, ip, deviceLimit, grant) {
-		ipMap.Delete(ip)
+	if !inboundInfo.GlobalLimit.Allow(uid, slot, deviceLimit, grant) {
+		ipMap.Delete(slot)
 		return false
 	}
 	return true
@@ -284,19 +305,21 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	}
 	inboundInfo := value.(*InboundInfo)
 
-	var uid, deviceLimit int
+	var uid, deviceLimit, clientID int
 	if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
 		u := v.(UserInfo)
 		uid = u.UID
 		deviceLimit = u.DeviceLimit
+		clientID = u.ClientID
 	}
+	slot := OnlineKey(clientID, ip)
 
-	v, ok := inboundInfo.UserOnlineIP.Load(userKey)
+	v, ok := inboundInfo.UserOnlineIP.Load(onlineBucket(tag, uid, clientID))
 	if !ok {
 		return false
 	}
 	ipMap := v.(*sync.Map)
-	entryValue, online := ipMap.Load(ip)
+	entryValue, online := ipMap.Load(slot)
 	if !online {
 		return false
 	}
@@ -304,13 +327,13 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	now := time.Now().Unix()
 	entry := entryValue.(onlineEntry)
 	if now-entry.LastSeen > int64(OnlineIPExpiry/time.Second) {
-		ipMap.Delete(ip)
+		ipMap.Delete(slot)
 		return false
 	}
-	ipMap.Store(ip, onlineEntry{UID: uid, LastSeen: now})
+	ipMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
 
-	if !inboundInfo.GlobalLimit.Refresh(uid, ip, deviceLimit) {
-		ipMap.Delete(ip)
+	if !inboundInfo.GlobalLimit.Refresh(uid, slot, deviceLimit) {
+		ipMap.Delete(slot)
 		return false
 	}
 	return true
@@ -327,15 +350,19 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 	}
 	inboundInfo := value.(*InboundInfo)
 
-	var deviceLimit int
+	var uid, deviceLimit, clientID int
 	if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
-		deviceLimit = v.(UserInfo).DeviceLimit
+		u := v.(UserInfo)
+		uid = u.UID
+		deviceLimit = u.DeviceLimit
+		clientID = u.ClientID
 	}
 	if deviceLimit <= 0 {
 		return true
 	}
+	slot := OnlineKey(clientID, ip)
 
-	v, ok := inboundInfo.UserOnlineIP.Load(userKey)
+	v, ok := inboundInfo.UserOnlineIP.Load(onlineBucket(tag, uid, clientID))
 	if !ok {
 		return true
 	}
@@ -348,7 +375,7 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 		if now-value.(onlineEntry).LastSeen > int64(OnlineIPExpiry/time.Second) {
 			return true
 		}
-		if key.(string) == ip {
+		if key.(string) == slot {
 			selfFresh = true
 			return false
 		}

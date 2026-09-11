@@ -42,6 +42,9 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		return false, ""
 	}
 
+	// 官方客户端按设备标识占名额，换网络不重复占用；第三方仍按出口 IP
+	slot := limiter.OnlineKey(user.ClientID, host)
+
 	ipSet, ok := a.svc.onlineIPs[auth]
 	if !ok {
 		ipSet = make(map[string]struct{})
@@ -55,7 +58,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		a.svc.ipLastActive[auth] = activeMap
 	}
 
-	allowed, grant := limiter.AdmitDeviceIP(ipSet, activeMap, host, user.UID, user.DeviceLimit)
+	allowed, grant := limiter.AdmitDeviceIP(ipSet, activeMap, slot, user.UID, user.DeviceLimit)
 	a.svc.mu.Unlock()
 	if !allowed {
 		logger.WithFields(log.Fields{
@@ -67,11 +70,11 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 	}
 
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if !a.svc.globalChecker.Allow(user.UID, host, user.DeviceLimit, grant) {
+	if !a.svc.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant) {
 		a.svc.mu.Lock()
-		delete(a.svc.onlineIPs[auth], host)
+		delete(a.svc.onlineIPs[auth], slot)
 		if am, ok := a.svc.ipLastActive[auth]; ok {
-			delete(am, host)
+			delete(am, slot)
 		}
 		a.svc.mu.Unlock()
 		logger.WithFields(log.Fields{

@@ -69,6 +69,7 @@ type AnyTLSService struct {
 }
 
 type userRecord struct {
+	ClientID    int
 	UID         int
 	Email       string
 	DeviceLimit int

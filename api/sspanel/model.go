@@ -71,6 +71,7 @@ type CustomConfig struct {
 // UserResponse is the response of user
 type UserResponse struct {
 	ID          int     `json:"id"`
+	ClientID    int     `json:"client_id"`
 	Passwd      string  `json:"passwd"`
 	Port        uint32  `json:"port"`
 	Method      string  `json:"method"`
@@ -99,8 +100,9 @@ type SystemLoad struct {
 
 // OnlineUser is the data structure of online user
 type OnlineUser struct {
-	UID int    `json:"user_id"`
-	IP  string `json:"ip"`
+	UID      int    `json:"user_id"`
+	IP       string `json:"ip"`
+	ClientID int    `json:"client_id,omitempty"`
 }
 
 // UserTraffic is the data structure of traffic
