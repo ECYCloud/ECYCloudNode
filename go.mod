@@ -5,7 +5,7 @@ go 1.26.5
 require (
 	dario.cat/mergo v1.0.2
 	github.com/apernet/hysteria/core/v2 v2.12.2
-	github.com/apernet/hysteria/extras/v2 v2.12.1
+	github.com/apernet/hysteria/extras/v2 v2.12.2
 	github.com/deckarep/golang-set v1.8.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-acme/lego/v4 v4.35.2
