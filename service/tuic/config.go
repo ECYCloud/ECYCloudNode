@@ -34,7 +34,7 @@ func (s *TuicService) buildSingBox() (*box.Box, string, error) {
 	}
 
 	ctx := context.Background()
-	ctx = box.Context(ctx, include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry(), include.DNSTransportRegistry(), include.ServiceRegistry())
+	ctx = box.Context(ctx, include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry(), include.DNSTransportRegistry(), include.ServiceRegistry(), include.CertificateProviderRegistry())
 
 	opts := option.Options{
 		Log: &option.LogOptions{

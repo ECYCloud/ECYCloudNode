@@ -66,7 +66,7 @@ func (s *AnyTLSService) acceptProxyProtocolConns(ln net.Listener, injectable ada
 			// 之后 conn 的后续 Read/Write 拿到的就是纯 TLS 数据。
 			metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 			metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
-			injectable.NewConnectionEx(context.Background(), conn, metadata, nil)
+			injectable.NewConnection(context.Background(), conn, metadata, nil)
 		}()
 	}
 }

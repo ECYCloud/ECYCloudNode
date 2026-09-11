@@ -204,12 +204,25 @@ jobs:
       - name: Change the name
         run: |
           mv build_assets ECYCloudNode-$ASSET_NAME
+      # 23 个矩阵作业并发上传，Artifact 服务偶发 ETIMEDOUT（Failed to CreateArtifact）。
+      # actions/upload-artifact 无重试入参，nick-fields/retry 又只能包 shell 命令、包不了 action，
+      # 故首次失败先不中断作业，再试一次；overwrite 让重试幂等，否则第二次会因同名资产已存在而失败。
       - name: Upload files to Artifacts
+        id: upload_artifact
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}
+          path: |
+            ./ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}/*
+      - name: Upload files to Artifacts (retry)
+        if: steps.upload_artifact.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
           name: ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}
           path: |
             ./ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}/*
+          overwrite: true
       # 23 个矩阵作业并发调用 Release API，偶发 “other side closed”（对端关连接）。
       # svenstaro/upload-release-action 无重试入参，首个请求失败即整步失败，故改用 gh + 重试。
       # --clobber 让重试幂等，否则第二次会因资产已存在而失败。

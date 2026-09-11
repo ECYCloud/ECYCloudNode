@@ -7,6 +7,7 @@ import (
 	"net"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -153,8 +154,6 @@ type anyTLSTracker struct {
 }
 
 var _ adapter.ConnectionTracker = (*anyTLSTracker)(nil)
-
-func (t *anyTLSTracker) ModeList() []string { return nil }
 
 func (t *anyTLSTracker) RoutedConnection(_ context.Context, conn net.Conn, m adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) net.Conn {
 	if t.svc == nil {
@@ -323,4 +322,10 @@ func (t *anyTLSTracker) RoutedPacketConnection(_ context.Context, conn N.PacketC
 	}
 
 	return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, host: host, limiter: limiter}
+}
+
+// RoutedFlow 仅在 TUN inbound 的 pre-match 流转发路径上被调用，AnyTLS 节点不注册
+// TUN inbound，因此这里无需统计；返回 nil 由 sing-box 的 router 自行跳过。
+func (t *anyTLSTracker) RoutedFlow(_ context.Context, _ adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) tun.FlowTracker {
+	return nil
 }
