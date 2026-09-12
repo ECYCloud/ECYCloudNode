@@ -30,10 +30,12 @@ func (l *hyEventLogger) userFields(id string) log.Fields {
 		return fields
 	}
 
+	cred, _ := splitAuthID(id)
+
 	l.svc.mu.RLock()
 	defer l.svc.mu.RUnlock()
 
-	if user, ok := l.svc.users[id]; ok {
+	if user, ok := l.svc.users[cred]; ok {
 		fields["uid"] = user.UID
 	}
 	return fields
@@ -49,8 +51,10 @@ func (l *hyEventLogger) auditRequest(addr net.Addr, id, reqAddr string) {
 		host = h
 	}
 
+	cred, _ := splitAuthID(id)
+
 	l.svc.mu.RLock()
-	user, ok := l.svc.users[id]
+	user, ok := l.svc.users[cred]
 	l.svc.mu.RUnlock()
 	if !ok || reqAddr == "" {
 		return
@@ -87,13 +91,8 @@ func (l *hyEventLogger) Connect(addr net.Addr, id string, tx uint64) {
 
 func (l *hyEventLogger) Disconnect(addr net.Addr, id string, err error) {
 	remote := ""
-	host := ""
 	if addr != nil {
 		remote = addr.String()
-		host = remote
-		if h, _, splitErr := net.SplitHostPort(remote); splitErr == nil {
-			host = h
-		}
 	}
 
 	fields := log.Fields{
@@ -103,9 +102,10 @@ func (l *hyEventLogger) Disconnect(addr net.Addr, id string, err error) {
 		fields[k] = v
 	}
 
-	// 归还该会话占用的名额
-	if l != nil && l.svc != nil && id != "" && host != "" {
-		l.svc.releaseOnline(id, host)
+	// 归还该会话占用的名额。地址取自连接标识，与登记时同一口径
+	cred, host := splitAuthID(id)
+	if l != nil && l.svc != nil && cred != "" && host != "" {
+		l.svc.releaseOnline(cred, host)
 	}
 
 	if err != nil {
@@ -118,14 +118,10 @@ func (l *hyEventLogger) Disconnect(addr net.Addr, id string, err error) {
 
 func (l *hyEventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 	remote := ""
-	host := ""
 	if addr != nil {
 		remote = addr.String()
-		host = remote
-		if h, _, err := net.SplitHostPort(remote); err == nil {
-			host = h
-		}
 	}
+	cred, host := splitAuthID(id)
 
 	var (
 		user    userRecord
@@ -137,12 +133,12 @@ func (l *hyEventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 		nodeTag = l.svc.tag
 
 		l.svc.mu.RLock()
-		user, ok = l.svc.users[id]
+		user, ok = l.svc.users[cred]
 		l.svc.mu.RUnlock()
 
 		// 存活会话的周期性复查：续期仍持有的名额，已被超限挤出的则断连；
 		// 被挤出后禁止靠流量抢回名额
-		l.svc.guardOnline(id, host)
+		l.svc.guardOnline(cred, host)
 	}
 
 	if ok {
@@ -174,14 +170,10 @@ func (l *hyEventLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
 
 func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, reqAddr string) {
 	remote := ""
-	host := ""
 	if addr != nil {
 		remote = addr.String()
-		host = remote
-		if h, _, err := net.SplitHostPort(remote); err == nil {
-			host = h
-		}
 	}
+	cred, host := splitAuthID(id)
 
 	var (
 		user    userRecord
@@ -193,12 +185,12 @@ func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, r
 		nodeTag = l.svc.tag
 
 		l.svc.mu.RLock()
-		user, ok = l.svc.users[id]
+		user, ok = l.svc.users[cred]
 		l.svc.mu.RUnlock()
 
 		// 存活会话的周期性复查：续期仍持有的名额，已被超限挤出的则断连；
 		// 被挤出后禁止靠流量抢回名额
-		l.svc.guardOnline(id, host)
+		l.svc.guardOnline(cred, host)
 	}
 
 	if ok {

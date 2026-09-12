@@ -25,6 +25,7 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 		return true
 	}
 
+	cred, host := splitAuthID(id)
 	var limiter *rate.Limiter
 
 	t.svc.mu.Lock()
@@ -42,23 +43,38 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 		}
 	}
 
-	if _, ok := t.svc.users[id]; !ok {
+	if _, ok := t.svc.users[cred]; !ok {
 		t.svc.mu.Unlock()
 		return false
 	}
-	counter, ok := t.svc.traffic[id]
+	counter, ok := t.svc.traffic[cred]
 	if !ok {
 		counter = &userTraffic{}
-		t.svc.traffic[id] = counter
+		t.svc.traffic[cred] = counter
 	}
 	counter.Upload += int64(tx)
 	counter.Download += int64(rx)
 
 	if t.svc.rateLimiters != nil {
-		limiter = t.svc.rateLimiters[id]
+		limiter = t.svc.rateLimiters[cred]
 	}
 
 	t.svc.mu.Unlock()
+
+	// TCPRequest / UDPRequest 只在新建代理请求时触发，单条长连接持续传输期间
+	// 只有流量事件能证明会话还在；不据此复查，名额会在 OnlineIPExpiry 后被回收，
+	// 在线数少算且名额被别的设备顶掉。
+	// 上行（客户端发来的数据）能证明客户端存活，续期并复查；下行只复查不续期。
+	// 返回 false 即通知内核断开这条连接。
+	if host != "" {
+		if tx > 0 {
+			if !t.svc.ensureOnline(cred, host) {
+				return false
+			}
+		} else if rx > 0 && !t.svc.verifyOnline(cred, host) {
+			return false
+		}
+	}
 
 	if limiter != nil {
 		total := int(tx + rx)
