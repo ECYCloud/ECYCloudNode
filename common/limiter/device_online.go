@@ -133,3 +133,51 @@ func AdmitDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time
 	activeMap[ip] = time.Now()
 	return true, grant
 }
+
+// EnsureDeviceIP 是协议侧上行方向（客户端→服务端有真实数据）的名额复查，与
+// Limiter.EnsureOnline 同语义：ip 仍持有名额则续期并返回 online=true；已被挤出或
+// 已过期返回 false，调用方应断开连接。被挤出后禁止再通过踢人重新抢回名额，所以这里
+// 只能续期、不能登记。
+// due 表示是否到了复查全局名额的时点，未到时调用方应跳过 Redis 往返：读写回调按每个
+// 缓冲区触发，不节流会把每个包都变成一次跨节点查询。
+func EnsureDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time, ip string) (online, due bool) {
+	if ip == "" {
+		return false, false
+	}
+	last, ok := activeMap[ip]
+	if !ok {
+		return false, false
+	}
+	now := time.Now()
+	if now.Sub(last) > OnlineIPExpiry {
+		delete(activeMap, ip)
+		if onlineIPs != nil {
+			delete(onlineIPs, ip)
+		}
+		return false, false
+	}
+	activeMap[ip] = now
+	return true, now.Sub(last) >= onlineTouchSec*time.Second
+}
+
+// VerifyDeviceIP 是协议侧下行方向（远端→客户端）的名额复查，与 Limiter.VerifyOnline
+// 同语义：只读、不续期。下行流量不能证明客户端仍然存活——客户端异常离线后，远端仍
+// 可能持续向残留连接推送数据；若据此续期，离线名额会被无限"续命"、永不释放。
+// 放行条件：该 ip 仍持有新鲜名额，或该用户尚有空余名额。
+func VerifyDeviceIP(activeMap map[string]time.Time, ip string, deviceLimit int) bool {
+	if deviceLimit <= 0 {
+		return true
+	}
+	now := time.Now()
+	fresh := 0
+	for slot, last := range activeMap {
+		if now.Sub(last) > OnlineIPExpiry {
+			continue
+		}
+		if slot == ip {
+			return true
+		}
+		fresh++
+	}
+	return fresh < deviceLimit
+}

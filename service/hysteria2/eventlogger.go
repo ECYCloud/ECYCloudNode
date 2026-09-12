@@ -3,7 +3,6 @@ package hysteria2
 import (
 	"fmt"
 	"net"
-	"time"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -104,23 +103,9 @@ func (l *hyEventLogger) Disconnect(addr net.Addr, id string, err error) {
 		fields[k] = v
 	}
 
-	// Remove this IP from online IP tracking.
+	// 归还该会话占用的名额
 	if l != nil && l.svc != nil && id != "" && host != "" {
-		l.svc.mu.Lock()
-		if ipSet, ok := l.svc.onlineIPs[id]; ok {
-			delete(ipSet, host)
-			if len(ipSet) == 0 {
-				delete(l.svc.onlineIPs, id)
-			}
-		}
-		// Also remove from ipLastActive
-		if activeMap, ok := l.svc.ipLastActive[id]; ok {
-			delete(activeMap, host)
-			if len(activeMap) == 0 {
-				delete(l.svc.ipLastActive, id)
-			}
-		}
-		l.svc.mu.Unlock()
+		l.svc.releaseOnline(id, host)
 	}
 
 	if err != nil {
@@ -155,18 +140,9 @@ func (l *hyEventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 		user, ok = l.svc.users[id]
 		l.svc.mu.RUnlock()
 
-		// 仅刷新仍持有名额的 IP；已被超限踢出的 IP 禁止靠流量抢回名额
-		if ok && host != "" && id != "" {
-			l.svc.mu.Lock()
-			if ipSet, exists := l.svc.onlineIPs[id]; exists {
-				if _, online := ipSet[host]; online {
-					if activeMap, ok := l.svc.ipLastActive[id]; ok {
-						activeMap[host] = time.Now()
-					}
-				}
-			}
-			l.svc.mu.Unlock()
-		}
+		// 存活会话的周期性复查：续期仍持有的名额，已被超限挤出的则断连；
+		// 被挤出后禁止靠流量抢回名额
+		l.svc.guardOnline(id, host)
 	}
 
 	if ok {
@@ -220,18 +196,9 @@ func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, r
 		user, ok = l.svc.users[id]
 		l.svc.mu.RUnlock()
 
-		// 仅刷新仍持有名额的 IP；已被超限踢出的 IP 禁止靠流量抢回名额
-		if ok && host != "" && id != "" {
-			l.svc.mu.Lock()
-			if ipSet, exists := l.svc.onlineIPs[id]; exists {
-				if _, online := ipSet[host]; online {
-					if activeMap, ok := l.svc.ipLastActive[id]; ok {
-						activeMap[host] = time.Now()
-					}
-				}
-			}
-			l.svc.mu.Unlock()
-		}
+		// 存活会话的周期性复查：续期仍持有的名额，已被超限挤出的则断连；
+		// 被挤出后禁止靠流量抢回名额
+		l.svc.guardOnline(id, host)
 	}
 
 	if ok {

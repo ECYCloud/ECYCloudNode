@@ -1,7 +1,6 @@
 package tuic
 
 import (
-	"net"
 	"reflect"
 	"strconv"
 	"time"
@@ -138,30 +137,28 @@ func (s *TuicService) addTraffic(uuid string, up, down int64) {
 	t.Download += down
 
 	// Note: We don't update onlineIPs here because we don't have the IP address.
-	// The IP is updated in Read/Write methods via updateOnlineIP().
+	// 名额由 Read/Write 里的 ensureOnline / verifyOnline 复查。
 }
 
-func (s *TuicService) allowConnection(uuid, ip string) bool {
-	host := ip
-	if host != "" {
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
+// slot 解析该凭据在 host 上占用的名额标识：官方客户端按设备标识占名额，换网络不
+// 重复占用；第三方仍按出口 IP。登记、续期、归还必须共用它，口径一旦分叉名额就对不上。
+// 调用方须自行持锁。
+func (s *TuicService) slot(uuid, host string) (string, userRecord, bool) {
+	user, ok := s.users[uuid]
+	if !ok {
+		return "", user, false
 	}
-	if host == "" {
-		host = "unknown"
-	}
+	return limiter.OnlineKey(user.ClientID, host), user, true
+}
 
+func (s *TuicService) allowConnection(uuid, host string) bool {
 	s.mu.Lock()
 
-	user, ok := s.users[uuid]
+	slot, user, ok := s.slot(uuid, host)
 	if !ok {
 		s.mu.Unlock()
 		return false
 	}
-
-	// 官方客户端按设备标识占名额，换网络不重复占用；第三方仍按出口 IP
-	slot := limiter.OnlineKey(user.ClientID, host)
 
 	ips, ok := s.onlineIPs[uuid]
 	if !ok {
@@ -182,7 +179,7 @@ func (s *TuicService) allowConnection(uuid, ip string) bool {
 		s.logger.WithFields(log.Fields{
 			"uid":         user.UID,
 			"deviceLimit": user.DeviceLimit,
-			"remote":      ip,
+			"remote":      host,
 		}).Warn("TUIC user exceeded device limit")
 		return false
 	}
@@ -198,7 +195,7 @@ func (s *TuicService) allowConnection(uuid, ip string) bool {
 		s.logger.WithFields(log.Fields{
 			"uid":         user.UID,
 			"deviceLimit": user.DeviceLimit,
-			"remote":      ip,
+			"remote":      host,
 		}).Warn("TUIC user exceeded global device limit")
 		return false
 	}
@@ -206,46 +203,42 @@ func (s *TuicService) allowConnection(uuid, ip string) bool {
 	return true
 }
 
-// updateOnlineIP re-adds an IP to the onlineIPs map and updates its last active time.
-// This is called on every traffic event to ensure active connections are tracked
-// even after collectUsage() clears the maps (similar to traditional Xray protocols).
-func (s *TuicService) updateOnlineIP(uuid string, addr net.Addr) {
-	if addr == nil {
-		return
+// ensureOnline 上行方向（客户端→服务端有真实数据）的周期性复查：续期仍持有的名额；
+// 已被挤出或已过期返回 false，调用方应断开连接。
+func (s *TuicService) ensureOnline(uuid, host string) bool {
+	s.mu.Lock()
+	slot, user, ok := s.slot(uuid, host)
+	if !ok {
+		s.mu.Unlock()
+		return false
 	}
+	online, due := limiter.EnsureDeviceIP(s.onlineIPs[uuid], s.ipLastActive[uuid], slot)
+	s.mu.Unlock()
 
-	remote := addr.String()
-	host := remote
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	// 不限设备数的账号没有名额可守，复查只为续期，不据此断连
+	if user.DeviceLimit <= 0 {
+		return true
 	}
-	if host == "" {
-		return
+	if !online {
+		return false
 	}
-
-	s.updateOnlineIPSimple(uuid, host)
+	if !due {
+		return true
+	}
+	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
+	return s.globalChecker.Refresh(user.UID, slot, user.DeviceLimit)
 }
 
-// updateOnlineIPSimple 仅刷新仍持有名额的条目（UDP 路径，host 已解析）。
-func (s *TuicService) updateOnlineIPSimple(uuid, host string) {
-	if host == "" || uuid == "" {
-		return
-	}
+// verifyOnline 下行方向（远端→客户端）的周期性复查：只核查不续期。
+func (s *TuicService) verifyOnline(uuid, host string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	slot := host
-	if user, ok := s.users[uuid]; ok {
-		slot = limiter.OnlineKey(user.ClientID, host)
+	slot, user, ok := s.slot(uuid, host)
+	if !ok {
+		return false
 	}
-	if ipSet, exists := s.onlineIPs[uuid]; exists {
-		if _, online := ipSet[slot]; online {
-			if activeMap, ok := s.ipLastActive[uuid]; ok {
-				activeMap[slot] = time.Now()
-			}
-		}
-	}
+	return limiter.VerifyDeviceIP(s.ipLastActive[uuid], slot, user.DeviceLimit)
 }
 
 func (s *TuicService) collectUsage() ([]api.UserTraffic, []api.OnlineUser, map[string]userTraffic) {
