@@ -65,57 +65,27 @@ mergeResults() {
 EOF
 }
 
-# Netflix check
-nf_region_from_html() {
-    printf '%s\n' "$1" | grep -oP '"requestCountry"\s*:\s*\{[^{}]*"id"\s*:\s*"\K[A-Z]{2}(?=")' | head -n 1
-}
-
-nf_title_unavailable() {
-    local code="$1"
-    local body="$2"
-    [ "$code" == "404" ] && return 0
-    echo "$body" | grep -qE 'Oh no!|page-404'
-}
-
+# Netflix check - improved region detection
 UnlockTest_Netflix() {
-    local mixed1 mixed2 body1 body2 result1 result2
-    mixed1=$(curl ${CURL_DEFAULT_OPTS} -sL -w '\n%{http_code}' 'https://www.netflix.com/title/81280792' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' --user-agent "${UA_BROWSER}" 2>/dev/null)
-    mixed2=$(curl ${CURL_DEFAULT_OPTS} -sL -w '\n%{http_code}' 'https://www.netflix.com/title/70143836' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' --user-agent "${UA_BROWSER}" 2>/dev/null)
-    result1=$(echo "$mixed1" | tail -n 1)
-    result2=$(echo "$mixed2" | tail -n 1)
-    body1=$(echo "$mixed1" | sed '$d')
-    body2=$(echo "$mixed2" | sed '$d')
+    local result1=$(curl ${CURL_DEFAULT_OPTS} -fsL 'https://www.netflix.com/title/81280792' -w %{http_code} -o /dev/null -H 'host: www.netflix.com' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'sec-fetch-site: none' -H 'sec-fetch-mode: navigate' -H 'sec-fetch-user: ?1' -H 'sec-fetch-dest: document' --user-agent "${UA_BROWSER}")
+    local result2=$(curl ${CURL_DEFAULT_OPTS} -fsL 'https://www.netflix.com/title/70143836' -w %{http_code} -o /dev/null -H 'host: www.netflix.com' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'sec-fetch-site: none' -H 'sec-fetch-mode: navigate' -H 'sec-fetch-user: ?1' -H 'sec-fetch-dest: document' --user-agent "${UA_BROWSER}")
 
     if [ "${result1}" == '000' ] || [ "$result2" == '000' ]; then
         writeResult "Netflix" "Unknown"
         return
     fi
-    if [ "$result1" == '403' ] || [ "$result2" == '403' ] || echo "$body1$body2" | grep -q 'NSEZ-403'; then
-        writeResult "Netflix" "No"
-        return
-    fi
-
-    local unavail1=0 unavail2=0
-    nf_title_unavailable "$result1" "$body1" && unavail1=1
-    nf_title_unavailable "$result2" "$body2" && unavail2=1
-    if [ "$unavail1" -eq 1 ] && [ "$unavail2" -eq 1 ]; then
+    if [ "$result1" == '404' ] && [ "$result2" == '404' ]; then
         writeResult "Netflix" "No (Originals Only)"
         return
     fi
-
-    if [ "$unavail1" -eq 0 ] || [ "$unavail2" -eq 0 ]; then
-        local region=$(nf_region_from_html "$body1")
-        [ -z "$region" ] && region=$(nf_region_from_html "$body2")
-        if [ -z "$region" ]; then
-            local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sL 'https://www.netflix.com/' -H 'accept-language: en-US,en;q=0.9' --user-agent "${UA_BROWSER}" 2>/dev/null)
-            region=$(nf_region_from_html "$tmpresult")
-        fi
-        if [ -z "$region" ]; then
-            local redir
-            redir=$(curl ${CURL_DEFAULT_OPTS} -o /dev/null -w '%{redirect_url}' 'https://www.netflix.com/title/80018499' -H 'accept-language: en-US,en;q=0.9' --user-agent "${UA_BROWSER}" 2>/dev/null)
-            region=$(echo "$redir" | awk -F/ '{print $4}' | cut -d- -f1 | tr 'a-z' 'A-Z')
-            echo "$region" | grep -qE '^[A-Z]{2}$' || region=""
-        fi
+    if [ "$result1" == '403' ] || [ "$result2" == '403' ]; then
+        writeResult "Netflix" "No"
+        return
+    fi
+    if [ "$result1" == '200' ] || [ "$result2" == '200' ]; then
+        local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sL 'https://www.netflix.com/' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'sec-fetch-site: none' -H 'sec-fetch-mode: navigate' -H 'sec-fetch-user: ?1' -H 'sec-fetch-dest: document' --user-agent "${UA_BROWSER}")
+        # 只读取 Netflix 对当前请求标记的地区。
+        local region=$(printf '%s\n' "$tmpresult" | grep -oP '"requestCountry"\s*:\s*\{[^{}]*"id"\s*:\s*"\K[A-Z]{2}(?=")' | head -n 1)
         if [ -n "$region" ]; then
             writeResult "Netflix" "Yes ($region)"
         else
@@ -128,7 +98,7 @@ UnlockTest_Netflix() {
 
 # YouTube Premium check
 UnlockTest_YouTube_Premium() {
-    local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sL 'https://www.youtube.com/premium' -H 'accept-language: en-US,en;q=0.9' -H 'cookie: SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwNTI2LjAxX3AwGgJlbiACGgYIgNzEsgY' --user-agent "${UA_BROWSER}")
+    local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sL 'https://www.youtube.com/premium' -H 'accept-language: en-US,en;q=0.9' -H 'cookie: YSC=FSCWhKo2Zgw; VISITOR_PRIVACY_METADATA=CgJERRIEEgAgYQ%3D%3D; PREF=f7=4000; __Secure-YEC=CgtRWTBGTFExeV9Iayjele2yBjIKCgJERRIEEgAgYQ%3D%3D; SOCS=CAISOAgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwNTI2LjAxX3AwGgV6aC1DTiACGgYIgMnpsgY; VISITOR_INFO1_LIVE=Di84mAIbgKY; __Secure-BUCKET=CGQ' --user-agent "${UA_BROWSER}")
     if [ -z "$tmpresult" ]; then
         writeResult "YouTube_Premium" "Unknown"
         return
@@ -166,10 +136,9 @@ UnlockTest_DisneyPlus() {
         return
     fi
 
-    local assertion=$(echo "$PreAssertion" | grep -oP '"assertion"\s*:\s*"\K[^"]+')
+    local assertion=$(echo $PreAssertion | python -m json.tool 2>/dev/null | grep assertion | cut -f4 -d'"')
     if [ -z "$assertion" ]; then
-        writeResult "DisneyPlus" "Unknown"
-        return
+        assertion=$(echo $PreAssertion | python3 -m json.tool 2>/dev/null | grep assertion | cut -f4 -d'"')
     fi
     local disneycookie=$(echo "$DISNEY_COOKIE_1" | sed "s/DISNEYASSERTION/${assertion}/g")
     local TokenContent=$(curl -4 --user-agent "${UA_Browser}" -s --max-time 8 -X POST "https://disney.api.edge.bamgrid.com/token" -H "authorization: Bearer ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84" -d "$disneycookie" 2>&1)
@@ -181,12 +150,21 @@ UnlockTest_DisneyPlus() {
         return
     fi
 
-    local refreshToken=$(echo "$TokenContent" | grep -oP '"refresh_token"\s*:\s*"\K[^"]+')
+    local refreshToken=$(echo $TokenContent | python -m json.tool 2>/dev/null | grep 'refresh_token' | awk '{print $2}' | cut -f2 -d'"')
+    if [ -z "$refreshToken" ]; then
+        refreshToken=$(echo $TokenContent | python3 -m json.tool 2>/dev/null | grep 'refresh_token' | awk '{print $2}' | cut -f2 -d'"')
+    fi
     local disneycontent=$(echo "$DISNEY_COOKIE_8" | sed "s/ILOVEDISNEY/${refreshToken}/g")
     local tmpresult=$(curl -4 --user-agent "${UA_Browser}" -X POST -sSL --max-time 8 "https://disney.api.edge.bamgrid.com/graph/v1/device/graphql" -H "authorization: ZGlzbmV5JmJyb3dzZXImMS4wLjA.Cu56AgSfBTDag5NiRA81oLHkDZfu5L3CKadnefEAY84" -d "$disneycontent" 2>&1)
 
-    local region=$(echo "$tmpresult" | grep -oP '"countryCode"\s*:\s*"\K[^"]+' | head -n 1)
-    local inSupportedLocation=$(echo "$tmpresult" | grep -oP '"inSupportedLocation"\s*:\s*\K(true|false)' | head -n 1)
+    local region=$(echo $tmpresult | python -m json.tool 2>/dev/null | grep 'countryCode' | cut -f4 -d'"')
+    if [ -z "$region" ]; then
+        region=$(echo $tmpresult | python3 -m json.tool 2>/dev/null | grep 'countryCode' | cut -f4 -d'"')
+    fi
+    local inSupportedLocation=$(echo $tmpresult | python -m json.tool 2>/dev/null | grep 'inSupportedLocation' | awk '{print $2}' | cut -f1 -d',')
+    if [ -z "$inSupportedLocation" ]; then
+        inSupportedLocation=$(echo $tmpresult | python3 -m json.tool 2>/dev/null | grep 'inSupportedLocation' | awk '{print $2}' | cut -f1 -d',')
+    fi
 
     if [[ "$region" == "JP" ]]; then
         writeResult "DisneyPlus" "Yes (JP)"
@@ -203,30 +181,29 @@ UnlockTest_DisneyPlus() {
     fi
 }
 
-# HBO Max：地区封锁看 geo-availability / isUserOutOfRegion，分区看 cookie 或 userCountry。
+# HBO Max check
 UnlockTest_HBOMax() {
-    local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sLi 'https://www.max.com/' -w "_TAG_%{http_code}_TAG_%{url_effective}" --user-agent "${UA_Browser}")
+    local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sLi 'https://www.max.com/' -w "_TAG_%{http_code}_TAG_" --user-agent "${UA_Browser}")
     local httpCode=$(echo "$tmpresult" | grep '_TAG_' | awk -F'_TAG_' '{print $2}')
-    local finalURL=$(echo "$tmpresult" | grep '_TAG_' | awk -F'_TAG_' '{print $3}')
     if [ "$httpCode" == '000' ]; then
         writeResult "HBOMax" "Unknown"
         return
     fi
-    if echo "$finalURL$tmpresult" | grep -qE 'geo-availability|"isUserOutOfRegion"\s*:\s*true'; then
-        writeResult "HBOMax" "No"
+
+    local countryList=$(echo "$tmpresult" | grep -woP '"url":"/[a-z]{2}/[a-z]{2}"' | cut -f4 -d'"' | cut -f2 -d'/' | sort -n | uniq | xargs | tr a-z A-Z)
+    countryList="${countryList} US"
+    local region=$(echo "$tmpresult" | grep -woP 'countryCode=\K[A-Z]{2}' | head -n 1)
+    local isUnavailable=$(echo "$countryList" | grep "$region")
+
+    if [ -z "$region" ]; then
+        writeResult "HBOMax" "Unknown"
         return
     fi
-
-    local region
-    region=$(echo "$tmpresult" | grep -oP 'countryCode=\K[A-Za-z]{2}' | head -n 1 | tr 'a-z' 'A-Z')
-    if ! echo "$region" | grep -qE '^[A-Z]{2}$'; then
-        region=$(echo "$tmpresult" | grep -oP '"userCountry"\s*:\s*"\K[A-Za-z]{2}' | head -n 1 | tr 'a-z' 'A-Z')
-    fi
-    if echo "$region" | grep -qE '^[A-Z]{2}$'; then
+    if [ -n "$isUnavailable" ]; then
         writeResult "HBOMax" "Yes ($region)"
         return
     fi
-    writeResult "HBOMax" "Unknown"
+    writeResult "HBOMax" "No"
 }
 
 # Prime Video check
@@ -237,18 +214,22 @@ UnlockTest_PrimeVideo() {
         return
     fi
 
-    local isBlocked=$(echo "$tmpresult" | grep -E '"isServiceRestricted"\s*:\s*true')
+    local isBlocked=$(echo "$tmpresult" | grep -i 'isServiceRestricted')
     local region=$(echo "$tmpresult" | grep -woP '"currentTerritory":"\K[^"]+' | head -n 1)
 
+    if [ -z "$isBlocked" ] && [ -z "$region" ]; then
+        writeResult "AmazonPrime" "No"
+        return
+    fi
     if [ -n "$isBlocked" ]; then
         writeResult "AmazonPrime" "No"
         return
     fi
-    if [ -z "$region" ]; then
-        writeResult "AmazonPrime" "No"
+    if [ -n "$region" ]; then
+        writeResult "AmazonPrime" "Yes ($region)"
         return
     fi
-    writeResult "AmazonPrime" "Yes ($region)"
+    writeResult "AmazonPrime" "No"
 }
 
 # OpenAI check
@@ -266,22 +247,9 @@ UnlockTest_OpenAI() {
     local result1=$(echo "$tmpresult1" | grep -i 'unsupported_country')
     local result2=$(echo "$tmpresult2" | grep -i 'VPN')
     local iso2_code=$(curl -4 -sS --max-time 5 https://chat.openai.com/cdn-cgi/trace 2>/dev/null | grep "loc=" | awk -F= '{print $2}')
-    iso2_code=$(echo "$iso2_code" | tr 'a-z' 'A-Z' | tr -d '\r\n ')
 
-    if [ "$iso2_code" == "HK" ] || [ "$iso2_code" == "RU" ]; then
+    if [ -n "$result1" ] || [ -n "$result2" ] || [ "$iso2_code" == "HK" ] || [ "$iso2_code" == "RU" ]; then
         writeResult "OpenAI" "No"
-        return
-    fi
-    if [ -n "$result1" ] && [ -n "$result2" ]; then
-        writeResult "OpenAI" "No"
-        return
-    fi
-    if [ -z "$result1" ] && [ -n "$result2" ]; then
-        writeResult "OpenAI" "仅限网页"
-        return
-    fi
-    if [ -n "$result1" ] && [ -z "$result2" ]; then
-        writeResult "OpenAI" "仅限App"
         return
     fi
 
@@ -292,42 +260,42 @@ UnlockTest_OpenAI() {
     if [[ " ${SUPPORT_COUNTRY[@]} " =~ " ${iso2_code} " ]]; then
         writeResult "OpenAI" "Yes ($iso2_code)"
         return
+    else
+        writeResult "OpenAI" "No"
+        return
     fi
-    writeResult "OpenAI" "No"
 }
 
-# Gemini：受 Google IP 归属限制。硬约束——YouTube Premium 为 No 时 Gemini 必为 No。
-# 官方可用地区：https://ai.google.dev/gemini-api/docs/available-regions
+# Google Gemini check - region-based detection
+# Based on official supported regions: https://ai.google.dev/gemini-api/docs/available-regions
+# If YouTube Premium is not available, Gemini is also not available
 UnlockTest_Gemini() {
+    # Check if YouTube Premium result exists and is "No"
     local ytResult=$(cat "$RESULT_DIR/YouTube_Premium" 2>/dev/null)
     if [[ "$ytResult" == "No"* ]]; then
         writeResult "Gemini" "No"
         return
     fi
 
+    # Gemini supported countries/regions (ISO 3166-1 alpha-2 codes)
+    # Source: https://ai.google.dev/gemini-api/docs/available-regions
     GEMINI_SUPPORT_COUNTRY=(AL DZ AS AO AI AQ AG AR AM AW AU AT AZ BS BH BD BB BE BZ BJ BM BT BO BA BW BR IO VG BN BG BF CV KH CM CA KY CF TD CL CX CC CO KM CG CK CR CI HR CW CZ CD DK DJ DM DO EC EG SV GQ ER EE SZ ET FK FO FJ FI FR GA GM GE DE GH GI GR GL GD GU GT GG GN GW GY HK HT HN HU IS IN ID IQ IE IM IL IT JM JP JE JO KZ KE KI XK KW KG LA LV LB LS LR LY LI LT LU MG MW MY MV ML MT MH MR MU MX FM MD MC MN ME MS MA MZ MM NA NR NP NL NC NZ NI NE NG NU NF MK MP NO OM PK PW PS PA PG PY PE PH PN PL PT PR QA CY RO RW BL SH KN LC PM VC WS SM ST SA SN RS SC SL SG SK SI SB SO ZA GS KR SS ES LK SR SE CH TW TJ TZ TH TL TG TK TO TT TN TM TC TV TR UG UA AE GB US UM UY VI UZ VU VE VN WF EH YE ZM ZW AX)
 
-    local iso2_code=""
-    # YouTube Premium 已解锁时，优先用 Google 自己标的 GL（与 Premium 同一套 IP 归属）
-    if [[ "$ytResult" == Yes* ]]; then
-        iso2_code=$(echo "$ytResult" | sed -n 's/^Yes (\(.*\))$/\1/p' | tr 'a-z' 'A-Z')
-        echo "$iso2_code" | grep -qE '^[A-Z]{2}$' || iso2_code=""
-    fi
-    if [ -z "$iso2_code" ]; then
-        iso2_code=$(curl -s --max-time 3 "https://ipinfo.io/country" 2>/dev/null | tr -d '\r\n ')
-    fi
+    # Get country code from IP using multiple services
+    local iso2_code=$(curl -s --max-time 3 "https://ipinfo.io/country" 2>/dev/null | tr -d '\n')
     if [ -z "$iso2_code" ]; then
         iso2_code=$(curl -s --max-time 3 "https://api.country.is" 2>/dev/null | grep -oE '"country":"[A-Z]{2}"' | sed 's/"country":"//;s/"//')
     fi
     if [ -z "$iso2_code" ]; then
-        iso2_code=$(curl -s --max-time 3 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d '\r\n ')
+        iso2_code=$(curl -s --max-time 3 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d '\n')
     fi
-    iso2_code=$(echo "$iso2_code" | tr 'a-z' 'A-Z')
-    if ! echo "$iso2_code" | grep -qE '^[A-Z]{2}$'; then
+
+    if [ -z "$iso2_code" ]; then
         writeResult "Gemini" "Unknown"
         return
     fi
 
+    # Check if country is in supported list
     if [[ " ${GEMINI_SUPPORT_COUNTRY[@]} " =~ " ${iso2_code} " ]]; then
         writeResult "Gemini" "Yes ($iso2_code)"
     else
@@ -410,42 +378,53 @@ UnlockTest_Claude() {
     writeResult "Claude" "Unknown"
 }
 
-# TikTok：先读站点自己的 region；没有再拿 IP 对照封禁名单（名单内 No，名单外不擅自 Yes）。
+# TikTok check - region-based detection
+# TikTok is banned or unavailable in certain countries/regions
+# Uses blacklist approach similar to OpenAI/Gemini detection
 UnlockTest_TikTok() {
+    # TikTok banned/unavailable countries (ISO 3166-1 alpha-2 codes)
+    # Official government bans:
+    #   IN: India (government ban since 2020)
+    #   AF: Afghanistan (Taliban ban since 2022)
+    #   IR: Iran (long-term ban)
+    #   SO: Somalia (government ban since 2023)
+    #   SN: Senegal (government ban since 2023)
+    #   JO: Jordan (ban since 2022)
+    #   UZ: Uzbekistan (ban since 2021)
+    #   AL: Albania (ban since 2025, first in Europe)
+    #   KG: Kyrgyzstan (ban since 2024)
+    # Effectively unavailable:
+    #   CN: China mainland (TikTok not available, only Douyin)
+    #   HK: Hong Kong (TikTok withdrew from HK in 2020)
+    #   KP: North Korea (no internet access)
     TIKTOK_BANNED_COUNTRY=(CN HK IN AF IR SO SN JO UZ AL KG KP)
 
-    local tmpresult region
-    tmpresult=$(curl ${CURL_DEFAULT_OPTS} --compressed -sL 'https://www.tiktok.com/' -H 'accept-language: en-US,en;q=0.9' --user-agent "${UA_BROWSER}" 2>/dev/null)
-    if echo "$tmpresult" | grep -q 'https://www.tiktok.com/hk/notfound'; then
-        writeResult "TikTok" "No"
-        return
-    fi
-    if echo "$tmpresult" | grep -q 'Please wait...'; then
-        tmpresult=$(curl ${CURL_DEFAULT_OPTS} --compressed -sL 'https://www.tiktok.com/explore' -H 'accept-language: en-US,en;q=0.9' --user-agent "${UA_BROWSER}" 2>/dev/null)
-    fi
-    region=$(echo "$tmpresult" | grep -oP '"region"\s*:\s*"\K[A-Z]{2}' | head -n 1)
-    if echo "$region" | grep -qE '^[A-Z]{2}$'; then
-        writeResult "TikTok" "Yes ($region)"
-        return
-    fi
-
-    region=$(curl -s --max-time 3 "https://ipinfo.io/country" 2>/dev/null | tr -d '\r\n ')
+    # Get country code from IP using multiple services
+    local region=$(curl -s --max-time 3 "https://ipinfo.io/country" 2>/dev/null | tr -d '\n')
     if [ -z "$region" ]; then
         region=$(curl -s --max-time 3 "https://api.country.is" 2>/dev/null | grep -oE '"country":"[A-Z]{2}"' | sed 's/"country":"//;s/"//')
     fi
     if [ -z "$region" ]; then
-        region=$(curl -s --max-time 3 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d '\r\n ')
+        region=$(curl -s --max-time 3 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d '\n')
     fi
-    region=$(echo "$region" | tr 'a-z' 'A-Z')
-    if ! echo "$region" | grep -qE '^[A-Z]{2}$'; then
+
+    # If we can't determine the region, return Unknown
+    if [ -z "$region" ]; then
         writeResult "TikTok" "Unknown"
         return
     fi
+
+    # Convert region to uppercase for comparison
+    region=$(echo "$region" | tr 'a-z' 'A-Z')
+
+    # Check if country is in banned list
     if [[ " ${TIKTOK_BANNED_COUNTRY[@]} " =~ " ${region} " ]]; then
         writeResult "TikTok" "No"
         return
     fi
-    writeResult "TikTok" "Unknown"
+
+    # TikTok is available in this region
+    writeResult "TikTok" "Yes ($region)"
 }
 
 # Run all checks in parallel
