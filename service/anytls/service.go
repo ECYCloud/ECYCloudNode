@@ -13,6 +13,7 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/api"
 	"github.com/ECYCloud/ECYCloudNode/common/limiter"
 	"github.com/ECYCloud/ECYCloudNode/common/rule"
+	"github.com/ECYCloud/ECYCloudNode/common/unlockcheck"
 	"github.com/ECYCloud/ECYCloudNode/service"
 	"github.com/ECYCloud/ECYCloudNode/service/controller"
 )
@@ -130,6 +131,11 @@ func (s *AnyTLSService) Start() error {
 			},
 		})
 	}
+
+	s.tasks = append(s.tasks, periodicTask{
+		tag:      "unlock check",
+		Periodic: unlockcheck.NewTask(s.apiClient, s.nodeInfo.NodeID, s.logger),
+	})
 
 	for _, t := range s.tasks {
 		go t.Start()

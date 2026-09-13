@@ -67,10 +67,6 @@ type Controller struct {
 	// 向 ACME 发起签发，每个巡检周期重试一次会撞签发方的失败限额。
 	rebuildRetryAt time.Time
 	rebuildBackoff time.Duration
-	// Unlock check related fields
-	unlockChecker       *unlockcheck.Checker
-	lastUnlockCheckTime time.Time
-	unlockCheckMutex    sync.Mutex
 	// Recovery tracking for IP whitelist / connectivity issues
 	consecutiveFailures int
 	lastFailureTime     time.Time
@@ -233,10 +229,10 @@ func (c *Controller) Start() error {
 			}})
 	}
 
-	// Initialize unlock check if enabled
-	if err := c.initUnlockCheck(); err != nil {
-		c.logger.Printf("Failed to initialize unlock check: %v", err)
-	}
+	c.tasks = append(c.tasks, periodicTask{
+		tag:      "unlock check",
+		Periodic: unlockcheck.NewTask(c.apiClient, c.nodeInfo.NodeID, c.logger),
+	})
 
 	// Start periodic tasks
 	for i := range c.tasks {
@@ -867,115 +863,5 @@ func (c *Controller) certMonitor() error {
 			}
 		}
 	}
-	return nil
-}
-
-// initUnlockCheck initializes the unlock check periodic task.
-// The actual configuration is fetched dynamically before each check (hot reload).
-// Note: Node IDs are pre-registered in panel.Start() before any controller starts.
-func (c *Controller) initUnlockCheck() error {
-	c.unlockChecker = unlockcheck.NewChecker(c.logger)
-	// Initialize lastUnlockCheckTime to zero so first check runs immediately after startup
-	c.lastUnlockCheckTime = time.Time{}
-
-	// Add unlock check periodic task with a base interval of 1 minute
-	// The actual check execution is controlled by unlockCheckMonitor based on panel config
-	c.tasks = append(c.tasks, periodicTask{
-		tag: "unlock check",
-		Periodic: &task.Periodic{
-			Interval: 1 * time.Minute,
-			Execute:  c.unlockCheckMonitor,
-		}})
-
-	c.logger.Printf("Unlock check task initialized for node %d (config will be fetched from panel)", c.nodeInfo.NodeID)
-
-	return nil
-}
-
-// unlockCheckMonitor performs the streaming unlock check and reports results.
-// It fetches the latest configuration from panel before each check (hot reload).
-// Uses a node registry system: the first node to execute detection reports for ALL registered nodes.
-// This eliminates the dependency on cache timing between nodes.
-// Checks are executed at whole hours (00:00, 01:00, etc.) based on the configured interval.
-func (c *Controller) unlockCheckMonitor() error {
-	if c.unlockChecker == nil {
-		return nil
-	}
-
-	// Use mutex to prevent concurrent execution within this node
-	c.unlockCheckMutex.Lock()
-	defer c.unlockCheckMutex.Unlock()
-
-	nodeID := c.nodeInfo.NodeID
-
-	// Check if this node has already been reported in this hour (by any node)
-	if unlockcheck.HasNodeReported(nodeID) {
-		return nil
-	}
-
-	// Fetch latest config from panel (hot reload)
-	config, err := c.apiClient.GetUnlockCheckConfig()
-	if err != nil {
-		c.logger.Printf("[UnlockCheck] Node %d: Failed to get unlock check config: %v", nodeID, err)
-		return nil
-	}
-
-	// Check if unlock check is enabled
-	if !config.Enabled {
-		return nil
-	}
-
-	// Check if interval is valid (interval is now in hours)
-	if config.CheckInterval <= 0 {
-		return nil
-	}
-
-	now := time.Now()
-	currentHour := now.Hour()
-
-	// Check if current hour matches the interval pattern
-	if currentHour%config.CheckInterval != 0 {
-		return nil
-	}
-
-	// Try to acquire the check lock (only one node should perform the actual check)
-	if !unlockcheck.TryAcquireCheckLock() {
-		// Another node is performing the check, skip this node
-		// The node that acquired the lock will report for all nodes
-		c.logger.Printf("[UnlockCheck] Node %d: Another node is performing check, skipping", nodeID)
-		return nil
-	}
-
-	// This node acquired the lock, perform the check and report for ALL registered nodes
-	defer unlockcheck.ReleaseCheckLock()
-
-	c.logger.Printf("[UnlockCheck] Node %d: Performing check at %02d:%02d (interval: %d hours)", nodeID, currentHour, now.Minute(), config.CheckInterval)
-
-	// Run all checks (will use csm.sh script)
-	results := c.unlockChecker.RunAllChecks()
-
-	// Store results in global cache
-	unlockcheck.SetCachedResults(results)
-
-	// Convert results to JSON
-	resultJSON := results.ToJSON()
-	c.logger.Printf("[UnlockCheck] Node %d: Results: %s", nodeID, resultJSON)
-
-	// Get all registered node IDs and report for each one
-	allNodeIDs := unlockcheck.GetRegisteredNodeIDs()
-	c.logger.Printf("[UnlockCheck] Node %d: Reporting results for %d nodes: %v", nodeID, len(allNodeIDs), allNodeIDs)
-
-	for _, targetNodeID := range allNodeIDs {
-		if err := c.apiClient.ReportUnlockCheckResultForNode(targetNodeID, resultJSON); err != nil {
-			c.logger.Printf("[UnlockCheck] Node %d: Failed to report for node %d: %v", nodeID, targetNodeID, err)
-		} else {
-			c.logger.Printf("[UnlockCheck] Node %d: Reported successfully for node %d", nodeID, targetNodeID)
-			unlockcheck.MarkNodeReported(targetNodeID)
-		}
-	}
-
-	// Update last report time for this node
-	c.lastUnlockCheckTime = now
-
 	return nil
 }

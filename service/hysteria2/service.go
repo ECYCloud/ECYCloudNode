@@ -13,6 +13,7 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/api"
 	"github.com/ECYCloud/ECYCloudNode/common/limiter"
 	"github.com/ECYCloud/ECYCloudNode/common/rule"
+	"github.com/ECYCloud/ECYCloudNode/common/unlockcheck"
 	"github.com/ECYCloud/ECYCloudNode/service"
 	"github.com/ECYCloud/ECYCloudNode/service/controller"
 )
@@ -143,6 +144,11 @@ func (h *Hysteria2Service) Start() error {
 			},
 		})
 	}
+
+	h.tasks = append(h.tasks, periodicTask{
+		tag:      "unlock check",
+		Periodic: unlockcheck.NewTask(h.apiClient, h.nodeInfo.NodeID, h.logger),
+	})
 
 	for _, t := range h.tasks {
 		go t.Start()

@@ -83,9 +83,16 @@ UnlockTest_Netflix() {
         return
     fi
     if [ "$result1" == '200' ] || [ "$result2" == '200' ]; then
-        local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sL 'https://www.netflix.com/' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'sec-fetch-site: none' -H 'sec-fetch-mode: navigate' -H 'sec-fetch-user: ?1' -H 'sec-fetch-dest: document' --user-agent "${UA_BROWSER}")
-        # 只读取 Netflix 对当前请求标记的地区。
-        local region=$(printf '%s\n' "$tmpresult" | grep -oP '"requestCountry"\s*:\s*\{[^{}]*"id"\s*:\s*"\K[A-Z]{2}(?=")' | head -n 1)
+        local title=81280792
+        [ "$result1" != '200' ] && title=70143836
+        local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sL "https://www.netflix.com/title/$title" -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'sec-fetch-site: none' -H 'sec-fetch-mode: navigate' -H 'sec-fetch-user: ?1' -H 'sec-fetch-dest: document' --user-agent "${UA_BROWSER}")
+        # 只读取 Netflix 对当前请求标记的国家，不使用州代码或第三方 IP 归属地。
+        local json_object='(?(DEFINE)(?<object>\{(?:[^{}"]|"(?:\\.|[^"\\])*"|(?&object))*\}))'
+        local json_prefix='^\{(?:[^{}"]|"(?:\\.|[^"\\])*"|(?&object))*?'
+        NetflixRegionField() {
+            grep -oP "$json_prefix\"$1\"\s*:\s*\K"'(?:"(?:\\.|[^"\\])*"|(?&object)|true|false|null|[0-9]+)(?=\s*[,}])'"$json_object"
+        }
+        local region=$(printf '%s\n' "$tmpresult" | tr '\r\n' '  ' | grep -oP 'netflix[.]reactContext\s*=\s*\K(?&object)'"$json_object" | NetflixRegionField models | NetflixRegionField geo | NetflixRegionField data | NetflixRegionField requestCountry | NetflixRegionField id | grep -oP '^"\K[A-Z]{2}(?="$)')
         if [ -n "$region" ]; then
             writeResult "Netflix" "Yes ($region)"
         else
