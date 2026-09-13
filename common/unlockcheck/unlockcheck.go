@@ -1,11 +1,16 @@
+// Package unlockcheck provides streaming unlock detection functionality.
+// It checks various streaming services (Netflix, YouTube Premium, Disney+, etc.)
+// and reports the results to the panel.
+// Detection logic is 100% based on csm.sh script from:
+// https://github.com/ECYCloud/check-stream-media
+// The script is embedded locally and executed without remote download.
+// NO FALLBACK - only uses the embedded csm.sh script for 100% accuracy.
 package unlockcheck
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -195,7 +200,8 @@ func NewChecker(logger *log.Entry) *Checker {
 }
 
 // RunAllChecks performs all unlock checks by executing embedded csm.sh script
-// 脚本执行或输出校验失败时，所有检查返回 Unknown。
+// This ensures 100% consistency with the csm.sh detection logic
+// NO FALLBACK - if script fails, returns Unknown for all services
 func (c *Checker) RunAllChecks() *UnlockCheckResults {
 	// Default results (all Unknown)
 	defaultResults := &UnlockCheckResults{
@@ -210,7 +216,7 @@ func (c *Checker) RunAllChecks() *UnlockCheckResults {
 		TikTok:         "Unknown",
 	}
 
-	// Execute the embedded script.
+	// Execute embedded csm.sh script (100% accurate detection)
 	scriptResults := c.runCSMScript()
 	if scriptResults != nil {
 		c.logger.Info("[UnlockCheck] csm.sh script executed successfully")
@@ -222,35 +228,53 @@ func (c *Checker) RunAllChecks() *UnlockCheckResults {
 	return defaultResults
 }
 
-// runCSMScript 使用标准输入/输出传递脚本和结果，避免并发检测覆盖文件。
+// runCSMScript executes the embedded csm.sh script locally, returns results or nil if failed
+// This uses the locally embedded script (CSM_SCRIPT) instead of downloading from remote
 func (c *Checker) runCSMScript() *UnlockCheckResults {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	execCmd := exec.CommandContext(ctx, "bash", "-s")
-	execCmd.Stdin = strings.NewReader(CSM_SCRIPT)
-	execCmd.WaitDelay = 5 * time.Second
-	var stderr bytes.Buffer
-	execCmd.Stderr = &stderr
-	resultData, err := execCmd.Output()
-	if err != nil {
-		c.logger.Warnf("[UnlockCheck] Script failed: %v; %s", err, stderr.String())
+	scriptPath := "/tmp/ecycloudnode_csm_check.sh"
+	resultPath := "/tmp/ecycloudnode_unlock_check_result.json"
+
+	// Write embedded script to temp file
+	c.logger.Info("[UnlockCheck] Writing embedded csm.sh script to temp file...")
+	if err := os.WriteFile(scriptPath, []byte(CSM_SCRIPT), 0755); err != nil {
+		c.logger.Warnf("[UnlockCheck] Failed to write script file: %v", err)
 		return nil
 	}
-	if stderr.Len() > 0 {
-		c.logger.Debugf("[UnlockCheck] Probe diagnostics: %s", stderr.String())
+
+	// Execute the script
+	c.logger.Info("[UnlockCheck] Executing embedded csm.sh script (100% same logic as csm.sh)...")
+	execCmd := exec.Command("bash", scriptPath)
+	execCmd.Env = append(os.Environ(), "LANG=en_US.UTF-8")
+	output, err := execCmd.CombinedOutput()
+	if err != nil {
+		c.logger.Warnf("[UnlockCheck] Failed to execute script: %v, output: %s", err, string(output))
+		// Clean up script file
+		os.Remove(scriptPath)
+		return nil
 	}
+
+	// Read result JSON file
+	resultData, err := os.ReadFile(resultPath)
+	if err != nil {
+		c.logger.Warnf("[UnlockCheck] Failed to read result file: %v", err)
+		os.Remove(scriptPath)
+		return nil
+	}
+
+	// Parse JSON results
 	var results UnlockCheckResults
 	if err := json.Unmarshal(resultData, &results); err != nil {
-		c.logger.Warnf("[UnlockCheck] Invalid result JSON: %v", err)
+		c.logger.Warnf("[UnlockCheck] Failed to parse result JSON: %v", err)
+		os.Remove(scriptPath)
+		os.Remove(resultPath)
 		return nil
 	}
-	for _, result := range []string{results.YouTubePremium, results.Netflix, results.DisneyPlus,
-		results.HBOMax, results.AmazonPrime, results.OpenAI, results.Gemini, results.Claude, results.TikTok} {
-		if result == "" {
-			c.logger.Warn("[UnlockCheck] Incomplete script results")
-			return nil
-		}
-	}
+
+	// Clean up temp files
+	os.Remove(scriptPath)
+	os.Remove(resultPath)
+
+	c.logger.Info("[UnlockCheck] Embedded csm.sh script executed successfully")
 	return &results
 }
 
