@@ -65,34 +65,57 @@ mergeResults() {
 EOF
 }
 
-# Netflix check - improved region detection
+# Netflix check
+nf_region_from_html() {
+    # 只读取 Netflix 对当前请求标记的国家。
+    local json_object='(?(DEFINE)(?<object>\{(?:[^{}"]|"(?:\\.|[^"\\])*"|(?&object))*\}))'
+    local json_prefix='^\{(?:[^{}"]|"(?:\\.|[^"\\])*"|(?&object))*?'
+    NetflixRegionField() {
+        grep -oP "$json_prefix\"$1\"\s*:\s*\K"'(?:"(?:\\.|[^"\\])*"|(?&object)|true|false|null|[0-9]+)(?=\s*[,}])'"$json_object"
+    }
+    printf '%s\n' "$1" | tr '\r\n' '  ' | grep -oP 'netflix[.]reactContext\s*=\s*\K(?&object)'"$json_object" | NetflixRegionField models | NetflixRegionField geo | NetflixRegionField data | NetflixRegionField requestCountry | NetflixRegionField id | grep -oP '^"\K[A-Z]{2}(?="$)'
+}
+
+nf_title_unavailable() {
+    local code="$1"
+    local body="$2"
+    [ "$code" == "404" ] && return 0
+    echo "$body" | grep -qE 'Oh no!|page-404'
+}
+
 UnlockTest_Netflix() {
-    local result1=$(curl ${CURL_DEFAULT_OPTS} -fsL 'https://www.netflix.com/title/81280792' -w %{http_code} -o /dev/null -H 'host: www.netflix.com' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'sec-fetch-site: none' -H 'sec-fetch-mode: navigate' -H 'sec-fetch-user: ?1' -H 'sec-fetch-dest: document' --user-agent "${UA_BROWSER}")
-    local result2=$(curl ${CURL_DEFAULT_OPTS} -fsL 'https://www.netflix.com/title/70143836' -w %{http_code} -o /dev/null -H 'host: www.netflix.com' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'sec-fetch-site: none' -H 'sec-fetch-mode: navigate' -H 'sec-fetch-user: ?1' -H 'sec-fetch-dest: document' --user-agent "${UA_BROWSER}")
+    local mixed1 mixed2 body1 body2 result1 result2
+    mixed1=$(curl ${CURL_DEFAULT_OPTS} -sL -w '\n%{http_code}' 'https://www.netflix.com/title/81280792' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' --user-agent "${UA_BROWSER}" 2>/dev/null)
+    mixed2=$(curl ${CURL_DEFAULT_OPTS} -sL -w '\n%{http_code}' 'https://www.netflix.com/title/70143836' -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' --user-agent "${UA_BROWSER}" 2>/dev/null)
+    result1=$(echo "$mixed1" | tail -n 1)
+    result2=$(echo "$mixed2" | tail -n 1)
+    body1=$(echo "$mixed1" | sed '$d')
+    body2=$(echo "$mixed2" | sed '$d')
 
     if [ "${result1}" == '000' ] || [ "$result2" == '000' ]; then
         writeResult "Netflix" "Unknown"
         return
     fi
-    if [ "$result1" == '404' ] && [ "$result2" == '404' ]; then
-        writeResult "Netflix" "No (Originals Only)"
-        return
-    fi
-    if [ "$result1" == '403' ] || [ "$result2" == '403' ]; then
+    if [ "$result1" == '403' ] || [ "$result2" == '403' ] || echo "$body1$body2" | grep -q 'NSEZ-403'; then
         writeResult "Netflix" "No"
         return
     fi
-    if [ "$result1" == '200' ] || [ "$result2" == '200' ]; then
-        local title=81280792
-        [ "$result1" != '200' ] && title=70143836
-        local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sL "https://www.netflix.com/title/$title" -H 'accept-language: en-US,en;q=0.9' -H "sec-ch-ua: ${UA_SEC_CH_UA}" -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'sec-fetch-site: none' -H 'sec-fetch-mode: navigate' -H 'sec-fetch-user: ?1' -H 'sec-fetch-dest: document' --user-agent "${UA_BROWSER}")
-        # 只读取 Netflix 对当前请求标记的国家，不使用州代码或第三方 IP 归属地。
-        local json_object='(?(DEFINE)(?<object>\{(?:[^{}"]|"(?:\\.|[^"\\])*"|(?&object))*\}))'
-        local json_prefix='^\{(?:[^{}"]|"(?:\\.|[^"\\])*"|(?&object))*?'
-        NetflixRegionField() {
-            grep -oP "$json_prefix\"$1\"\s*:\s*\K"'(?:"(?:\\.|[^"\\])*"|(?&object)|true|false|null|[0-9]+)(?=\s*[,}])'"$json_object"
-        }
-        local region=$(printf '%s\n' "$tmpresult" | tr '\r\n' '  ' | grep -oP 'netflix[.]reactContext\s*=\s*\K(?&object)'"$json_object" | NetflixRegionField models | NetflixRegionField geo | NetflixRegionField data | NetflixRegionField requestCountry | NetflixRegionField id | grep -oP '^"\K[A-Z]{2}(?="$)')
+
+    local unavail1=0 unavail2=0
+    nf_title_unavailable "$result1" "$body1" && unavail1=1
+    nf_title_unavailable "$result2" "$body2" && unavail2=1
+    if [ "$unavail1" -eq 1 ] && [ "$unavail2" -eq 1 ]; then
+        writeResult "Netflix" "No (Originals Only)"
+        return
+    fi
+
+    if [ "$unavail1" -eq 0 ] || [ "$unavail2" -eq 0 ]; then
+        local region=$(nf_region_from_html "$body1")
+        [ -z "$region" ] && region=$(nf_region_from_html "$body2")
+        if [ -z "$region" ]; then
+            local tmpresult=$(curl ${CURL_DEFAULT_OPTS} -sL 'https://www.netflix.com/' -H 'accept-language: en-US,en;q=0.9' --user-agent "${UA_BROWSER}" 2>/dev/null)
+            region=$(nf_region_from_html "$tmpresult")
+        fi
         if [ -n "$region" ]; then
             writeResult "Netflix" "Yes ($region)"
         else
