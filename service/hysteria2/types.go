@@ -34,14 +34,14 @@ type Hysteria2Service struct {
 	// globalChecker 跨节点全局设备限制（共享 Redis），未启用时为 nil
 	globalChecker *limiter.GlobalDeviceChecker
 
-	mu           sync.RWMutex
-	users        map[string]userRecord           // uuid -> user
-	traffic      map[string]*userTraffic         // uuid -> counters
-	overLimit    map[string]bool                 // uuid -> over device limit
-	onlineIPs    map[string]map[string]struct{}  // uuid -> set of IPs
-	ipLastActive map[string]map[string]time.Time // uuid -> ip -> last active time
-	blockedIDs   map[string]bool                 // connection id -> blocked by audit
-	rateLimiters map[string]*rate.Limiter        // uuid -> per-user speed limiter
+	mu             sync.RWMutex
+	users          map[string]userRecord           // uuid -> user
+	traffic        map[string]*userTraffic         // uuid -> counters
+	overLimit      map[string]bool                 // uuid -> over device limit
+	onlineSlots    map[string]map[string]struct{}  // uuid -> set of slots
+	slotLastActive map[string]map[string]time.Time // uuid -> slot -> last active time
+	blockedIDs     map[string]bool                 // connection id -> blocked by audit
+	rateLimiters   map[string]*rate.Limiter        // uuid -> per-user speed limiter
 	// rebuildPending 记录「server 尚未按 nodeInfo 装好」。面板随后会返回 304，
 	// 届时既没有新配置可比，DeepEqual 也判不出重建没走完。
 	rebuildPending bool

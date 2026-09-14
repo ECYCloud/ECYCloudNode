@@ -34,15 +34,15 @@ func New(apiClient api.API, cfg *controller.Config) *TuicService {
 		globalChecker = limiter.NewGlobalDeviceChecker(cfg.GlobalDeviceLimitConfig)
 	}
 	return &TuicService{
-		apiClient:     apiClient,
-		config:        cfg,
-		logger:        logger,
-		rules:         rule.New(),
-		globalChecker: globalChecker,
-		users:         make(map[string]userRecord),
-		traffic:       make(map[string]*userTraffic),
-		onlineIPs:     make(map[string]map[string]struct{}),
-		ipLastActive:  make(map[string]map[string]time.Time),
+		apiClient:      apiClient,
+		config:         cfg,
+		logger:         logger,
+		rules:          rule.New(),
+		globalChecker:  globalChecker,
+		users:          make(map[string]userRecord),
+		traffic:        make(map[string]*userTraffic),
+		onlineSlots:    make(map[string]map[string]struct{}),
+		slotLastActive: make(map[string]map[string]time.Time),
 	}
 }
 

@@ -61,20 +61,20 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		return false, ""
 	}
 
-	ipSet, ok := a.svc.onlineIPs[auth]
+	slotSet, ok := a.svc.onlineSlots[auth]
 	if !ok {
-		ipSet = make(map[string]struct{})
-		a.svc.onlineIPs[auth] = ipSet
+		slotSet = make(map[string]struct{})
+		a.svc.onlineSlots[auth] = slotSet
 	}
 
-	// Initialize ipLastActive map for this user if not exists
-	activeMap, ok := a.svc.ipLastActive[auth]
+	// Initialize slotLastActive map for this user if not exists
+	activeMap, ok := a.svc.slotLastActive[auth]
 	if !ok {
 		activeMap = make(map[string]time.Time)
-		a.svc.ipLastActive[auth] = activeMap
+		a.svc.slotLastActive[auth] = activeMap
 	}
 
-	allowed, grant := limiter.AdmitDeviceIP(ipSet, activeMap, slot, user.UID, user.DeviceLimit)
+	allowed, grant := limiter.AdmitDeviceSlot(slotSet, activeMap, slot, user.UID, user.DeviceLimit)
 	a.svc.mu.Unlock()
 	if !allowed {
 		logger.WithFields(log.Fields{
@@ -88,8 +88,8 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
 	if !a.svc.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant) {
 		a.svc.mu.Lock()
-		delete(a.svc.onlineIPs[auth], slot)
-		if am, ok := a.svc.ipLastActive[auth]; ok {
+		delete(a.svc.onlineSlots[auth], slot)
+		if am, ok := a.svc.slotLastActive[auth]; ok {
 			delete(am, slot)
 		}
 		a.svc.mu.Unlock()
@@ -124,7 +124,7 @@ func (h *Hysteria2Service) ensureOnline(cred, host string) bool {
 		h.mu.Unlock()
 		return false
 	}
-	online, due := limiter.EnsureDeviceIP(h.onlineIPs[cred], h.ipLastActive[cred], slot)
+	online, due := limiter.EnsureDeviceSlot(h.onlineSlots[cred], h.slotLastActive[cred], slot)
 	h.mu.Unlock()
 
 	// 不限设备数的账号没有名额可守，复查只为续期，不据此断连
@@ -152,7 +152,7 @@ func (h *Hysteria2Service) verifyOnline(cred, host string) bool {
 	if !ok {
 		return false
 	}
-	return limiter.VerifyDeviceIP(h.ipLastActive[cred], slot, user.DeviceLimit)
+	return limiter.VerifyDeviceSlot(h.slotLastActive[cred], slot, user.DeviceLimit)
 }
 
 // guardOnline 是存活会话的周期性复查入口：名额已被挤出时标记断开，
@@ -183,16 +183,16 @@ func (h *Hysteria2Service) releaseOnline(cred, host string) {
 	if !ok {
 		return
 	}
-	if ipSet, exists := h.onlineIPs[cred]; exists {
-		delete(ipSet, slot)
-		if len(ipSet) == 0 {
-			delete(h.onlineIPs, cred)
+	if slotSet, exists := h.onlineSlots[cred]; exists {
+		delete(slotSet, slot)
+		if len(slotSet) == 0 {
+			delete(h.onlineSlots, cred)
 		}
 	}
-	if activeMap, exists := h.ipLastActive[cred]; exists {
+	if activeMap, exists := h.slotLastActive[cred]; exists {
 		delete(activeMap, slot)
 		if len(activeMap) == 0 {
-			delete(h.ipLastActive, cred)
+			delete(h.slotLastActive, cred)
 		}
 	}
 }

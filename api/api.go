@@ -17,10 +17,8 @@ type API interface {
 	GetUserList() (userList *[]UserInfo, err error)
 	ReportNodeStatus(nodeStatus *NodeStatus) (err error)
 	ReportNodeOnlineUsers(onlineUser *[]OnlineUser) (err error)
-	// ReportKickedUsers 上报因在线 IP 超限被踢下线的 IP，供面板通知官方客户端。
 	ReportKickedUsers(kickedUser *[]OnlineUser) (err error)
-	// ConsumeIpReclaim 消耗官方客户端确认：仅该出口 IP 可踢人。
-	// targetIP 是用户在客户端选定要挤下线的 IP，为空时由节点挑最旧在线 IP。
+	ConsumeSlotReclaim(uid int, slot string) (ok bool, targetSlot string, err error)
 	ConsumeIpReclaim(uid int, ip string) (ok bool, targetIP string, err error)
 	ReportUserTraffic(userTraffic *[]UserTraffic) (err error)
 	Describe() ClientInfo

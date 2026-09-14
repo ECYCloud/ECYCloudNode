@@ -42,7 +42,7 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
 		}
-		limiter.ShareAccountSlots(accountSlots, u.UID, u.ClientID, keys, s.onlineIPs, s.ipLastActive)
+		limiter.ShareAccountSlots(accountSlots, u.UID, u.ClientID, keys, s.onlineSlots, s.slotLastActive)
 
 		limit := determineRate(nodeLimit, u.SpeedLimit)
 		var limiter *rate.Limiter
@@ -103,15 +103,15 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 	s.authUsers = authUsers
 	s.rateLimiters = newRateLimiters
 
-	for uuid := range s.onlineIPs {
+	for uuid := range s.onlineSlots {
 		if _, ok := newUsers[uuid]; !ok {
-			delete(s.onlineIPs, uuid)
+			delete(s.onlineSlots, uuid)
 		}
 	}
-	// Clean ipLastActive records for removed users
-	for uuid := range s.ipLastActive {
+	// Clean slotLastActive records for removed users
+	for uuid := range s.slotLastActive {
 		if _, ok := newUsers[uuid]; !ok {
-			delete(s.ipLastActive, uuid)
+			delete(s.slotLastActive, uuid)
 		}
 	}
 }
@@ -140,7 +140,7 @@ func (s *AnyTLSService) addTraffic(uuid string, up, down int64) {
 	t.Upload += up
 	t.Download += down
 
-	// Note: We don't update onlineIPs here because we don't have the IP address.
+	// 在线名额由连接认证和连接流量回调维护。
 	// 名额由 Read/Write 里的 ensureOnline / verifyOnline 复查。
 }
 
@@ -164,20 +164,20 @@ func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 		return false
 	}
 
-	ips, ok := s.onlineIPs[uuid]
+	slots, ok := s.onlineSlots[uuid]
 	if !ok {
-		ips = make(map[string]struct{})
-		s.onlineIPs[uuid] = ips
+		slots = make(map[string]struct{})
+		s.onlineSlots[uuid] = slots
 	}
 
-	// Initialize ipLastActive map for this user if not exists
-	activeMap, ok := s.ipLastActive[uuid]
+	// Initialize slotLastActive map for this user if not exists
+	activeMap, ok := s.slotLastActive[uuid]
 	if !ok {
 		activeMap = make(map[string]time.Time)
-		s.ipLastActive[uuid] = activeMap
+		s.slotLastActive[uuid] = activeMap
 	}
 
-	allowed, grant := limiter.AdmitDeviceIP(ips, activeMap, slot, user.UID, user.DeviceLimit)
+	allowed, grant := limiter.AdmitDeviceSlot(slots, activeMap, slot, user.UID, user.DeviceLimit)
 	s.mu.Unlock()
 	if !allowed {
 		s.logger.WithFields(log.Fields{
@@ -191,8 +191,8 @@ func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
 	if !s.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant) {
 		s.mu.Lock()
-		delete(s.onlineIPs[uuid], slot)
-		if am, ok := s.ipLastActive[uuid]; ok {
+		delete(s.onlineSlots[uuid], slot)
+		if am, ok := s.slotLastActive[uuid]; ok {
 			delete(am, slot)
 		}
 		s.mu.Unlock()
@@ -216,7 +216,7 @@ func (s *AnyTLSService) ensureOnline(uuid, host string) bool {
 		s.mu.Unlock()
 		return false
 	}
-	online, due := limiter.EnsureDeviceIP(s.onlineIPs[uuid], s.ipLastActive[uuid], slot)
+	online, due := limiter.EnsureDeviceSlot(s.onlineSlots[uuid], s.slotLastActive[uuid], slot)
 	s.mu.Unlock()
 
 	// 不限设备数的账号没有名额可守，复查只为续期，不据此断连
@@ -242,7 +242,7 @@ func (s *AnyTLSService) verifyOnline(uuid, host string) bool {
 	if !ok {
 		return false
 	}
-	return limiter.VerifyDeviceIP(s.ipLastActive[uuid], slot, user.DeviceLimit)
+	return limiter.VerifyDeviceSlot(s.slotLastActive[uuid], slot, user.DeviceLimit)
 }
 
 func (s *AnyTLSService) collectUsage() ([]api.UserTraffic, []api.OnlineUser, map[string]userTraffic) {
@@ -273,40 +273,40 @@ func (s *AnyTLSService) collectUsage() ([]api.UserTraffic, []api.OnlineUser, map
 		t.Download = 0
 	}
 
-	// 先按活跃时间清理过期 IP，再收集在线用户。
+	// 先按活跃时间清理过期名额，再收集在线用户。
 	// 整表清空会导致每个上报周期设备名额被重新抢占，使设备限制形同虚设；
-	// 活跃连接会通过流量事件持续刷新 ipLastActive，从而稳定持有名额。
+	// 活跃连接会通过流量事件持续刷新 slotLastActive，从而稳定持有名额。
 	now := time.Now()
-	for uuid, activeMap := range s.ipLastActive {
-		for ip, last := range activeMap {
-			if now.Sub(last) > limiter.OnlineIPExpiry {
-				delete(activeMap, ip)
-				if ipSet, ok := s.onlineIPs[uuid]; ok {
-					delete(ipSet, ip)
+	for uuid, activeMap := range s.slotLastActive {
+		for slot, last := range activeMap {
+			if now.Sub(last) > limiter.OnlineSlotExpiry {
+				delete(activeMap, slot)
+				if slotSet, ok := s.onlineSlots[uuid]; ok {
+					delete(slotSet, slot)
 				}
 			}
 		}
 		if len(activeMap) == 0 {
-			delete(s.ipLastActive, uuid)
-			delete(s.onlineIPs, uuid)
+			delete(s.slotLastActive, uuid)
+			delete(s.onlineSlots, uuid)
 		}
 	}
 
 	var online []api.OnlineUser
 	// 同账号的官方设备共用一份账本，多个认证键指向同一张表，按「账号+名额标识」去重
 	seen := make(map[string]struct{})
-	for uuid, ipSet := range s.onlineIPs {
+	for uuid, slotSet := range s.onlineSlots {
 		user, ok := s.users[uuid]
 		if !ok {
 			continue
 		}
-		for ip := range ipSet {
-			key := strconv.Itoa(user.UID) + "|" + ip
+		for slot := range slotSet {
+			key := strconv.Itoa(user.UID) + "|" + slot
 			if _, dup := seen[key]; dup {
 				continue
 			}
 			seen[key] = struct{}{}
-			online = append(online, api.OnlineUser{UID: user.UID, IP: ip, ClientID: limiter.ClientIDFromOnlineKey(ip)})
+			online = append(online, limiter.OnlineUser(user.UID, slot))
 		}
 	}
 

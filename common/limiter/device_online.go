@@ -4,7 +4,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ECYCloud/ECYCloudNode/api"
 )
+
+func OnlineUser(uid int, slot string) api.OnlineUser {
+	user := api.OnlineUser{UID: uid, ClientID: ClientIDFromOnlineKey(slot)}
+	if user.ClientID == 0 {
+		user.IP = slot
+	}
+	return user
+}
 
 const clientKeyPrefix = "client-"
 
@@ -80,15 +90,15 @@ func ShareAccountSlots(shared map[int]DeviceSlots, uid, clientID int, authKeys [
 	}
 }
 
-// PurgeStaleDeviceIPs 清理超过 expiry 未活跃的 IP，返回剩余活跃 IP 数。
-func PurgeStaleDeviceIPs(onlineIPs map[string]struct{}, activeMap map[string]time.Time, expiry time.Duration) int {
+// PurgeStaleDeviceSlots 清理超过 expiry 未活跃的 名额，返回剩余活跃 名额 数。
+func PurgeStaleDeviceSlots(onlineSlots map[string]struct{}, activeMap map[string]time.Time, expiry time.Duration) int {
 	now := time.Now()
 	fresh := 0
-	for ip, last := range activeMap {
+	for slot, last := range activeMap {
 		if now.Sub(last) > expiry {
-			delete(activeMap, ip)
-			if onlineIPs != nil {
-				delete(onlineIPs, ip)
+			delete(activeMap, slot)
+			if onlineSlots != nil {
+				delete(onlineSlots, slot)
 			}
 		} else {
 			fresh++
@@ -97,30 +107,30 @@ func PurgeStaleDeviceIPs(onlineIPs map[string]struct{}, activeMap map[string]tim
 	return fresh
 }
 
-// AdmitDeviceIP 在协议侧本地在线表登记 IP；名额满时须有官方客户端确认才踢人，
-// 优先踢用户在客户端选定的那个 IP。
+// AdmitDeviceSlot 在协议侧本地在线表登记 名额；名额满时须有官方客户端确认才踢人，
+// 优先踢用户在客户端选定的那个 名额。
 // 第二个返回值是本次消耗到的确认，供全局限制复用，避免再查一次授权。
-func AdmitDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time, ip string, uid, deviceLimit int) (allowed bool, grant ReclaimGrant) {
-	if ip == "" {
+func AdmitDeviceSlot(onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int) (allowed bool, grant ReclaimGrant) {
+	if slot == "" {
 		return false, grant
 	}
-	fresh := PurgeStaleDeviceIPs(onlineIPs, activeMap, OnlineIPExpiry)
-	if _, exists := onlineIPs[ip]; exists {
-		activeMap[ip] = time.Now()
+	fresh := PurgeStaleDeviceSlots(onlineSlots, activeMap, OnlineSlotExpiry)
+	if _, exists := onlineSlots[slot]; exists {
+		activeMap[slot] = time.Now()
 		return true, grant
 	}
 	if deviceLimit > 0 && fresh >= deviceLimit {
-		if _, ok := peekOldestDeviceIP(activeMap); !ok {
+		if _, ok := peekOldestDeviceSlot(activeMap); !ok {
 			return false, grant
 		}
-		grant = ConsumeReclaimGrant(uid, ip)
+		grant = ConsumeReclaimGrant(uid, slot)
 		if !grant.Granted {
 			return false, grant
 		}
 		// 用户只选了一个，名额缺口不止一个时其余继续踢最旧的
-		target := grant.TargetIP
+		target := grant.TargetSlot
 		for deviceLimit > 0 && fresh >= deviceLimit {
-			evicted, ok := EvictDeviceIP(onlineIPs, activeMap, target)
+			evicted, ok := EvictDeviceSlot(onlineSlots, activeMap, target)
 			if !ok {
 				return false, grant
 			}
@@ -129,52 +139,52 @@ func AdmitDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time
 			fresh--
 		}
 	}
-	onlineIPs[ip] = struct{}{}
-	activeMap[ip] = time.Now()
+	onlineSlots[slot] = struct{}{}
+	activeMap[slot] = time.Now()
 	return true, grant
 }
 
-// EnsureDeviceIP 是协议侧上行方向（客户端→服务端有真实数据）的名额复查，与
-// Limiter.EnsureOnline 同语义：ip 仍持有名额则续期并返回 online=true；已被挤出或
+// EnsureDeviceSlot 是协议侧上行方向（客户端→服务端有真实数据）的名额复查，与
+// Limiter.EnsureOnline 同语义：slot 仍持有名额则续期并返回 online=true；已被挤出或
 // 已过期返回 false，调用方应断开连接。被挤出后禁止再通过踢人重新抢回名额，所以这里
 // 只能续期、不能登记。
 // due 表示是否到了复查全局名额的时点，未到时调用方应跳过 Redis 往返：读写回调按每个
 // 缓冲区触发，不节流会把每个包都变成一次跨节点查询。
-func EnsureDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time, ip string) (online, due bool) {
-	if ip == "" {
+func EnsureDeviceSlot(onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string) (online, due bool) {
+	if slot == "" {
 		return false, false
 	}
-	last, ok := activeMap[ip]
+	last, ok := activeMap[slot]
 	if !ok {
 		return false, false
 	}
 	now := time.Now()
-	if now.Sub(last) > OnlineIPExpiry {
-		delete(activeMap, ip)
-		if onlineIPs != nil {
-			delete(onlineIPs, ip)
+	if now.Sub(last) > OnlineSlotExpiry {
+		delete(activeMap, slot)
+		if onlineSlots != nil {
+			delete(onlineSlots, slot)
 		}
 		return false, false
 	}
-	activeMap[ip] = now
+	activeMap[slot] = now
 	return true, now.Sub(last) >= onlineTouchSec*time.Second
 }
 
-// VerifyDeviceIP 是协议侧下行方向（远端→客户端）的名额复查，与 Limiter.VerifyOnline
+// VerifyDeviceSlot 是协议侧下行方向（远端→客户端）的名额复查，与 Limiter.VerifyOnline
 // 同语义：只读、不续期。下行流量不能证明客户端仍然存活——客户端异常离线后，远端仍
 // 可能持续向残留连接推送数据；若据此续期，离线名额会被无限"续命"、永不释放。
-// 放行条件：该 ip 仍持有新鲜名额，或该用户尚有空余名额。
-func VerifyDeviceIP(activeMap map[string]time.Time, ip string, deviceLimit int) bool {
+// 放行条件：该 slot 仍持有新鲜名额，或该用户尚有空余名额。
+func VerifyDeviceSlot(activeMap map[string]time.Time, slot string, deviceLimit int) bool {
 	if deviceLimit <= 0 {
 		return true
 	}
 	now := time.Now()
 	fresh := 0
-	for slot, last := range activeMap {
-		if now.Sub(last) > OnlineIPExpiry {
+	for key, last := range activeMap {
+		if now.Sub(last) > OnlineSlotExpiry {
 			continue
 		}
-		if slot == ip {
+		if key == slot {
 			return true
 		}
 		fresh++

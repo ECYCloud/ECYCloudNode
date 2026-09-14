@@ -39,13 +39,13 @@ type AnyTLSService struct {
 	// globalChecker 跨节点全局设备限制（共享 Redis），未启用时为 nil
 	globalChecker *limiter.GlobalDeviceChecker
 
-	mu           sync.RWMutex
-	users        map[string]userRecord           // authKey -> user
-	traffic      map[string]*userTraffic         // authKey -> counters
-	onlineIPs    map[string]map[string]struct{}  // authKey -> set of IPs
-	ipLastActive map[string]map[string]time.Time // authKey -> ip -> last active time
-	authUsers    []option.AnyTLSUser             // users for sing-anytls authentication
-	rateLimiters map[string]*rate.Limiter        // authKey -> per-user speed limiter
+	mu             sync.RWMutex
+	users          map[string]userRecord           // authKey -> user
+	traffic        map[string]*userTraffic         // authKey -> counters
+	onlineSlots    map[string]map[string]struct{}  // authKey -> set of slots
+	slotLastActive map[string]map[string]time.Time // authKey -> slot -> last active time
+	authUsers      []option.AnyTLSUser             // users for sing-anytls authentication
+	rateLimiters   map[string]*rate.Limiter        // authKey -> per-user speed limiter
 	// builtAuthUsers 是运行中的 inbound 实际认识的凭据。sing-box 的 AnyTLS
 	// inbound 在构造时就固化用户表且没有在线更新入口，靠它判断是否必须重建。
 	builtAuthUsers map[string]struct{}

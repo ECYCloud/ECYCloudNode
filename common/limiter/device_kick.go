@@ -8,14 +8,14 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/api"
 )
 
-var deviceKickBuffer sync.Map // key: "uid|ip" -> api.OnlineUser
+var deviceKickBuffer sync.Map // key: "uid|slot" -> api.OnlineUser
 
-// NoteDeviceKick 记录因在线 IP 超限被挤出的 IP，供上报面板后通知官方客户端。
-func NoteDeviceKick(uid int, ip string) {
-	if uid <= 0 || ip == "" {
+// NoteDeviceKick 记录因在线 名额 超限被挤出的 名额，供上报面板后通知官方客户端。
+func NoteDeviceKick(uid int, slot string) {
+	if uid <= 0 || slot == "" {
 		return
 	}
-	deviceKickBuffer.Store(fmt.Sprintf("%d|%s", uid, ip), api.OnlineUser{UID: uid, IP: ip})
+	deviceKickBuffer.Store(fmt.Sprintf("%d|%s", uid, slot), OnlineUser(uid, slot))
 }
 
 // TakeDeviceKicks 取出并清空待上报的踢下线记录。
@@ -29,40 +29,40 @@ func TakeDeviceKicks() []api.OnlineUser {
 	return out
 }
 
-func peekOldestDeviceIP(activeMap map[string]time.Time) (string, bool) {
+func peekOldestDeviceSlot(activeMap map[string]time.Time) (string, bool) {
 	if len(activeMap) == 0 {
 		return "", false
 	}
-	oldestIP := ""
+	oldestSlot := ""
 	var oldestAt time.Time
 	first := true
-	for ip, at := range activeMap {
+	for slot, at := range activeMap {
 		if first || at.Before(oldestAt) {
-			oldestIP = ip
+			oldestSlot = slot
 			oldestAt = at
 			first = false
 		}
 	}
-	if oldestIP == "" {
+	if oldestSlot == "" {
 		return "", false
 	}
-	return oldestIP, true
+	return oldestSlot, true
 }
 
-// EvictDeviceIP 移除用户选定的 target，同步清理 onlineIPs，返回被踢 IP。
-// target 为空或已不在线时退回最旧活跃 IP。
-func EvictDeviceIP(onlineIPs map[string]struct{}, activeMap map[string]time.Time, target string) (string, bool) {
+// EvictDeviceSlot 移除用户选定的 target，同步清理 onlineSlots，返回被踢 名额。
+// target 为空或已不在线时退回最旧活跃 名额。
+func EvictDeviceSlot(onlineSlots map[string]struct{}, activeMap map[string]time.Time, target string) (string, bool) {
 	victim := target
 	if _, online := activeMap[victim]; !online {
-		oldestIP, ok := peekOldestDeviceIP(activeMap)
+		oldestSlot, ok := peekOldestDeviceSlot(activeMap)
 		if !ok {
 			return "", false
 		}
-		victim = oldestIP
+		victim = oldestSlot
 	}
 	delete(activeMap, victim)
-	if onlineIPs != nil {
-		delete(onlineIPs, victim)
+	if onlineSlots != nil {
+		delete(onlineSlots, victim)
 	}
 	return victim, true
 }

@@ -790,13 +790,17 @@ func (c *Controller) userInfoMonitor() (err error) {
 			c.logger.Print(err)
 		} else if len(*onlineDevice) > 0 {
 			sample := (*onlineDevice)[0]
+			identity := fmt.Sprintf("IP=%s", sample.IP)
+			if sample.ClientID != 0 {
+				identity = fmt.Sprintf("ClientID=%d", sample.ClientID)
+			}
 			c.logger.Printf(
-				"Report %d online users (NodeID=%d, Tag=%s); example: UID=%d IP=%s",
+				"Report %d online users (NodeID=%d, Tag=%s); example: UID=%d %s",
 				len(*onlineDevice),
 				c.nodeInfo.NodeID,
 				c.Tag,
 				sample.UID,
-				sample.IP,
+				identity,
 			)
 		}
 		if kicks := limiter.TakeDeviceKicks(); len(kicks) > 0 {

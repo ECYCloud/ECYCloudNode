@@ -62,7 +62,7 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 	t.svc.mu.Unlock()
 
 	// TCPRequest / UDPRequest 只在新建代理请求时触发，单条长连接持续传输期间
-	// 只有流量事件能证明会话还在；不据此复查，名额会在 OnlineIPExpiry 后被回收，
+	// 只有流量事件能证明会话还在；不据此复查，名额会在 OnlineSlotExpiry 后被回收，
 	// 在线数少算且名额被别的设备顶掉。
 	// 上行（客户端发来的数据）能证明客户端存活，续期并复查；下行只复查不续期。
 	// 返回 false 即通知内核断开这条连接。
@@ -87,7 +87,7 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 }
 
 func (t *hyTrafficLogger) LogOnlineState(id string, online bool) {
-	// Online state is tracked via Authenticator using the onlineIPs map.
+	// Online state is tracked via Authenticator using the onlineSlots map.
 }
 
 func (t *hyTrafficLogger) TraceStream(stream server.HyStream, stats *server.StreamStats) {}
@@ -124,7 +124,7 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
 		}
-		limiter.ShareAccountSlots(accountSlots, u.UID, u.ClientID, keys, h.onlineIPs, h.ipLastActive)
+		limiter.ShareAccountSlots(accountSlots, u.UID, u.ClientID, keys, h.onlineSlots, h.slotLastActive)
 
 		limit := determineRate(nodeLimit, u.SpeedLimit)
 		var limiter *rate.Limiter
@@ -171,16 +171,16 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 	h.users = newUsers
 	h.rateLimiters = newRateLimiters
 
-	// Clean online IP records for removed users
-	for uuid := range h.onlineIPs {
+	// Clean online slot records for removed users
+	for uuid := range h.onlineSlots {
 		if _, ok := newUsers[uuid]; !ok {
-			delete(h.onlineIPs, uuid)
+			delete(h.onlineSlots, uuid)
 		}
 	}
-	// Clean ipLastActive records for removed users
-	for uuid := range h.ipLastActive {
+	// Clean slotLastActive records for removed users
+	for uuid := range h.slotLastActive {
 		if _, ok := newUsers[uuid]; !ok {
-			delete(h.ipLastActive, uuid)
+			delete(h.slotLastActive, uuid)
 		}
 	}
 }
@@ -240,40 +240,40 @@ func (h *Hysteria2Service) collectUsage() ([]api.UserTraffic, []api.OnlineUser, 
 		t.Download = 0
 	}
 
-	// 先按活跃时间清理过期 IP，再收集在线用户。
+	// 先按活跃时间清理过期名额，再收集在线用户。
 	// 整表清空会导致每个上报周期设备名额被重新抢占，使设备限制形同虚设；
-	// 活跃连接会通过流量事件持续刷新 ipLastActive，从而稳定持有名额。
+	// 活跃连接会通过流量事件持续刷新 slotLastActive，从而稳定持有名额。
 	now := time.Now()
-	for uuid, activeMap := range h.ipLastActive {
-		for ip, last := range activeMap {
-			if now.Sub(last) > limiter.OnlineIPExpiry {
-				delete(activeMap, ip)
-				if ipSet, ok := h.onlineIPs[uuid]; ok {
-					delete(ipSet, ip)
+	for uuid, activeMap := range h.slotLastActive {
+		for slot, last := range activeMap {
+			if now.Sub(last) > limiter.OnlineSlotExpiry {
+				delete(activeMap, slot)
+				if slotSet, ok := h.onlineSlots[uuid]; ok {
+					delete(slotSet, slot)
 				}
 			}
 		}
 		if len(activeMap) == 0 {
-			delete(h.ipLastActive, uuid)
-			delete(h.onlineIPs, uuid)
+			delete(h.slotLastActive, uuid)
+			delete(h.onlineSlots, uuid)
 		}
 	}
 
 	var onlineUsers []api.OnlineUser
 	// 同账号的官方设备共用一份账本，多个认证键指向同一张表，按「账号+名额标识」去重
 	seen := make(map[string]struct{})
-	for uuid, ipSet := range h.onlineIPs {
+	for uuid, slotSet := range h.onlineSlots {
 		user, ok := h.users[uuid]
 		if !ok {
 			continue
 		}
-		for ip := range ipSet {
-			key := strconv.Itoa(user.UID) + "|" + ip
+		for slot := range slotSet {
+			key := strconv.Itoa(user.UID) + "|" + slot
 			if _, dup := seen[key]; dup {
 				continue
 			}
 			seen[key] = struct{}{}
-			onlineUsers = append(onlineUsers, api.OnlineUser{UID: user.UID, IP: ip, ClientID: limiter.ClientIDFromOnlineKey(ip)})
+			onlineUsers = append(onlineUsers, limiter.OnlineUser(user.UID, slot))
 		}
 	}
 

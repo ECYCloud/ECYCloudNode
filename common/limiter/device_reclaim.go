@@ -5,11 +5,9 @@ import (
 	"strings"
 )
 
-// ReclaimGrant 是官方客户端的挤下线确认。TargetIP 为用户在客户端选定要挤下线的 IP，
-// 为空（旧版客户端或该 IP 已下线）时由节点挑最旧活跃 IP。
 type ReclaimGrant struct {
-	Granted  bool
-	TargetIP string
+	Granted    bool
+	TargetSlot string
 }
 
 var reclaimConsumer func(int, string) (bool, string)
@@ -33,14 +31,21 @@ func NormalizeClientIP(ip string) string {
 	return parsed.String()
 }
 
-func ConsumeReclaimGrant(uid int, ip string) ReclaimGrant {
-	ip = NormalizeClientIP(ip)
-	if uid <= 0 || ip == "" || reclaimConsumer == nil {
+func ConsumeReclaimGrant(uid int, slot string) ReclaimGrant {
+	slot = strings.TrimSpace(slot)
+	if !IsClientOnlineKey(slot) {
+		slot = NormalizeClientIP(slot)
+	}
+	if uid <= 0 || slot == "" || reclaimConsumer == nil {
 		return ReclaimGrant{}
 	}
-	ok, targetIP := reclaimConsumer(uid, ip)
+	ok, targetSlot := reclaimConsumer(uid, slot)
 	if !ok {
 		return ReclaimGrant{}
 	}
-	return ReclaimGrant{Granted: true, TargetIP: NormalizeClientIP(targetIP)}
+	targetSlot = strings.TrimSpace(targetSlot)
+	if !IsClientOnlineKey(targetSlot) {
+		targetSlot = NormalizeClientIP(targetSlot)
+	}
+	return ReclaimGrant{Granted: true, TargetSlot: targetSlot}
 }

@@ -35,17 +35,17 @@ func New(apiClient api.API, cfg *controller.Config) *Hysteria2Service {
 		globalChecker = limiter.NewGlobalDeviceChecker(cfg.GlobalDeviceLimitConfig)
 	}
 	return &Hysteria2Service{
-		apiClient:     apiClient,
-		config:        cfg,
-		logger:        logger,
-		rules:         rule.New(),
-		globalChecker: globalChecker,
-		users:         make(map[string]userRecord),
-		traffic:       make(map[string]*userTraffic),
-		overLimit:     make(map[string]bool),
-		onlineIPs:     make(map[string]map[string]struct{}),
-		ipLastActive:  make(map[string]map[string]time.Time),
-		blockedIDs:    make(map[string]bool),
+		apiClient:      apiClient,
+		config:         cfg,
+		logger:         logger,
+		rules:          rule.New(),
+		globalChecker:  globalChecker,
+		users:          make(map[string]userRecord),
+		traffic:        make(map[string]*userTraffic),
+		overLimit:      make(map[string]bool),
+		onlineSlots:    make(map[string]map[string]struct{}),
+		slotLastActive: make(map[string]map[string]time.Time),
+		blockedIDs:     make(map[string]bool),
 	}
 }
 

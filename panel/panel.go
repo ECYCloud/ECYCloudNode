@@ -325,13 +325,19 @@ func (p *Panel) Start() {
 			}
 		}
 
-		limiter.SetReclaimConsumer(func(uid int, ip string) (bool, string) {
-			ok, targetIP, err := apiClient.ConsumeIpReclaim(uid, ip)
+		limiter.SetReclaimConsumer(func(uid int, slot string) (bool, string) {
+			consume := apiClient.ConsumeSlotReclaim
+			operation, field := "ConsumeSlotReclaim", "slot"
+			if !limiter.IsClientOnlineKey(slot) {
+				consume = apiClient.ConsumeIpReclaim
+				operation, field = "ConsumeIpReclaim", "ip"
+			}
+			ok, targetSlot, err := consume(uid, slot)
 			if err != nil {
-				log.Warnf("ConsumeIpReclaim uid=%d ip=%s: %v", uid, ip, err)
+				log.Warnf("%s uid=%d %s=%s: %v", operation, uid, field, slot, err)
 				return false, ""
 			}
-			return ok, targetIP
+			return ok, targetSlot
 		})
 
 		// Register service for this node

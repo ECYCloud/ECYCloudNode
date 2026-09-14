@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	// OnlineIPExpiry IP 无活动超过该时长即视为下线，释放设备名额
-	OnlineIPExpiry = time.Minute
+	// OnlineSlotExpiry 名额 无活动超过该时长即视为下线，释放设备名额
+	OnlineSlotExpiry = time.Minute
 	// onlineTouchSec 存活连接刷新在线状态/复查名额的间隔（秒）
 	onlineTouchSec = 10
 )
@@ -28,19 +28,19 @@ type UserInfo struct {
 	DeviceLimit int
 }
 
-// onlineEntry 记录单个在线 IP 的归属与最近活跃时间（unix 秒）
+// onlineEntry 记录单个在线 名额 的归属与最近活跃时间（unix 秒）
 type onlineEntry struct {
 	UID      int
 	LastSeen int64
 }
 
 type InboundInfo struct {
-	Tag            string
-	NodeSpeedLimit uint64
-	UserInfo       *sync.Map // Key: user identifier (usually UID string) -> UserInfo
-	BucketHub      *sync.Map // Key: user identifier -> *rate.Limiter
-	UserOnlineIP   *sync.Map // Key: onlineBucket() -> *sync.Map (Key: OnlineKey(), Value: onlineEntry)
-	GlobalLimit    *GlobalDeviceChecker
+	Tag             string
+	NodeSpeedLimit  uint64
+	UserInfo        *sync.Map // Key: user identifier (usually UID string) -> UserInfo
+	BucketHub       *sync.Map // Key: user identifier -> *rate.Limiter
+	UserOnlineSlots *sync.Map // Key: onlineBucket() -> *sync.Map (Key: OnlineKey(), Value: onlineEntry)
+	GlobalLimit     *GlobalDeviceChecker
 }
 
 // onlineBucket 名额账本的分桶键。官方客户端每台设备有独立 userKey，必须并到账号级
@@ -64,11 +64,11 @@ func New() *Limiter {
 
 func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalLimit *GlobalDeviceLimitConfig) error {
 	inboundInfo := &InboundInfo{
-		Tag:            tag,
-		NodeSpeedLimit: nodeSpeedLimit,
-		BucketHub:      new(sync.Map),
-		UserOnlineIP:   new(sync.Map),
-		GlobalLimit:    NewGlobalDeviceChecker(globalLimit),
+		Tag:             tag,
+		NodeSpeedLimit:  nodeSpeedLimit,
+		BucketHub:       new(sync.Map),
+		UserOnlineSlots: new(sync.Map),
+		GlobalLimit:     NewGlobalDeviceChecker(globalLimit),
 	}
 
 	userMap := new(sync.Map)
@@ -130,26 +130,26 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
 		now := time.Now().Unix()
-		// 只清理过期 IP，保留活跃 IP 的在线状态。
+		// 只清理过期 名额，保留活跃 名额 的在线状态。
 		// 整表清空会导致每个上报周期设备名额被重新抢占，使设备限制形同虚设。
-		inboundInfo.UserOnlineIP.Range(func(key, value interface{}) bool {
+		inboundInfo.UserOnlineSlots.Range(func(key, value interface{}) bool {
 			email := key.(string)
-			ipMap := value.(*sync.Map)
+			slotMap := value.(*sync.Map)
 			active := 0
-			ipMap.Range(func(ipKey, entryValue interface{}) bool {
+			slotMap.Range(func(slotKey, entryValue interface{}) bool {
 				entry := entryValue.(onlineEntry)
-				if now-entry.LastSeen > int64(OnlineIPExpiry/time.Second) {
-					ipMap.Delete(ipKey)
+				if now-entry.LastSeen > int64(OnlineSlotExpiry/time.Second) {
+					slotMap.Delete(slotKey)
 					return true
 				}
 				active++
-				slot := ipKey.(string)
-				onlineUser = append(onlineUser, api.OnlineUser{UID: entry.UID, IP: slot, ClientID: ClientIDFromOnlineKey(slot)})
+				slot := slotKey.(string)
+				onlineUser = append(onlineUser, OnlineUser(entry.UID, slot))
 				return true
 			})
 			if active == 0 {
 				// 用户已完全下线：释放在线表与限速桶
-				inboundInfo.UserOnlineIP.Delete(email)
+				inboundInfo.UserOnlineSlots.Delete(email)
 				inboundInfo.BucketHub.Delete(email)
 			}
 			return true
@@ -179,7 +179,7 @@ func (l *Limiter) GetUserBucket(tag string, userKey string, ip string) (limiter 
 			clientID = u.ClientID
 		}
 
-		if !admitIP(inboundInfo, userKey, ip, uid, deviceLimit) {
+		if !admitSlot(inboundInfo, userKey, ip, uid, deviceLimit) {
 			return nil, false, true
 		}
 
@@ -203,34 +203,34 @@ func (l *Limiter) GetUserBucket(tag string, userKey string, ip string) (limiter 
 	return nil, false, false
 }
 
-// admitIP 登记/刷新用户占用的在线名额；名额满时须有官方客户端确认才踢最旧的一个。
+// admitSlot 登记/刷新用户占用的在线名额；名额满时须有官方客户端确认才踢最旧的一个。
 // 已在线的名额刷新活跃时间放行；新名额在清理过期条目后按剩余额度判定，不足则拒绝。
 // 官方客户端按设备标识占名额，第三方按出口 IP 占名额，两组各自独立计数。
-func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int) bool {
+func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int) bool {
 	clientID := 0
 	if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
 		clientID = v.(UserInfo).ClientID
 	}
 	slot := OnlineKey(clientID, ip)
 	now := time.Now().Unix()
-	v, _ := inboundInfo.UserOnlineIP.LoadOrStore(onlineBucket(inboundInfo.Tag, uid, clientID), new(sync.Map))
-	ipMap := v.(*sync.Map)
+	v, _ := inboundInfo.UserOnlineSlots.LoadOrStore(onlineBucket(inboundInfo.Tag, uid, clientID), new(sync.Map))
+	slotMap := v.(*sync.Map)
 
 	var grant ReclaimGrant
-	if _, online := ipMap.Load(slot); online {
-		ipMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
+	if _, online := slotMap.Load(slot); online {
+		slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
 	} else {
 		counter := 0
-		ipMap.Range(func(key, value interface{}) bool {
-			if now-value.(onlineEntry).LastSeen > int64(OnlineIPExpiry/time.Second) {
-				ipMap.Delete(key)
+		slotMap.Range(func(key, value interface{}) bool {
+			if now-value.(onlineEntry).LastSeen > int64(OnlineSlotExpiry/time.Second) {
+				slotMap.Delete(key)
 			} else {
 				counter++
 			}
 			return true
 		})
 		if deviceLimit > 0 && counter >= deviceLimit {
-			if _, ok := peekOldestOnlineIP(ipMap, now); !ok {
+			if _, ok := peekOldestOnlineSlot(slotMap, now); !ok {
 				return false
 			}
 			grant = ConsumeReclaimGrant(uid, slot)
@@ -238,9 +238,9 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 				return false
 			}
 			// 用户只选了一个，名额缺口不止一个时其余继续踢最旧的
-			target := grant.TargetIP
+			target := grant.TargetSlot
 			for deviceLimit > 0 && counter >= deviceLimit {
-				evicted, ok := evictOnlineIP(ipMap, now, target)
+				evicted, ok := evictOnlineSlot(slotMap, now, target)
 				if !ok {
 					return false
 				}
@@ -249,54 +249,54 @@ func admitIP(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int)
 				counter--
 			}
 		}
-		ipMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
+		slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
 	}
 
 	// 全局（跨节点）限制
 	if !inboundInfo.GlobalLimit.Allow(uid, slot, deviceLimit, grant) {
-		ipMap.Delete(slot)
+		slotMap.Delete(slot)
 		return false
 	}
 	return true
 }
 
-func peekOldestOnlineIP(ipMap *sync.Map, now int64) (string, bool) {
-	oldestIP := ""
+func peekOldestOnlineSlot(slotMap *sync.Map, now int64) (string, bool) {
+	oldestSlot := ""
 	oldestSeen := int64(math.MaxInt64)
-	expiry := int64(OnlineIPExpiry / time.Second)
-	ipMap.Range(func(key, value interface{}) bool {
+	expiry := int64(OnlineSlotExpiry / time.Second)
+	slotMap.Range(func(key, value interface{}) bool {
 		entry := value.(onlineEntry)
 		if now-entry.LastSeen > expiry {
 			return true
 		}
 		if entry.LastSeen < oldestSeen {
 			oldestSeen = entry.LastSeen
-			oldestIP = key.(string)
+			oldestSlot = key.(string)
 		}
 		return true
 	})
-	if oldestIP == "" {
+	if oldestSlot == "" {
 		return "", false
 	}
-	return oldestIP, true
+	return oldestSlot, true
 }
 
-// evictOnlineIP 踢掉用户选定的 target；target 为空或已不在线时退回最旧活跃 IP。
-func evictOnlineIP(ipMap *sync.Map, now int64, target string) (string, bool) {
+// evictOnlineSlot 踢掉用户选定的 target；target 为空或已不在线时退回最旧活跃 名额。
+func evictOnlineSlot(slotMap *sync.Map, now int64, target string) (string, bool) {
 	victim := target
-	if _, online := ipMap.Load(victim); !online {
-		oldestIP, ok := peekOldestOnlineIP(ipMap, now)
+	if _, online := slotMap.Load(victim); !online {
+		oldestSlot, ok := peekOldestOnlineSlot(slotMap, now)
 		if !ok {
 			return "", false
 		}
-		victim = oldestIP
+		victim = oldestSlot
 	}
-	ipMap.Delete(victim)
+	slotMap.Delete(victim)
 	return victim, true
 }
 
 // EnsureOnline 供上行方向（客户端→服务端有真实数据）周期性复查：
-// IP 仍在线则刷新活跃时间；若名额已被占满且该 IP 已被挤出，
+// 名额 仍在线则刷新活跃时间；若名额已被占满且该 名额 已被挤出，
 // 返回 false（调用方应断开连接）。被挤出后禁止再通过踢人重新抢回名额。
 func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	value, ok := l.InboundInfo.Load(tag)
@@ -314,26 +314,26 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	}
 	slot := OnlineKey(clientID, ip)
 
-	v, ok := inboundInfo.UserOnlineIP.Load(onlineBucket(tag, uid, clientID))
+	v, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, uid, clientID))
 	if !ok {
 		return false
 	}
-	ipMap := v.(*sync.Map)
-	entryValue, online := ipMap.Load(slot)
+	slotMap := v.(*sync.Map)
+	entryValue, online := slotMap.Load(slot)
 	if !online {
 		return false
 	}
 
 	now := time.Now().Unix()
 	entry := entryValue.(onlineEntry)
-	if now-entry.LastSeen > int64(OnlineIPExpiry/time.Second) {
-		ipMap.Delete(slot)
+	if now-entry.LastSeen > int64(OnlineSlotExpiry/time.Second) {
+		slotMap.Delete(slot)
 		return false
 	}
-	ipMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
+	slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
 
 	if !inboundInfo.GlobalLimit.Refresh(uid, slot, deviceLimit) {
-		ipMap.Delete(slot)
+		slotMap.Delete(slot)
 		return false
 	}
 	return true
@@ -341,8 +341,8 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 
 // VerifyOnline 供下行方向（远端→客户端）周期性复查：只读、不续期、不登记。
 // 下行流量不能证明客户端仍然存活——客户端异常离线后，远端仍可能持续向
-// 残留连接推送数据；若据此续期，离线 IP 会被无限"续命"，名额永不释放。
-// 放行条件：该 IP 仍持有新鲜名额，或该用户尚有空余名额。
+// 残留连接推送数据；若据此续期，离线 名额 会被无限"续命"，名额永不释放。
+// 放行条件：该 名额 仍持有新鲜名额，或该用户尚有空余名额。
 func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 	value, ok := l.InboundInfo.Load(tag)
 	if !ok {
@@ -362,17 +362,17 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 	}
 	slot := OnlineKey(clientID, ip)
 
-	v, ok := inboundInfo.UserOnlineIP.Load(onlineBucket(tag, uid, clientID))
+	v, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, uid, clientID))
 	if !ok {
 		return true
 	}
-	ipMap := v.(*sync.Map)
+	slotMap := v.(*sync.Map)
 
 	now := time.Now().Unix()
 	fresh := 0
 	selfFresh := false
-	ipMap.Range(func(key, value interface{}) bool {
-		if now-value.(onlineEntry).LastSeen > int64(OnlineIPExpiry/time.Second) {
+	slotMap.Range(func(key, value interface{}) bool {
+		if now-value.(onlineEntry).LastSeen > int64(OnlineSlotExpiry/time.Second) {
 			return true
 		}
 		if key.(string) == slot {

@@ -78,6 +78,7 @@ type UserResponse struct {
 	SpeedLimit  float64 `json:"node_speedlimit"`
 	DeviceLimit int     `json:"node_connector"`
 	UUID        string  `json:"uuid"`
+	OnlineCount int     `json:"online_count"`
 	AliveIP     int     `json:"alive_ip"`
 }
 
@@ -101,7 +102,7 @@ type SystemLoad struct {
 // OnlineUser is the data structure of online user
 type OnlineUser struct {
 	UID      int    `json:"user_id"`
-	IP       string `json:"ip"`
+	IP       string `json:"ip,omitempty"`
 	ClientID int    `json:"client_id,omitempty"`
 }
 
