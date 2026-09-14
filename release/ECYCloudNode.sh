@@ -700,7 +700,7 @@ show_ECYCloudNode_version() {
 run_unlockcheck() {
     echo -e "${green}正在执行节点解锁检测...${plain}"
     echo ""
-    /usr/local/ECYCloudNode/ECYCloudNode unlockcheck
+    /usr/local/ECYCloudNode/ECYCloudNode unlockcheck --config /etc/ECYCloudNode/config.yml
     echo ""
     if [[ $# == 0 ]]; then
         before_show_menu

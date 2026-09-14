@@ -5,38 +5,45 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/ECYCloud/ECYCloudNode/common/unlockcheck"
+	"github.com/ECYCloud/ECYCloudNode/panel"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
-
-// UnlockCheckResults represents all unlock check results
-type UnlockCheckResults struct {
-	YouTubePremium string `json:"YouTube_Premium"`
-	Netflix        string `json:"Netflix"`
-	DisneyPlus     string `json:"DisneyPlus"`
-	HBOMax         string `json:"HBOMax"`
-	AmazonPrime    string `json:"AmazonPrime"`
-	OpenAI         string `json:"OpenAI"`
-	Gemini         string `json:"Gemini"`
-	Claude         string `json:"Claude"`
-	TikTok         string `json:"TikTok"`
-}
 
 func init() {
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "unlockcheck",
 		Short: "Manually run streaming unlock detection",
-		Long:  "Run streaming unlock detection manually and display results. This uses the same detection logic as the automatic check.",
-		Run: func(cmd *cobra.Command, args []string) {
-			runManualUnlockCheck()
+		Long:  "Run streaming unlock detection manually, display results and report them to the configured panel nodes. This uses the same detection logic as the automatic check.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runManualUnlockCheck()
 		},
 	})
 }
 
-func runManualUnlockCheck() {
+func runManualUnlockCheck() error {
+	configPath := cfgFile
+	if configPath == "" {
+		configPath = "/etc/ECYCloudNode/config.yml"
+	}
+	config := viper.New()
+	config.SetConfigFile(configPath)
+	if err := config.ReadInConfig(); err != nil {
+		return fmt.Errorf("读取节点配置失败：%w", err)
+	}
+	panelConfig := &panel.Config{}
+	if err := config.Unmarshal(panelConfig); err != nil {
+		return fmt.Errorf("解析节点配置失败：%w", err)
+	}
+	if len(panelConfig.NodesConfig) == 0 {
+		return fmt.Errorf("节点配置中没有 Nodes，无法上报检测结果")
+	}
+
 	fmt.Println("========================================")
 	fmt.Println("  ECYCloudNode Unlock Detection")
 	fmt.Println("========================================")
@@ -46,43 +53,43 @@ func runManualUnlockCheck() {
 
 	startTime := time.Now()
 
-	// Get the embedded script from unlockcheck package
-	scriptPath := "/tmp/ecycloudnode_manual_check.sh"
-	resultPath := "/tmp/ecycloudnode_unlock_check_result.json"
+	// 手动检测与后台定时检测使用独立文件，避免上报另一轮结果。
+	workDir, err := os.MkdirTemp("", "ecycloudnode-manual-")
+	if err != nil {
+		return fmt.Errorf("创建检测临时目录失败：%w", err)
+	}
+	defer os.RemoveAll(workDir)
+	scriptPath := filepath.Join(workDir, "check.sh")
+	resultPath := filepath.Join(workDir, "unlock_check_result.json")
 
 	// Get the script content from unlockcheck package
 	script := unlockcheck.GetCSMScript()
+	script = strings.ReplaceAll(script, "/tmp/ecycloudnode_unlock_check", "${ECYCLOUDNODE_UNLOCK_TMP}/unlock_check")
 
 	// Write script to temp file
 	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
-		fmt.Printf("Error: Failed to write script file: %v\n", err)
-		return
+		return fmt.Errorf("写入检测脚本失败：%w", err)
 	}
-	defer os.Remove(scriptPath)
 
 	// Execute the script
 	execCmd := exec.Command("bash", scriptPath)
-	execCmd.Env = append(os.Environ(), "LANG=en_US.UTF-8")
+	execCmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "ECYCLOUDNODE_UNLOCK_TMP="+filepath.ToSlash(workDir))
 	output, err := execCmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("Error: Failed to execute script: %v\n", err)
 		fmt.Printf("Output: %s\n", string(output))
-		return
+		return fmt.Errorf("执行检测脚本失败：%w", err)
 	}
 
 	// Read result JSON file
 	resultData, err := os.ReadFile(resultPath)
 	if err != nil {
-		fmt.Printf("Error: Failed to read result file: %v\n", err)
-		return
+		return fmt.Errorf("读取检测结果失败：%w", err)
 	}
-	defer os.Remove(resultPath)
 
 	// Parse JSON results
-	var results UnlockCheckResults
+	var results unlockcheck.UnlockCheckResults
 	if err := json.Unmarshal(resultData, &results); err != nil {
-		fmt.Printf("Error: Failed to parse result JSON: %v\n", err)
-		return
+		return fmt.Errorf("解析检测结果失败：%w", err)
 	}
 
 	elapsed := time.Since(startTime)
@@ -107,6 +114,13 @@ func runManualUnlockCheck() {
 	fmt.Println("JSON Result:")
 	jsonOutput, _ := json.MarshalIndent(results, "", "  ")
 	fmt.Println(string(jsonOutput))
+
+	reported, err := panel.New(panelConfig).ReportUnlockCheckResult(results.ToJSON())
+	fmt.Printf("已向面板上报 %d 个节点的检测结果。\n", reported)
+	if err != nil {
+		return fmt.Errorf("检测已完成，但结果上报失败：%w", err)
+	}
+	return nil
 }
 
 func printResult(service, result string) {
