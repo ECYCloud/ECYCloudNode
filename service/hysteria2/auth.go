@@ -74,7 +74,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		a.svc.slotLastActive[auth] = activeMap
 	}
 
-	allowed, grant := limiter.AdmitDeviceSlot(slotSet, activeMap, slot, user.UID, user.DeviceLimit)
+	allowed, grant := limiter.AdmitDeviceSlot(&a.svc.mu, slotSet, activeMap, slot, user.UID, user.DeviceLimit)
 	a.svc.mu.Unlock()
 	if !allowed {
 		logger.WithFields(log.Fields{
@@ -116,7 +116,8 @@ func (h *Hysteria2Service) slot(cred, host string) (string, userRecord, bool) {
 	return limiter.OnlineKey(user.ClientID, host), user, true
 }
 
-// ensureOnline 复查并续期该凭据持有的名额；已被挤出或已过期返回 false。
+// ensureOnline 复查并续期该凭据持有的名额，闲置过期但尚有空余名额时重新登记；
+// 已被挤出且名额已满返回 false。
 func (h *Hysteria2Service) ensureOnline(cred, host string) bool {
 	h.mu.Lock()
 	slot, user, ok := h.slot(cred, host)
@@ -124,13 +125,9 @@ func (h *Hysteria2Service) ensureOnline(cred, host string) bool {
 		h.mu.Unlock()
 		return false
 	}
-	online, due := limiter.EnsureDeviceSlot(h.onlineSlots[cred], h.slotLastActive[cred], slot)
+	online, due := limiter.EnsureDeviceSlot(h.onlineSlots, h.slotLastActive, cred, slot, user.DeviceLimit)
 	h.mu.Unlock()
 
-	// 不限设备数的账号没有名额可守，复查只为续期，不据此断连
-	if user.DeviceLimit <= 0 {
-		return true
-	}
 	if !online {
 		return false
 	}
@@ -138,7 +135,15 @@ func (h *Hysteria2Service) ensureOnline(cred, host string) bool {
 		return true
 	}
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	return h.globalChecker.Refresh(user.UID, slot, user.DeviceLimit)
+	if h.globalChecker.Refresh(user.UID, slot, user.DeviceLimit) {
+		return true
+	}
+	// 被全局挤出的名额不能留在本地账本继续占位，与 Authenticate 同口径
+	h.mu.Lock()
+	delete(h.onlineSlots[cred], slot)
+	delete(h.slotLastActive[cred], slot)
+	h.mu.Unlock()
+	return false
 }
 
 // verifyOnline 下行方向（远端→客户端）的复查：只核查不续期。下行流量不能证明客户端
@@ -183,16 +188,6 @@ func (h *Hysteria2Service) releaseOnline(cred, host string) {
 	if !ok {
 		return
 	}
-	if slotSet, exists := h.onlineSlots[cred]; exists {
-		delete(slotSet, slot)
-		if len(slotSet) == 0 {
-			delete(h.onlineSlots, cred)
-		}
-	}
-	if activeMap, exists := h.slotLastActive[cred]; exists {
-		delete(activeMap, slot)
-		if len(activeMap) == 0 {
-			delete(h.slotLastActive, cred)
-		}
-	}
+	delete(h.onlineSlots[cred], slot)
+	delete(h.slotLastActive[cred], slot)
 }

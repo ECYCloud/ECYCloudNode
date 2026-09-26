@@ -3,6 +3,7 @@ package limiter
 import (
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ECYCloud/ECYCloudNode/api"
@@ -109,65 +110,87 @@ func PurgeStaleDeviceSlots(onlineSlots map[string]struct{}, activeMap map[string
 
 // AdmitDeviceSlot 在协议侧本地在线表登记 名额；名额满时须有官方客户端确认才踢人，
 // 优先踢用户在客户端选定的那个 名额。
+// 调用方须持 mu 进入，返回时仍持 mu：取确认是一次对面板的 HTTP 调用，不能持锁等待，
+// 这里会解锁去取、取回后重新加锁并重数一遍再踢。
 // 第二个返回值是本次消耗到的确认，供全局限制复用，避免再查一次授权。
-func AdmitDeviceSlot(onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int) (allowed bool, grant ReclaimGrant) {
+func AdmitDeviceSlot(mu sync.Locker, onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int) (allowed bool, grant ReclaimGrant) {
 	if slot == "" {
 		return false, grant
 	}
-	fresh := PurgeStaleDeviceSlots(onlineSlots, activeMap, OnlineSlotExpiry)
-	if _, exists := onlineSlots[slot]; exists {
+	for {
+		fresh := PurgeStaleDeviceSlots(onlineSlots, activeMap, OnlineSlotExpiry)
+		if _, exists := onlineSlots[slot]; exists {
+			activeMap[slot] = time.Now()
+			return true, grant
+		}
+		if deviceLimit > 0 && fresh >= deviceLimit {
+			if _, ok := peekOldestDeviceSlot(activeMap); !ok {
+				return false, grant
+			}
+			if !grant.Granted {
+				mu.Unlock()
+				grant = ConsumeReclaimGrant(uid, slot)
+				mu.Lock()
+				if !grant.Granted {
+					return false, grant
+				}
+				continue
+			}
+			// 用户只选了一个，名额缺口不止一个时其余继续踢最旧的
+			target := grant.TargetSlot
+			for deviceLimit > 0 && fresh >= deviceLimit {
+				evicted, ok := EvictDeviceSlot(onlineSlots, activeMap, target)
+				if !ok {
+					return false, grant
+				}
+				NoteDeviceKick(uid, evicted)
+				target = ""
+				fresh--
+			}
+		}
+		onlineSlots[slot] = struct{}{}
 		activeMap[slot] = time.Now()
 		return true, grant
 	}
-	if deviceLimit > 0 && fresh >= deviceLimit {
-		if _, ok := peekOldestDeviceSlot(activeMap); !ok {
-			return false, grant
-		}
-		grant = ConsumeReclaimGrant(uid, slot)
-		if !grant.Granted {
-			return false, grant
-		}
-		// 用户只选了一个，名额缺口不止一个时其余继续踢最旧的
-		target := grant.TargetSlot
-		for deviceLimit > 0 && fresh >= deviceLimit {
-			evicted, ok := EvictDeviceSlot(onlineSlots, activeMap, target)
-			if !ok {
-				return false, grant
-			}
-			NoteDeviceKick(uid, evicted)
-			target = ""
-			fresh--
-		}
-	}
-	onlineSlots[slot] = struct{}{}
-	activeMap[slot] = time.Now()
-	return true, grant
 }
 
 // EnsureDeviceSlot 是协议侧上行方向（客户端→服务端有真实数据）的名额复查，与
-// Limiter.EnsureOnline 同语义：slot 仍持有名额则续期并返回 online=true；已被挤出或
-// 已过期返回 false，调用方应断开连接。被挤出后禁止再通过踢人重新抢回名额，所以这里
-// 只能续期、不能登记。
+// Limiter.EnsureOnline 同语义：slot 仍持有名额则续期并返回 online=true；闲置过期（或整张
+// 表还不存在）但账号尚有空余名额时重新登记；已被挤出且名额已满返回 false，调用方
+// 应断开连接。被挤出后禁止再通过踢人重新抢回名额，所以这里不消费确认、不踢人。
+// onlineSlots / slotLastActive 是服务侧按认证键 key 存的两张总表，调用方须持锁。
 // due 表示是否到了复查全局名额的时点，未到时调用方应跳过 Redis 往返：读写回调按每个
-// 缓冲区触发，不节流会把每个包都变成一次跨节点查询。
-func EnsureDeviceSlot(onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string) (online, due bool) {
+// 缓冲区触发，不节流会把每个包都变成一次跨节点查询。活跃时间也只在到点时刷新，否则持续
+// 传输时永远到不了复查时点，全局名额会在 Expiry 后过期。
+func EnsureDeviceSlot(onlineSlots map[string]map[string]struct{}, slotLastActive map[string]map[string]time.Time,
+	key, slot string, deviceLimit int) (online, due bool) {
 	if slot == "" {
 		return false, false
 	}
-	last, ok := activeMap[slot]
-	if !ok {
-		return false, false
-	}
 	now := time.Now()
-	if now.Sub(last) > OnlineSlotExpiry {
-		delete(activeMap, slot)
-		if onlineSlots != nil {
-			delete(onlineSlots, slot)
+	activeMap := slotLastActive[key]
+	if last, ok := activeMap[slot]; ok && now.Sub(last) <= OnlineSlotExpiry {
+		if now.Sub(last) < onlineTouchSec*time.Second {
+			return true, false
 		}
+		activeMap[slot] = now
+		return true, true
+	}
+	if !VerifyDeviceSlot(activeMap, slot, deviceLimit) {
 		return false, false
 	}
+	if activeMap == nil {
+		activeMap = make(map[string]time.Time)
+		slotLastActive[key] = activeMap
+	}
+	slots := onlineSlots[key]
+	if slots == nil {
+		slots = make(map[string]struct{})
+		onlineSlots[key] = slots
+	}
+	slots[slot] = struct{}{}
 	activeMap[slot] = now
-	return true, now.Sub(last) >= onlineTouchSec*time.Second
+	return true, true
 }
 
 // VerifyDeviceSlot 是协议侧下行方向（远端→客户端）的名额复查，与 Limiter.VerifyOnline

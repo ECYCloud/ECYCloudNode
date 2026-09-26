@@ -173,7 +173,7 @@ func (s *TuicService) allowConnection(uuid, host string) bool {
 		s.slotLastActive[uuid] = activeMap
 	}
 
-	allowed, grant := limiter.AdmitDeviceSlot(slots, activeMap, slot, user.UID, user.DeviceLimit)
+	allowed, grant := limiter.AdmitDeviceSlot(&s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit)
 	s.mu.Unlock()
 	if !allowed {
 		s.logger.WithFields(log.Fields{
@@ -203,8 +203,8 @@ func (s *TuicService) allowConnection(uuid, host string) bool {
 	return true
 }
 
-// ensureOnline 上行方向（客户端→服务端有真实数据）的周期性复查：续期仍持有的名额；
-// 已被挤出或已过期返回 false，调用方应断开连接。
+// ensureOnline 上行方向（客户端→服务端有真实数据）的周期性复查：续期仍持有的名额，
+// 闲置过期但尚有空余名额时重新登记；已被挤出且名额已满返回 false，调用方应断开连接。
 func (s *TuicService) ensureOnline(uuid, host string) bool {
 	s.mu.Lock()
 	slot, user, ok := s.slot(uuid, host)
@@ -212,13 +212,9 @@ func (s *TuicService) ensureOnline(uuid, host string) bool {
 		s.mu.Unlock()
 		return false
 	}
-	online, due := limiter.EnsureDeviceSlot(s.onlineSlots[uuid], s.slotLastActive[uuid], slot)
+	online, due := limiter.EnsureDeviceSlot(s.onlineSlots, s.slotLastActive, uuid, slot, user.DeviceLimit)
 	s.mu.Unlock()
 
-	// 不限设备数的账号没有名额可守，复查只为续期，不据此断连
-	if user.DeviceLimit <= 0 {
-		return true
-	}
 	if !online {
 		return false
 	}
@@ -226,7 +222,15 @@ func (s *TuicService) ensureOnline(uuid, host string) bool {
 		return true
 	}
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	return s.globalChecker.Refresh(user.UID, slot, user.DeviceLimit)
+	if s.globalChecker.Refresh(user.UID, slot, user.DeviceLimit) {
+		return true
+	}
+	// 被全局挤出的名额不能留在本地账本继续占位，与 allowConnection 同口径
+	s.mu.Lock()
+	delete(s.onlineSlots[uuid], slot)
+	delete(s.slotLastActive[uuid], slot)
+	s.mu.Unlock()
+	return false
 }
 
 // verifyOnline 下行方向（远端→客户端）的周期性复查：只核查不续期。
@@ -272,6 +276,7 @@ func (s *TuicService) collectUsage() ([]api.UserTraffic, []api.OnlineUser, map[s
 	// 先按活跃时间清理过期名额，再收集在线用户。
 	// 整表清空会导致每个上报周期设备名额被重新抢占，使设备限制形同虚设；
 	// 活跃连接会通过流量事件持续刷新 slotLastActive，从而稳定持有名额。
+	// 账本清空也不删引用：同账号设备共用这一份，删掉后重连会各建新账本、绕过账号级上限。
 	now := time.Now()
 	for uuid, activeMap := range s.slotLastActive {
 		for slot, last := range activeMap {
@@ -281,10 +286,6 @@ func (s *TuicService) collectUsage() ([]api.UserTraffic, []api.OnlineUser, map[s
 					delete(slotSet, slot)
 				}
 			}
-		}
-		if len(activeMap) == 0 {
-			delete(s.slotLastActive, uuid)
-			delete(s.onlineSlots, uuid)
 		}
 	}
 

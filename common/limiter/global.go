@@ -29,7 +29,7 @@ var (
 // 多节点并发时后写者会覆盖前写者刚登记的 名额，在线数可以超过上限。同理不得在前面
 // 垫本地缓存，否则节点会拿过期副本写回。
 //
-// sweepPrelude 是三个脚本共用的前置片段：清掉过期 field，算出按活跃时间升序的存活
+// sweepPrelude 是两个脚本共用的前置片段：清掉过期 field，算出按活跃时间升序的存活
 // 列表与本次 名额 的活跃时间。ARGV 顺序固定为 now / expiry / slot / deviceLimit / touch / target。
 const sweepPrelude = `
 local now = tonumber(ARGV[1])
@@ -52,8 +52,8 @@ end
 table.sort(live, function(a, b) return a[2] < b[2] end)
 `
 
-// admitScript 在名额未满时登记 名额 并放行（返回 1）；名额已满返回 0，由调用方取得
-// 官方客户端确认后再走 evictScript。
+// admitScript 在名额未满时登记 名额 并放行（返回 1）；名额已满返回 0，Allow 取得
+// 官方客户端确认后再走 evictScript，Refresh 据此判为已被挤出。
 var admitScript = redis.NewScript(sweepPrelude + `
 local limit = tonumber(ARGV[4])
 local touch = tonumber(ARGV[5])
@@ -97,19 +97,6 @@ end
 redis.call('HSET', KEYS[1], slot, ARGV[1])
 redis.call('EXPIRE', KEYS[1], ARGV[2])
 return kicked
-`)
-
-// refreshScript 只续期已在名额中的 名额；已被挤出时返回 0，禁止踢人抢回。
-var refreshScript = redis.NewScript(sweepPrelude + `
-local touch = tonumber(ARGV[5])
-if mine == nil then
-	return 0
-end
-if now - mine >= touch then
-	redis.call('HSET', KEYS[1], slot, ARGV[1])
-	redis.call('EXPIRE', KEYS[1], ARGV[2])
-end
-return 1
 `)
 
 // NewGlobalDeviceChecker 未启用全局限制时返回 nil；nil 检查器的 Allow / Refresh 恒放行。
@@ -189,13 +176,14 @@ func (g *GlobalDeviceChecker) Allow(uid int, slot string, deviceLimit int, grant
 	return true
 }
 
-// Refresh 仅续期已在全局名额中的 名额；若已被挤出则返回 false，禁止踢人抢回。
+// Refresh 续期全局名额中的 名额，闲置过期但尚有空余名额时重新登记；若已被挤出且名额已满
+// 则返回 false，禁止踢人抢回。
 func (g *GlobalDeviceChecker) Refresh(uid int, slot string, deviceLimit int) bool {
 	if g == nil || deviceLimit <= 0 {
 		return true
 	}
 
-	online, err := g.eval(refreshScript, uid, slot, deviceLimit, "").Int()
+	online, err := g.eval(admitScript, uid, slot, deviceLimit, "").Int()
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "cache service")
 		return true

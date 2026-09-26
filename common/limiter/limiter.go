@@ -41,6 +41,9 @@ type InboundInfo struct {
 	BucketHub       *sync.Map // Key: user identifier -> *rate.Limiter
 	UserOnlineSlots *sync.Map // Key: onlineBucket() -> *sync.Map (Key: OnlineKey(), Value: onlineEntry)
 	GlobalLimit     *GlobalDeviceChecker
+	// slotMu 串行化在线账本的「先数后写」：sync.Map 只保证单次操作原子，
+	// 两条连接同时数到「未满」再各自登记就会超限
+	slotMu sync.Mutex
 }
 
 // onlineBucket 名额账本的分桶键。官方客户端每台设备有独立 userKey，必须并到账号级
@@ -132,6 +135,8 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 		now := time.Now().Unix()
 		// 只清理过期 名额，保留活跃 名额 的在线状态。
 		// 整表清空会导致每个上报周期设备名额被重新抢占，使设备限制形同虚设。
+		inboundInfo.slotMu.Lock()
+		defer inboundInfo.slotMu.Unlock()
 		inboundInfo.UserOnlineSlots.Range(func(key, value interface{}) bool {
 			email := key.(string)
 			slotMap := value.(*sync.Map)
@@ -212,14 +217,21 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 		clientID = v.(UserInfo).ClientID
 	}
 	slot := OnlineKey(clientID, ip)
-	now := time.Now().Unix()
-	v, _ := inboundInfo.UserOnlineSlots.LoadOrStore(onlineBucket(inboundInfo.Tag, uid, clientID), new(sync.Map))
-	slotMap := v.(*sync.Map)
+	bucket := onlineBucket(inboundInfo.Tag, uid, clientID)
 
-	var grant ReclaimGrant
-	if _, online := slotMap.Load(slot); online {
-		slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
-	} else {
+	var (
+		grant   ReclaimGrant
+		slotMap *sync.Map
+	)
+	inboundInfo.slotMu.Lock()
+	for {
+		now := time.Now().Unix()
+		v, _ := inboundInfo.UserOnlineSlots.LoadOrStore(bucket, new(sync.Map))
+		slotMap = v.(*sync.Map)
+		if _, online := slotMap.Load(slot); online {
+			slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
+			break
+		}
 		counter := 0
 		slotMap.Range(func(key, value interface{}) bool {
 			if now-value.(onlineEntry).LastSeen > int64(OnlineSlotExpiry/time.Second) {
@@ -231,17 +243,24 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 		})
 		if deviceLimit > 0 && counter >= deviceLimit {
 			if _, ok := peekOldestOnlineSlot(slotMap, now); !ok {
+				inboundInfo.slotMu.Unlock()
 				return false
 			}
-			grant = ConsumeReclaimGrant(uid, slot)
 			if !grant.Granted {
-				return false
+				// 取确认是一次对面板的 HTTP 调用，不能持锁等待；拿到后重新数一遍再踢
+				inboundInfo.slotMu.Unlock()
+				if grant = ConsumeReclaimGrant(uid, slot); !grant.Granted {
+					return false
+				}
+				inboundInfo.slotMu.Lock()
+				continue
 			}
 			// 用户只选了一个，名额缺口不止一个时其余继续踢最旧的
 			target := grant.TargetSlot
 			for deviceLimit > 0 && counter >= deviceLimit {
 				evicted, ok := evictOnlineSlot(slotMap, now, target)
 				if !ok {
+					inboundInfo.slotMu.Unlock()
 					return false
 				}
 				NoteDeviceKick(uid, evicted)
@@ -250,7 +269,9 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 			}
 		}
 		slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
+		break
 	}
+	inboundInfo.slotMu.Unlock()
 
 	// 全局（跨节点）限制
 	if !inboundInfo.GlobalLimit.Allow(uid, slot, deviceLimit, grant) {
@@ -296,7 +317,7 @@ func evictOnlineSlot(slotMap *sync.Map, now int64, target string) (string, bool)
 }
 
 // EnsureOnline 供上行方向（客户端→服务端有真实数据）周期性复查：
-// 名额 仍在线则刷新活跃时间；若名额已被占满且该 名额 已被挤出，
+// 名额 仍在线则刷新活跃时间，闲置过期但账号尚有空余名额时重新登记；若名额已被占满且该 名额 已被挤出，
 // 返回 false（调用方应断开连接）。被挤出后禁止再通过踢人重新抢回名额。
 func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	value, ok := l.InboundInfo.Load(tag)
@@ -314,23 +335,15 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	}
 	slot := OnlineKey(clientID, ip)
 
-	v, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, uid, clientID))
-	if !ok {
+	inboundInfo.slotMu.Lock()
+	if !l.VerifyOnline(tag, userKey, ip) {
+		inboundInfo.slotMu.Unlock()
 		return false
 	}
+	v, _ := inboundInfo.UserOnlineSlots.LoadOrStore(onlineBucket(tag, uid, clientID), new(sync.Map))
 	slotMap := v.(*sync.Map)
-	entryValue, online := slotMap.Load(slot)
-	if !online {
-		return false
-	}
-
-	now := time.Now().Unix()
-	entry := entryValue.(onlineEntry)
-	if now-entry.LastSeen > int64(OnlineSlotExpiry/time.Second) {
-		slotMap.Delete(slot)
-		return false
-	}
-	slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: now})
+	slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: time.Now().Unix()})
+	inboundInfo.slotMu.Unlock()
 
 	if !inboundInfo.GlobalLimit.Refresh(uid, slot, deviceLimit) {
 		slotMap.Delete(slot)

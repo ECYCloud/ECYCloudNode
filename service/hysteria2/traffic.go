@@ -243,6 +243,7 @@ func (h *Hysteria2Service) collectUsage() ([]api.UserTraffic, []api.OnlineUser, 
 	// 先按活跃时间清理过期名额，再收集在线用户。
 	// 整表清空会导致每个上报周期设备名额被重新抢占，使设备限制形同虚设；
 	// 活跃连接会通过流量事件持续刷新 slotLastActive，从而稳定持有名额。
+	// 账本清空也不删引用：同账号设备共用这一份，删掉后重连会各建新账本、绕过账号级上限。
 	now := time.Now()
 	for uuid, activeMap := range h.slotLastActive {
 		for slot, last := range activeMap {
@@ -252,10 +253,6 @@ func (h *Hysteria2Service) collectUsage() ([]api.UserTraffic, []api.OnlineUser, 
 					delete(slotSet, slot)
 				}
 			}
-		}
-		if len(activeMap) == 0 {
-			delete(h.slotLastActive, uuid)
-			delete(h.onlineSlots, uuid)
 		}
 	}
 
