@@ -70,6 +70,7 @@ type CustomConfig struct {
 
 // UserResponse is the response of user
 type UserResponse struct {
+	ValidUntil  int64   `json:"valid_until"`
 	ID          int     `json:"id"`
 	ClientID    int     `json:"client_id"`
 	Passwd      string  `json:"passwd"`
@@ -104,13 +105,6 @@ type OnlineUser struct {
 	UID      int    `json:"user_id"`
 	IP       string `json:"ip,omitempty"`
 	ClientID int    `json:"client_id,omitempty"`
-}
-
-// UserTraffic is the data structure of traffic
-type UserTraffic struct {
-	UID      int   `json:"user_id"`
-	Upload   int64 `json:"u"`
-	Download int64 `json:"d"`
 }
 
 type RuleItem struct {

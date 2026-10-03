@@ -46,7 +46,8 @@ func IsAPIFailure(err error) bool {
 // ECYCloudNode 配置不一致带来的混乱，因此这里不再包含任何与 VLESS 开关相关
 // 的字段。
 type Config struct {
-	APIHost string `mapstructure:"ApiHost"`
+	TrafficDir string `mapstructure:"TrafficDir"`
+	APIHost    string `mapstructure:"ApiHost"`
 	// NodeID 支持单个或多个节点 ID：
 	//   NodeID: 41
 	//   NodeID: "41,42,43"
@@ -162,6 +163,7 @@ type TuicConfig struct {
 }
 
 type UserInfo struct {
+	ValidUntil  int64
 	UID         int
 	ClientID    int
 	Email       string
@@ -184,13 +186,6 @@ type OnlineUser struct {
 	UID      int
 	IP       string
 	ClientID int
-}
-
-type UserTraffic struct {
-	UID      int
-	Email    string
-	Upload   int64
-	Download int64
 }
 
 type ClientInfo struct {

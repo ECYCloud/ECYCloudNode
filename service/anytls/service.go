@@ -40,14 +40,25 @@ func New(apiClient api.API, cfg *controller.Config) *AnyTLSService {
 		rules:          rule.New(),
 		globalChecker:  globalChecker,
 		users:          make(map[string]userRecord),
-		traffic:        make(map[string]*userTraffic),
 		onlineSlots:    make(map[string]map[string]struct{}),
 		slotLastActive: make(map[string]map[string]time.Time),
 	}
 }
 
 func (s *AnyTLSService) Start() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.reloadMu.Lock()
+	s.closed = false
+	s.generation++
+	generation := s.generation
+	s.reloadMu.Unlock()
 	s.clientInfo = s.apiClient.Describe()
+	if s.config != nil && !s.config.DisableUploadTraffic {
+		if err := s.apiClient.PrepareTraffic(); err != nil {
+			return err
+		}
+	}
 
 	nodeInfo, err := s.apiClient.GetNodeInfo()
 	if err != nil {
@@ -101,8 +112,10 @@ func (s *AnyTLSService) Start() error {
 	if err != nil {
 		return err
 	}
+	s.reloadMu.Lock()
 	s.box = boxInstance
-	s.startBox(boxInstance, "start")
+	s.setRebuildPending(s.startBox(boxInstance, "start") != nil)
+	s.reloadMu.Unlock()
 
 	interval := time.Duration(s.config.UpdatePeriodic) * time.Second
 	s.tasks = []periodicTask{
@@ -138,6 +151,18 @@ func (s *AnyTLSService) Start() error {
 	})
 
 	for _, t := range s.tasks {
+		execute := t.Execute
+		t.Execute = func() error {
+			s.lifecycleMu.RLock()
+			defer s.lifecycleMu.RUnlock()
+			s.reloadMu.Lock()
+			closed := s.closed || generation != s.generation
+			s.reloadMu.Unlock()
+			if closed {
+				return errors.New("AnyTLS service is closed")
+			}
+			return execute()
+		}
 		go t.Start()
 	}
 
@@ -146,13 +171,15 @@ func (s *AnyTLSService) Start() error {
 }
 
 func (s *AnyTLSService) Close() error {
-	// 摘下来再关：startBox 靠 s.box 是否还是自己来区分「我们关的」和「它自己没起来」
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	s.closed = true
 	instance := s.box
 	s.box = nil
 	front := s.frontListener
 	s.frontListener = nil
-	s.reloadMu.Unlock()
 
 	for _, t := range s.tasks {
 		if t.Periodic != nil {
@@ -163,10 +190,11 @@ func (s *AnyTLSService) Close() error {
 	if front != nil {
 		front.Close()
 	}
+	var closeErr error
 	if instance != nil {
-		return instance.Close()
+		closeErr = instance.Close()
 	}
-	return nil
+	return errors.Join(closeErr, s.apiClient.CloseTraffic())
 }
 
 // currentNodeInfo 读取当前节点信息。nodeMonitor、userMonitor 与 certMonitor 是
@@ -216,26 +244,12 @@ func (s *AnyTLSService) setRebuildPending(pending bool) {
 	s.rebuildBackoff = next
 }
 
-// startBox 后台启动 box。sing-box 的入站在 Start 才绑定端口，端口被占之类的错误
-// 不会在构造阶段暴露，因此启动失败必须重新置位待重建；但这个 goroutine 可能晚到，
-// 只有它启动的仍是当前 box 才算故障，reloadMu 保证读到的是 reload 之后的状态。
-func (s *AnyTLSService) startBox(instance *box.Box, phase string) {
-	go func() {
-		err := instance.Start()
-		if err == nil {
-			return
-		}
-
-		s.reloadMu.Lock()
-		superseded := s.box != instance
-		s.reloadMu.Unlock()
-		if superseded {
-			return
-		}
-
+func (s *AnyTLSService) startBox(instance *box.Box, phase string) error {
+	err := instance.Start()
+	if err != nil {
 		s.logger.Errorf("AnyTLS box start error (%s): %v", phase, err)
-		s.setRebuildPending(true)
-	}()
+	}
+	return err
 }
 
 // reloadNode replaces in-memory node information and rebuilds the underlying
@@ -261,6 +275,9 @@ func (s *AnyTLSService) reloadNode(nodeInfo *api.NodeInfo) error {
 
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
+	if s.closed {
+		return errors.New("AnyTLS service is closed")
+	}
 
 	// nodeInfo 同时被 userMonitor 读取（syncUsers 取 SpeedLimit），必须与其同锁
 	s.mu.Lock()
@@ -326,9 +343,10 @@ func (s *AnyTLSService) reloadNode(nodeInfo *api.NodeInfo) error {
 			} else {
 				s.box = rollback
 				s.inboundTag = rollbackTag
-				s.startBox(rollback, "rollback")
-				s.logger.Warnf("AnyTLS reload failed, rolled back to previous config: %v", err)
-				rebuilt = true
+				rebuilt = s.startBox(rollback, "rollback") == nil
+				if rebuilt {
+					s.logger.Warnf("AnyTLS reload failed, rolled back to previous config: %v", err)
+				}
 			}
 		}
 		s.setRebuildPending(!rebuilt)
@@ -336,8 +354,7 @@ func (s *AnyTLSService) reloadNode(nodeInfo *api.NodeInfo) error {
 	}
 	s.box = boxInstance
 	s.inboundTag = inboundTag
-	s.setRebuildPending(false)
-	s.startBox(boxInstance, "reload")
+	s.setRebuildPending(s.startBox(boxInstance, "reload") != nil)
 
 	s.logger.Infof("AnyTLS node reloaded on %s:%d", s.config.ListenIP, s.nodeInfo.Port)
 	return nil
@@ -370,12 +387,13 @@ func (s *AnyTLSService) triggerRecovery() {
 	s.consecutiveFailures = 0
 
 	// Restart periodic tasks after a short delay
+	tasks := s.tasks
 	go func() {
 		time.Sleep(5 * time.Second)
 		s.logger.Info("Restarting periodic tasks...")
-		for i := range s.tasks {
-			s.logger.Printf("Restarting %s task", s.tasks[i].tag)
-			go s.tasks[i].Start()
+		for i := range tasks {
+			s.logger.Printf("Restarting %s task", tasks[i].tag)
+			go tasks[i].Start()
 		}
 		s.recoveryMutex.Lock()
 		s.recoveryInProgress = false

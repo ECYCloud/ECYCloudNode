@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	mapset "github.com/deckarep/golang-set"
+	mapset "github.com/deckarep/golang-set/v3"
 	"github.com/xtls/xray-core/common/errors"
 
 	"github.com/ECYCloud/ECYCloudNode/api"
@@ -107,10 +107,10 @@ func (r *Manager) UpdateRule(tag string, newRuleList []api.DetectRule) error {
 func (r *Manager) GetDetectResult(tag string) (*[]api.DetectResult, error) {
 	detectResult := make([]api.DetectResult, 0)
 	if value, ok := r.InboundDetectResult.LoadAndDelete(tag); ok {
-		resultSet := value.(mapset.Set)
+		resultSet := value.(mapset.Set[api.DetectResult])
 		it := resultSet.Iterator()
 		for result := range it.C {
-			detectResult = append(detectResult, result.(api.DetectResult))
+			detectResult = append(detectResult, result)
 		}
 	}
 	return &detectResult, nil
@@ -151,10 +151,10 @@ func (r *Manager) Detect(tag string, destination string, userKey string, srcIP s
 				errors.LogDebug(context.Background(), fmt.Sprintf("Record illegal behavior failed! Cannot find user's uid: %s", userKey))
 				return reject
 			}
-			newSet := mapset.NewSetWith(api.DetectResult{UID: uid, RuleID: hitRuleID, IP: srcIP})
+			newSet := mapset.NewSet(api.DetectResult{UID: uid, RuleID: hitRuleID, IP: srcIP})
 			// If there are any hit history
 			if v, ok := r.InboundDetectResult.LoadOrStore(tag, newSet); ok {
-				resultSet := v.(mapset.Set)
+				resultSet := v.(mapset.Set[api.DetectResult])
 				// If this is a new record
 				if resultSet.Add(api.DetectResult{UID: uid, RuleID: hitRuleID, IP: srcIP}) {
 					r.InboundDetectResult.Store(tag, resultSet)

@@ -19,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 
 	"github.com/ECYCloud/ECYCloudNode/api"
+	"github.com/ECYCloud/ECYCloudNode/app/mydispatcher"
 	"github.com/ECYCloud/ECYCloudNode/common/limiter"
 )
 
@@ -168,14 +169,16 @@ func (w *dataPathWrapper) Dispatch(ctx context.Context, link *transport.Link) {
 
 		// Device limit and rate limit
 		if w.limiter != nil && email != "" {
-			if bucket, ok, reject := w.limiter.GetUserBucket(nodeTag, email, srcIP); reject {
+			if _, _, reject := w.limiter.GetUserBucket(nodeTag, email, srcIP); reject {
 				common.Close(link.Writer)
 				common.Interrupt(link.Reader)
 				return
-			} else if ok && bucket != nil {
-				// Limit uplink and downlink: wrap Reader and Writer
-				link.Reader = w.limiter.RateReader(link.Reader, bucket)
-				link.Writer = w.limiter.RateWriter(link.Writer, bucket)
+			}
+			link.Reader = w.limiter.RateReader(link.Reader, nodeTag, email)
+			link.Writer = w.limiter.RateWriter(link.Writer, nodeTag, email)
+			if record := w.limiter.TrafficRecorder(nodeTag, email); record != nil {
+				link.Reader = &mydispatcher.SizeStatReader{Reader: link.Reader, Record: func(n int64) error { return record(n, 0) }}
+				link.Writer = &mydispatcher.SizeStatWriter{Writer: link.Writer, Record: func(n int64) error { return record(0, n) }}
 			}
 			// 存活连接周期复查在线名额，超限被挤出的 IP 会被强制断开；
 			// 上行（客户端数据）续期在线时间，下行只核查不续期
@@ -296,40 +299,29 @@ func (c *Controller) removeUsers(users []string, tag string) error {
 	return nil
 }
 
-func (c *Controller) getTraffic(email string) (up int64, down int64, upCounter stats.Counter, downCounter stats.Counter) {
+func (c *Controller) getTraffic(email string) (up int64, down int64) {
 	upName := "user>>>" + email + ">>>traffic>>>uplink"
 	downName := "user>>>" + email + ">>>traffic>>>downlink"
-	upCounter = c.stm.GetCounter(upName)
-	downCounter = c.stm.GetCounter(downName)
-	if upCounter != nil && upCounter.Value() != 0 {
-		up = upCounter.Value()
-	} else {
-		upCounter = nil
+	if counter := c.stm.GetCounter(upName); counter != nil {
+		up = counter.Set(0)
 	}
-	if downCounter != nil && downCounter.Value() != 0 {
-		down = downCounter.Value()
-	} else {
-		downCounter = nil
+	if counter := c.stm.GetCounter(downName); counter != nil {
+		down = counter.Set(0)
 	}
-	return up, down, upCounter, downCounter
-}
-
-func (c *Controller) resetTraffic(upCounterList *[]stats.Counter, downCounterList *[]stats.Counter) {
-	for _, upCounter := range *upCounterList {
-		upCounter.Set(0)
-	}
-	for _, downCounter := range *downCounterList {
-		downCounter.Set(0)
-	}
+	return up, down
 }
 
 func (c *Controller) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig) error {
-	err := c.dispatcher.Limiter.AddInboundLimiter(tag, nodeSpeedLimit, userList, globalDeviceLimitConfig)
+	var record func(int, int64, int64) error
+	if !c.config.DisableUploadTraffic {
+		record = c.apiClient.RecordUserTraffic
+	}
+	err := c.dispatcher.Limiter.AddInboundLimiter(tag, nodeSpeedLimit, userList, globalDeviceLimitConfig, record)
 	return err
 }
 
-func (c *Controller) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserInfo) error {
-	err := c.dispatcher.Limiter.UpdateInboundLimiter(tag, updatedUserList)
+func (c *Controller) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserInfo, replace ...bool) error {
+	err := c.dispatcher.Limiter.UpdateInboundLimiter(tag, updatedUserList, replace...)
 	return err
 }
 

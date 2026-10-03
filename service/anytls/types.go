@@ -41,7 +41,6 @@ type AnyTLSService struct {
 
 	mu             sync.RWMutex
 	users          map[string]userRecord           // authKey -> user
-	traffic        map[string]*userTraffic         // authKey -> counters
 	onlineSlots    map[string]map[string]struct{}  // authKey -> set of slots
 	slotLastActive map[string]map[string]time.Time // authKey -> slot -> last active time
 	authUsers      []option.AnyTLSUser             // users for sing-anytls authentication
@@ -59,7 +58,10 @@ type AnyTLSService struct {
 
 	// reloadMu prevents concurrent rebuilds of the underlying sing-box
 	// instance when node configuration or certificates change.
-	reloadMu sync.Mutex
+	reloadMu    sync.Mutex
+	lifecycleMu sync.RWMutex
+	closed      bool
+	generation  uint64
 
 	// Recovery tracking for IP whitelist / connectivity issues
 	consecutiveFailures int
@@ -69,16 +71,12 @@ type AnyTLSService struct {
 }
 
 type userRecord struct {
+	ValidUntil  int64
 	ClientID    int
 	UID         int
 	Email       string
 	DeviceLimit int
 	SpeedLimit  uint64
-}
-
-type userTraffic struct {
-	Upload   int64
-	Download int64
 }
 
 type periodicTask struct {

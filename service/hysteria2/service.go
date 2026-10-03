@@ -41,7 +41,6 @@ func New(apiClient api.API, cfg *controller.Config) *Hysteria2Service {
 		rules:          rule.New(),
 		globalChecker:  globalChecker,
 		users:          make(map[string]userRecord),
-		traffic:        make(map[string]*userTraffic),
 		overLimit:      make(map[string]bool),
 		onlineSlots:    make(map[string]map[string]struct{}),
 		slotLastActive: make(map[string]map[string]time.Time),
@@ -51,7 +50,19 @@ func New(apiClient api.API, cfg *controller.Config) *Hysteria2Service {
 
 // Start implements service.Service.Start.
 func (h *Hysteria2Service) Start() error {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	h.reloadMu.Lock()
+	h.closed = false
+	h.generation++
+	generation := h.generation
+	h.reloadMu.Unlock()
 	h.clientInfo = h.apiClient.Describe()
+	if h.config != nil && !h.config.DisableUploadTraffic {
+		if err := h.apiClient.PrepareTraffic(); err != nil {
+			return err
+		}
+	}
 
 	// Fetch node info.
 	nodeInfo, err := h.apiClient.GetNodeInfo()
@@ -107,7 +118,9 @@ func (h *Hysteria2Service) Start() error {
 	if err != nil {
 		return err
 	}
+	h.reloadMu.Lock()
 	h.server = srv
+	h.reloadMu.Unlock()
 	h.serve(srv, "start")
 
 	// Apply Hysteria2 port hopping iptables rules for the initial node
@@ -151,6 +164,18 @@ func (h *Hysteria2Service) Start() error {
 	})
 
 	for _, t := range h.tasks {
+		execute := t.Execute
+		t.Execute = func() error {
+			h.lifecycleMu.RLock()
+			defer h.lifecycleMu.RUnlock()
+			h.reloadMu.Lock()
+			closed := h.closed || generation != h.generation
+			h.reloadMu.Unlock()
+			if closed {
+				return errors.New("Hysteria2 service is closed")
+			}
+			return execute()
+		}
 		go t.Start()
 	}
 
@@ -160,9 +185,12 @@ func (h *Hysteria2Service) Start() error {
 
 // Close implements service.Service.Close.
 func (h *Hysteria2Service) Close() error {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
 	// Best-effort cleanup of any iptables rules we previously installed for
 	// Hysteria2 port hopping.
 	h.reloadMu.Lock()
+	h.closed = true
 	if len(h.portHopRules) > 0 {
 		deletePortHopIptablesRules(h.portHopRules, h.logger)
 		h.portHopRules = nil
@@ -178,10 +206,11 @@ func (h *Hysteria2Service) Close() error {
 		}
 	}
 	h.tasks = nil
+	var closeErr error
 	if srv != nil {
-		return srv.Close()
+		closeErr = srv.Close()
 	}
-	return nil
+	return errors.Join(closeErr, h.apiClient.CloseTraffic())
 }
 
 // needsRebuild 报告是否该重试上一轮没走完的重建。退避未到就先不动。
@@ -274,6 +303,9 @@ func (h *Hysteria2Service) reloadNode(nodeInfo *api.NodeInfo) error {
 
 	h.reloadMu.Lock()
 	defer h.reloadMu.Unlock()
+	if h.closed {
+		return errors.New("Hysteria2 service is closed")
+	}
 
 	oldInfo := h.nodeInfo
 	h.nodeInfo = nodeInfo
@@ -378,12 +410,13 @@ func (h *Hysteria2Service) triggerRecovery() {
 	h.consecutiveFailures = 0
 
 	// Restart periodic tasks after a short delay
+	tasks := h.tasks
 	go func() {
 		time.Sleep(5 * time.Second)
 		h.logger.Info("Restarting periodic tasks...")
-		for i := range h.tasks {
-			h.logger.Printf("Restarting %s task", h.tasks[i].tag)
-			go h.tasks[i].Start()
+		for i := range tasks {
+			h.logger.Printf("Restarting %s task", tasks[i].tag)
+			go tasks[i].Start()
 		}
 		h.recoveryMutex.Lock()
 		h.recoveryInProgress = false

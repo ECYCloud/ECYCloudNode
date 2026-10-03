@@ -20,7 +20,10 @@ type API interface {
 	ReportKickedUsers(kickedUser *[]OnlineUser) (err error)
 	ConsumeSlotReclaim(uid int, slot string) (ok bool, targetSlot string, err error)
 	ConsumeIpReclaim(uid int, ip string) (ok bool, targetIP string, err error)
-	ReportUserTraffic(userTraffic *[]UserTraffic) (err error)
+	PrepareTraffic() error
+	RecordUserTraffic(uid int, upload, download int64) error
+	ReportUserTraffic() error
+	CloseTraffic() error
 	Describe() ClientInfo
 	GetNodeRule() (ruleList *[]DetectRule, err error)
 	GetExemptUsers() (exemptUsers []ExemptUser, err error)

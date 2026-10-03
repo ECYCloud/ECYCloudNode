@@ -12,7 +12,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/time/rate"
 )
 
 // remoteHost 取出连接来源的主机部分，名额的登记与复查共用它。
@@ -31,9 +30,9 @@ type connCounter struct {
 	net.Conn
 	svc     *AnyTLSService
 	user    string
+	uid     int
 	host    string
 	blocked bool
-	limiter *rate.Limiter
 }
 
 func (c *connCounter) Read(p []byte) (int, error) {
@@ -42,45 +41,56 @@ func (c *connCounter) Read(p []byte) (int, error) {
 	}
 	n, err := c.Conn.Read(p)
 	if n > 0 && c.svc != nil {
-		c.svc.addTraffic(c.user, int64(n), 0)
+		if recordErr := c.svc.addTraffic(c.uid, int64(n), 0); recordErr != nil {
+			_ = c.Close()
+			return 0, recordErr
+		}
 		// 仅上行（客户端发来的数据）能证明客户端存活，据此续期在线时间；
 		// 下行不续期，避免客户端离线后残留连接被远端数据无限"续命"
 		if !c.svc.ensureOnline(c.user, c.host) {
 			_ = c.Conn.Close()
+			return 0, io.EOF
 		}
-		if c.limiter != nil {
-			_ = c.limiter.WaitN(context.Background(), n)
+		if waitErr := c.svc.waitTraffic(c.user, n); waitErr != nil {
+			_ = c.Close()
+			return 0, waitErr
+		}
+		if !c.svc.ensureOnline(c.user, c.host) {
+			_ = c.Close()
+			return 0, io.EOF
 		}
 	}
 	return n, err
 }
 
 func (c *connCounter) Write(p []byte) (int, error) {
-	if c.blocked {
+	if c.blocked || (c.svc != nil && !c.svc.verifyOnline(c.user, c.host)) {
 		return 0, io.EOF
 	}
-	n, err := c.Conn.Write(p)
-	if n > 0 && c.svc != nil {
-		c.svc.addTraffic(c.user, 0, int64(n))
-		// 名额已被挤出且账号名额已满：超限设备的既有下行连接必须断开，
-		// 否则大文件下载之类的长连接能一直跑完
-		if !c.svc.verifyOnline(c.user, c.host) {
-			_ = c.Conn.Close()
+	if len(p) > 0 && c.svc != nil {
+		if recordErr := c.svc.addTraffic(c.uid, 0, int64(len(p))); recordErr != nil {
+			_ = c.Close()
+			return 0, recordErr
 		}
-		if c.limiter != nil {
-			_ = c.limiter.WaitN(context.Background(), n)
+		if waitErr := c.svc.waitTraffic(c.user, len(p)); waitErr != nil {
+			_ = c.Close()
+			return 0, waitErr
+		}
+		if !c.svc.verifyOnline(c.user, c.host) {
+			_ = c.Close()
+			return 0, io.EOF
 		}
 	}
-	return n, err
+	return c.Conn.Write(p)
 }
 
 type packetConnCounter struct {
 	N.PacketConn
 	svc     *AnyTLSService
 	user    string
+	uid     int
 	host    string
 	blocked bool
-	limiter *rate.Limiter
 }
 
 // ReadPacket implements N.PacketReader to count upload traffic (user -> proxy).
@@ -91,12 +101,21 @@ func (c *packetConnCounter) ReadPacket(buffer *buf.Buffer) (destination M.Socksa
 	destination, err = c.PacketConn.ReadPacket(buffer)
 	n := buffer.Len()
 	if n > 0 && c.svc != nil {
-		c.svc.addTraffic(c.user, int64(n), 0)
+		if recordErr := c.svc.addTraffic(c.uid, int64(n), 0); recordErr != nil {
+			_ = c.Close()
+			return M.Socksaddr{}, recordErr
+		}
 		if !c.svc.ensureOnline(c.user, c.host) {
 			_ = c.PacketConn.Close()
+			return M.Socksaddr{}, io.EOF
 		}
-		if c.limiter != nil {
-			_ = c.limiter.WaitN(context.Background(), n)
+		if waitErr := c.svc.waitTraffic(c.user, n); waitErr != nil {
+			_ = c.Close()
+			return M.Socksaddr{}, waitErr
+		}
+		if !c.svc.ensureOnline(c.user, c.host) {
+			_ = c.Close()
+			return M.Socksaddr{}, io.EOF
 		}
 	}
 	return destination, err
@@ -104,21 +123,29 @@ func (c *packetConnCounter) ReadPacket(buffer *buf.Buffer) (destination M.Socksa
 
 // WritePacket implements N.PacketWriter to count download traffic (proxy -> user).
 func (c *packetConnCounter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	if c.blocked {
+	if c.blocked || (c.svc != nil && !c.svc.verifyOnline(c.user, c.host)) {
+		buffer.Release()
 		return io.EOF
 	}
 	n := buffer.Len()
-	err := c.PacketConn.WritePacket(buffer, destination)
-	if err == nil && n > 0 && c.svc != nil {
-		c.svc.addTraffic(c.user, 0, int64(n))
-		if !c.svc.verifyOnline(c.user, c.host) {
-			_ = c.PacketConn.Close()
+	if n > 0 && c.svc != nil {
+		if recordErr := c.svc.addTraffic(c.uid, 0, int64(n)); recordErr != nil {
+			buffer.Release()
+			_ = c.Close()
+			return recordErr
 		}
-		if c.limiter != nil {
-			_ = c.limiter.WaitN(context.Background(), n)
+		if waitErr := c.svc.waitTraffic(c.user, n); waitErr != nil {
+			buffer.Release()
+			_ = c.Close()
+			return waitErr
+		}
+		if !c.svc.verifyOnline(c.user, c.host) {
+			buffer.Release()
+			_ = c.Close()
+			return io.EOF
 		}
 	}
-	return err
+	return c.PacketConn.WritePacket(buffer, destination)
 }
 
 type anyTLSTracker struct {
@@ -191,20 +218,12 @@ func (t *anyTLSTracker) RoutedConnection(_ context.Context, conn net.Conn, m ada
 		blocked = true
 	}
 
-	// Attach per-user rate limiter if configured.
-	var limiter *rate.Limiter
-	t.svc.mu.RLock()
-	if t.svc.rateLimiters != nil {
-		limiter = t.svc.rateLimiters[m.User]
-	}
-	t.svc.mu.RUnlock()
-
 	if blocked {
 		_ = conn.Close()
-		return &connCounter{Conn: conn, svc: t.svc, user: m.User, host: host, blocked: true, limiter: limiter}
+		return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, blocked: true}
 	}
 
-	return &connCounter{Conn: conn, svc: t.svc, user: m.User, host: host, limiter: limiter}
+	return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host}
 }
 
 func (t *anyTLSTracker) RoutedPacketConnection(_ context.Context, conn N.PacketConn, m adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) N.PacketConn {
@@ -271,20 +290,12 @@ func (t *anyTLSTracker) RoutedPacketConnection(_ context.Context, conn N.PacketC
 		blocked = true
 	}
 
-	// Attach per-user rate limiter if configured.
-	var limiter *rate.Limiter
-	t.svc.mu.RLock()
-	if t.svc.rateLimiters != nil {
-		limiter = t.svc.rateLimiters[m.User]
-	}
-	t.svc.mu.RUnlock()
-
 	if blocked {
 		_ = conn.Close()
-		return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, host: host, blocked: true, limiter: limiter}
+		return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, blocked: true}
 	}
 
-	return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, host: host, limiter: limiter}
+	return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host}
 }
 
 // RoutedFlow 仅在 TUN inbound 的 pre-match 流转发路径上被调用，AnyTLS 节点不注册

@@ -59,7 +59,10 @@ type Controller struct {
 	logger       *log.Entry
 	// monitorMu 串行化节点与用户两个周期任务：它们同为独立 goroutine、同一间隔，
 	// 却共同读写 nodeInfo / Tag / userList / limitedUsers 等状态。
-	monitorMu sync.Mutex
+	monitorMu   sync.Mutex
+	lifecycleMu sync.RWMutex
+	closed      bool
+	generation  uint64
 	// rebuildPending 记录「inbound 尚未按 nodeInfo 装好」。面板随后会返回 304，
 	// 届时 newNodeInfo 等于当前缓存，只靠 DeepEqual 判不出重建没走完。
 	rebuildPending bool
@@ -127,7 +130,17 @@ func New(server *core.Instance, api api.API, config *Config) *Controller {
 
 // Start implement the Start() function of the service interface
 func (c *Controller) Start() error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	c.closed = false
+	c.generation++
+	generation := c.generation
 	c.clientInfo = c.apiClient.Describe()
+	if !c.config.DisableUploadTraffic {
+		if err := c.apiClient.PrepareTraffic(); err != nil {
+			return err
+		}
+	}
 	// First fetch Node Info
 	newNodeInfo, err := c.apiClient.GetNodeInfo()
 	if err != nil {
@@ -235,9 +248,18 @@ func (c *Controller) Start() error {
 	})
 
 	// Start periodic tasks
-	for i := range c.tasks {
-		c.logger.Printf("Start %s periodic task", c.tasks[i].tag)
-		go c.tasks[i].Start()
+	for _, periodic := range c.tasks {
+		execute := periodic.Execute
+		periodic.Execute = func() error {
+			c.lifecycleMu.RLock()
+			defer c.lifecycleMu.RUnlock()
+			if c.closed || generation != c.generation {
+				return errors.New("Xray service is closed")
+			}
+			return execute()
+		}
+		c.logger.Printf("Start %s periodic task", periodic.tag)
+		go periodic.Start()
 	}
 
 	return nil
@@ -245,6 +267,9 @@ func (c *Controller) Start() error {
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	c.closed = true
 	for i := range c.tasks {
 		if c.tasks[i].Periodic != nil {
 			// 关停途中 panic 会让后续任务、路由规则与 xray core 都来不及释放
@@ -253,6 +278,7 @@ func (c *Controller) Close() error {
 			}
 		}
 	}
+	c.tasks = nil
 
 	// Remove the same-node routing rule if it was added
 	if isECYCloudNodeManagedTag(c.Tag) && c.router != nil {
@@ -264,7 +290,15 @@ func (c *Controller) Close() error {
 		}
 	}
 
-	return nil
+	if c.dispatcher != nil {
+		_ = c.DeleteInboundLimiter(c.Tag)
+	}
+	if c.ibm != nil && c.Tag != "" {
+		if err := c.removeInbound(c.Tag); err != nil && !errors.Is(err, common.ErrNoClue) {
+			c.logger.Errorf("Inbound close failed: %s", err)
+		}
+	}
+	return c.apiClient.CloseTraffic()
 }
 
 // needsRebuild 报告是否该重试上一轮没走完的重建。退避未到就先不动。
@@ -455,11 +489,10 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 					c.logger.Print(err)
 					syncFailed = true
 				}
-				// Update Limiter
-				if err := c.UpdateInboundLimiter(c.Tag, &added); err != nil {
-					c.logger.Print(err)
-					syncFailed = true
-				}
+			}
+			if err := c.UpdateInboundLimiter(c.Tag, newUserInfo, true); err != nil {
+				c.logger.Print(err)
+				syncFailed = true
 			}
 		}
 		c.logger.Printf("%d user deleted, %d user added", len(deleted), len(added))
@@ -502,12 +535,13 @@ func (c *Controller) triggerRecovery() {
 	c.consecutiveFailures = 0
 
 	// Restart periodic tasks after a short delay
+	tasks := c.tasks
 	go func() {
 		time.Sleep(5 * time.Second)
 		c.logger.Info("Restarting periodic tasks...")
-		for i := range c.tasks {
-			c.logger.Printf("Restarting %s task", c.tasks[i].tag)
-			go c.tasks[i].Start()
+		for i := range tasks {
+			c.logger.Printf("Restarting %s task", tasks[i].tag)
+			go tasks[i].Start()
 		}
 		c.recoveryMutex.Lock()
 		c.recoveryInProgress = false
@@ -621,42 +655,30 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 	return nil
 }
 
-func compareUserList(old, new *[]api.UserInfo) (deleted, added []api.UserInfo) {
-	mSrc := make(map[api.UserInfo]byte) // 按源数组建索引
-	mAll := make(map[api.UserInfo]byte) // 源+目所有元素建索引
-
-	var set []api.UserInfo // 交集
-
-	// 1.源数组建立map
-	for _, v := range *old {
-		mSrc[v] = 0
-		mAll[v] = 0
+func compareUserList(old, next *[]api.UserInfo) (deleted, added []api.UserInfo) {
+	previous := make(map[api.UserInfo]api.UserInfo)
+	current := make(map[api.UserInfo]api.UserInfo)
+	for _, u := range *old {
+		key := u
+		key.ValidUntil = 0
+		previous[key] = u
 	}
-	// 2.目数组中，存不进去，即重复元素，所有存不进去的集合就是并集
-	for _, v := range *new {
-		l := len(mAll)
-		mAll[v] = 1
-		if l != len(mAll) { // 长度变化，即可以存
-			l = len(mAll)
-		} else { // 存不了，进并集
-			set = append(set, v)
+	for _, u := range *next {
+		key := u
+		key.ValidUntil = 0
+		current[key] = u
+	}
+	for key, u := range previous {
+		if _, ok := current[key]; !ok {
+			deleted = append(deleted, u)
 		}
 	}
-	// 3.遍历交集，在并集中找，找到就从并集中删，删完后就是补集（即并-交=所有变化的元素）
-	for _, v := range set {
-		delete(mAll, v)
-	}
-	// 4.此时，mall是补集，所有元素去源中找，找到就是删除的，找不到的必定能在目数组中找到，即新加的
-	for v := range mAll {
-		_, exist := mSrc[v]
-		if exist {
-			deleted = append(deleted, v)
-		} else {
-			added = append(added, v)
+	for key, u := range current {
+		if _, ok := previous[key]; !ok {
+			added = append(added, u)
 		}
 	}
-
-	return deleted, added
+	return
 }
 
 func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
@@ -716,15 +738,12 @@ func (c *Controller) userInfoMonitor() (err error) {
 	}
 
 	// Get User traffic
-	var userTraffic []api.UserTraffic
-	var upCounterList []stats.Counter
-	var downCounterList []stats.Counter
 	AutoSpeedLimit := int64(c.config.AutoSpeedLimitConfig.Limit)
 	UpdatePeriodic := int64(c.config.UpdatePeriodic)
 	limitedUsers := make([]api.UserInfo, 0)
 	for _, user := range *c.userList {
 		userTag := c.buildUserTag(&user)
-		up, down, upCounter, downCounter := c.getTraffic(userTag)
+		up, down := c.getTraffic(userTag)
 		if down > 0 {
 			c.logger.Printf("Traffic counted: tag=%s up=%d down=%d", userTag, up, down)
 		}
@@ -747,18 +766,6 @@ func (c *Controller) userInfoMonitor() (err error) {
 					delete(c.warnedUsers, user)
 				}
 			}
-			userTraffic = append(userTraffic, api.UserTraffic{
-				UID:      user.UID,
-				Email:    user.Email,
-				Upload:   up,
-				Download: down})
-
-			if upCounter != nil {
-				upCounterList = append(upCounterList, upCounter)
-			}
-			if downCounter != nil {
-				downCounterList = append(downCounterList, downCounter)
-			}
 		} else {
 			delete(c.warnedUsers, user)
 		}
@@ -768,17 +775,9 @@ func (c *Controller) userInfoMonitor() (err error) {
 			c.logger.Print(err)
 		}
 	}
-	if len(userTraffic) > 0 {
-		c.logger.Printf("Reporting %d user(s) traffic to panel; example: UID=%d up=%d down=%d", len(userTraffic), userTraffic[0].UID, userTraffic[0].Upload, userTraffic[0].Download)
-		var err error // Define an empty error
-		if !c.config.DisableUploadTraffic {
-			err = c.apiClient.ReportUserTraffic(&userTraffic)
-		}
-		// If report traffic error, not clear the traffic
-		if err != nil {
+	if !c.config.DisableUploadTraffic {
+		if err := c.apiClient.ReportUserTraffic(); err != nil {
 			c.logger.Print(err)
-		} else {
-			c.resetTraffic(&upCounterList, &downCounterList)
 		}
 	}
 
@@ -848,6 +847,8 @@ func (c *Controller) buildNodeTag() string {
 
 // Check Cert
 func (c *Controller) certMonitor() error {
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
 	// 仅当当前节点启用 TLS 且未启用 REALITY 时才进行证书监控。
 	// 对于未设置 CertConfig 的旧配置，直接跳过证书监控以避免空指针。
 	if c.config == nil || c.config.CertConfig == nil {

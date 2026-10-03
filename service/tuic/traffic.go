@@ -1,6 +1,7 @@
 package tuic
 
 import (
+	"context"
 	"reflect"
 	"strconv"
 	"time"
@@ -41,6 +42,7 @@ func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 		}
 
 		rec := userRecord{
+			ValidUntil:  u.ValidUntil,
 			UID:         u.UID,
 			ClientID:    u.ClientID,
 			Email:       u.Email,
@@ -73,9 +75,6 @@ func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 
 		if limiter != nil {
 			newRateLimiters[key] = limiter
-		}
-		if _, ok := s.traffic[key]; !ok {
-			s.traffic[key] = &userTraffic{}
 		}
 
 		// TUIC user with UUID and password (using Passwd as password)
@@ -124,20 +123,21 @@ func (s *TuicService) hasUnbuiltAuthUser() bool {
 	return false
 }
 
-func (s *TuicService) addTraffic(uuid string, up, down int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	t, ok := s.traffic[uuid]
-	if !ok {
-		t = &userTraffic{}
-		s.traffic[uuid] = t
+func (s *TuicService) waitTraffic(uuid string, n int) error {
+	s.mu.RLock()
+	bucket := s.rateLimiters[uuid]
+	s.mu.RUnlock()
+	if bucket == nil {
+		return nil
 	}
-	t.Upload += up
-	t.Download += down
+	return limiter.WaitN(context.Background(), bucket, n)
+}
 
-	// 在线名额由连接认证和连接流量回调维护。
-	// 名额由 Read/Write 里的 ensureOnline / verifyOnline 复查。
+func (s *TuicService) addTraffic(uid int, up, down int64) error {
+	if s.config.DisableUploadTraffic {
+		return nil
+	}
+	return s.apiClient.RecordUserTraffic(uid, up, down)
 }
 
 // slot 解析该凭据在 host 上占用的名额标识：官方客户端按设备标识占名额，换网络不
@@ -145,7 +145,7 @@ func (s *TuicService) addTraffic(uuid string, up, down int64) {
 // 调用方须自行持锁。
 func (s *TuicService) slot(uuid, host string) (string, userRecord, bool) {
 	user, ok := s.users[uuid]
-	if !ok {
+	if !ok || (user.ValidUntil != 0 && time.Now().Unix() >= user.ValidUntil) {
 		return "", user, false
 	}
 	return limiter.OnlineKey(user.ClientID, host), user, true
@@ -245,33 +245,9 @@ func (s *TuicService) verifyOnline(uuid, host string) bool {
 	return limiter.VerifyDeviceSlot(s.slotLastActive[uuid], slot, user.DeviceLimit)
 }
 
-func (s *TuicService) collectUsage() ([]api.UserTraffic, []api.OnlineUser, map[string]userTraffic) {
+func (s *TuicService) collectUsage() []api.OnlineUser {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	snapshot := make(map[string]userTraffic)
-	var uts []api.UserTraffic
-	for uuid, t := range s.traffic {
-		user, ok := s.users[uuid]
-		if !ok {
-			continue
-		}
-		if t.Upload == 0 && t.Download == 0 {
-			continue
-		}
-		snapshot[uuid] = userTraffic{
-			Upload:   t.Upload,
-			Download: t.Download,
-		}
-		uts = append(uts, api.UserTraffic{
-			UID:      user.UID,
-			Email:    user.Email,
-			Upload:   t.Upload,
-			Download: t.Download,
-		})
-		t.Upload = 0
-		t.Download = 0
-	}
 
 	// 先按活跃时间清理过期名额，再收集在线用户。
 	// 整表清空会导致每个上报周期设备名额被重新抢占，使设备限制形同虚设；
@@ -307,31 +283,20 @@ func (s *TuicService) collectUsage() ([]api.UserTraffic, []api.OnlineUser, map[s
 		}
 	}
 
-	return uts, online, snapshot
-}
-
-func (s *TuicService) restoreTraffic(snapshot map[string]userTraffic) {
-	if len(snapshot) == 0 {
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for uuid, snap := range snapshot {
-		counter, ok := s.traffic[uuid]
-		if !ok || counter == nil {
-			counter = &userTraffic{}
-			s.traffic[uuid] = counter
-		}
-		counter.Upload += snap.Upload
-		counter.Download += snap.Download
-	}
+	return online
 }
 
 func (s *TuicService) userMonitor() error {
 	if time.Since(s.startAt) < time.Duration(s.config.UpdatePeriodic)*time.Second {
 		return nil
+	}
+
+	if !s.config.DisableUploadTraffic {
+		defer func() {
+			if err := s.apiClient.ReportUserTraffic(); err != nil {
+				s.logger.Print(err)
+			}
+		}()
 	}
 
 	CPU, Mem, Disk, Uptime, err := serverstatus.GetSystemInfo()
@@ -399,14 +364,7 @@ func (s *TuicService) userMonitor() error {
 		}
 	}
 
-	userTraffic, onlineUsers, snapshot := s.collectUsage()
-	if len(userTraffic) > 0 && !s.config.DisableUploadTraffic {
-		if err = s.apiClient.ReportUserTraffic(&userTraffic); err != nil {
-			s.logger.Print(err)
-			// Restore counters so traffic is not lost and can be retried.
-			s.restoreTraffic(snapshot)
-		}
-	}
+	onlineUsers := s.collectUsage()
 	if err = s.apiClient.ReportNodeOnlineUsers(&onlineUsers); err != nil {
 		s.logger.Print(err)
 	}

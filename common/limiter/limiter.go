@@ -22,6 +22,7 @@ const (
 )
 
 type UserInfo struct {
+	ValidUntil  int64
 	UID         int
 	ClientID    int
 	SpeedLimit  uint64
@@ -41,6 +42,7 @@ type InboundInfo struct {
 	BucketHub       *sync.Map // Key: user identifier -> *rate.Limiter
 	UserOnlineSlots *sync.Map // Key: onlineBucket() -> *sync.Map (Key: OnlineKey(), Value: onlineEntry)
 	GlobalLimit     *GlobalDeviceChecker
+	RecordTraffic   func(int, int64, int64) error
 	// slotMu 串行化在线账本的「先数后写」：sync.Map 只保证单次操作原子，
 	// 两条连接同时数到「未满」再各自登记就会超限
 	slotMu sync.Mutex
@@ -65,7 +67,7 @@ func New() *Limiter {
 	}
 }
 
-func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalLimit *GlobalDeviceLimitConfig) error {
+func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalLimit *GlobalDeviceLimitConfig, recorder ...func(int, int64, int64) error) error {
 	inboundInfo := &InboundInfo{
 		Tag:             tag,
 		NodeSpeedLimit:  nodeSpeedLimit,
@@ -73,11 +75,15 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 		UserOnlineSlots: new(sync.Map),
 		GlobalLimit:     NewGlobalDeviceChecker(globalLimit),
 	}
+	if len(recorder) > 0 {
+		inboundInfo.RecordTraffic = recorder[0]
+	}
 
 	userMap := new(sync.Map)
 	for _, u := range *userList {
 		userKey := u.Key(tag)
 		userMap.Store(userKey, UserInfo{
+			ValidUntil:  u.ValidUntil,
 			UID:         u.UID,
 			ClientID:    u.ClientID,
 			SpeedLimit:  u.SpeedLimit,
@@ -89,13 +95,43 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 	return nil
 }
 
-func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserInfo) error {
+func (l *Limiter) TrafficRecorder(tag, userKey string) func(int64, int64) error {
+	value, ok := l.InboundInfo.Load(tag)
+	if !ok {
+		return nil
+	}
+	info := value.(*InboundInfo)
+	if info.RecordTraffic == nil {
+		return nil
+	}
+	user, ok := info.UserInfo.Load(userKey)
+	if !ok {
+		return func(int64, int64) error { return fmt.Errorf("traffic account is no longer authorized") }
+	}
+	uid := user.(UserInfo).UID
+	return func(up, down int64) error { return info.RecordTraffic(uid, up, down) }
+}
+
+func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserInfo, replace ...bool) error {
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
+		if len(replace) > 0 && replace[0] {
+			keys := make(map[string]bool, len(*updatedUserList))
+			for _, user := range *updatedUserList {
+				keys[user.Key(tag)] = true
+			}
+			inboundInfo.UserInfo.Range(func(key, value any) bool {
+				if !keys[key.(string)] {
+					inboundInfo.UserInfo.Delete(key)
+				}
+				return true
+			})
+		}
 		// Update User info
 		for _, u := range *updatedUserList {
 			userKey := u.Key(tag)
 			inboundInfo.UserInfo.Store(userKey, UserInfo{
+				ValidUntil:  u.ValidUntil,
 				UID:         u.UID,
 				ClientID:    u.ClientID,
 				SpeedLimit:  u.SpeedLimit,
@@ -167,45 +203,57 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 }
 
 func (l *Limiter) GetUserBucket(tag string, userKey string, ip string) (limiter *rate.Limiter, SpeedLimit bool, Reject bool) {
+	if !l.AuthorizationAllowed(tag, userKey) {
+		return nil, false, true
+	}
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		var (
-			userLimit                  uint64
-			deviceLimit, uid, clientID int
+			deviceLimit, uid int
 		)
 
 		inboundInfo := value.(*InboundInfo)
-		nodeLimit := inboundInfo.NodeSpeedLimit
-
 		if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
 			u := v.(UserInfo)
 			uid = u.UID
-			userLimit = u.SpeedLimit
 			deviceLimit = u.DeviceLimit
-			clientID = u.ClientID
 		}
 
 		if !admitSlot(inboundInfo, userKey, ip, uid, deviceLimit) {
 			return nil, false, true
 		}
 
-		if clientID != 0 {
-			userKey = fmt.Sprintf("%s|%d", tag, uid)
-		}
-		// Speed limit
-		limit := determineRate(nodeLimit, userLimit) // Determine the speed limit rate
-		if limit > 0 {
-			limiter := rate.NewLimiter(rate.Limit(limit), int(limit)) // Byte/s
-			if v, ok := inboundInfo.BucketHub.LoadOrStore(userKey, limiter); ok {
-				bucket := v.(*rate.Limiter)
-				return bucket, true, false
-			}
-			return limiter, true, false
-		}
-		return nil, false, false
+		limiter = l.rateBucket(tag, userKey)
+		return limiter, limiter != nil, false
 	}
 
 	errors.LogDebug(context.Background(), "Get Inbound Limiter information failed")
 	return nil, false, false
+}
+
+func (l *Limiter) rateBucket(tag, userKey string) *rate.Limiter {
+	value, ok := l.InboundInfo.Load(tag)
+	if !ok {
+		return nil
+	}
+	inboundInfo := value.(*InboundInfo)
+	value, ok = inboundInfo.UserInfo.Load(userKey)
+	if !ok {
+		return nil
+	}
+	u := value.(UserInfo)
+	limit := determineRate(inboundInfo.NodeSpeedLimit, u.SpeedLimit)
+	if limit == 0 {
+		return nil
+	}
+	if u.ClientID != 0 {
+		userKey = fmt.Sprintf("%s|%d", tag, u.UID)
+	}
+	if value, ok := inboundInfo.BucketHub.Load(userKey); ok {
+		return value.(*rate.Limiter)
+	}
+	bucket := rate.NewLimiter(rate.Limit(limit), int(limit))
+	value, _ = inboundInfo.BucketHub.LoadOrStore(userKey, bucket)
+	return value.(*rate.Limiter)
 }
 
 // admitSlot 登记/刷新用户占用的在线名额；名额满时须有官方客户端确认才踢最旧的一个。
@@ -320,6 +368,9 @@ func evictOnlineSlot(slotMap *sync.Map, now int64, target string) (string, bool)
 // 名额 仍在线则刷新活跃时间，闲置过期但账号尚有空余名额时重新登记；若名额已被占满且该 名额 已被挤出，
 // 返回 false（调用方应断开连接）。被挤出后禁止再通过踢人重新抢回名额。
 func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
+	if !l.AuthorizationAllowed(tag, userKey) {
+		return false
+	}
 	value, ok := l.InboundInfo.Load(tag)
 	if !ok {
 		return true
@@ -357,6 +408,9 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 // 残留连接推送数据；若据此续期，离线 名额 会被无限"续命"，名额永不释放。
 // 放行条件：该 名额 仍持有新鲜名额，或该用户尚有空余名额。
 func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
+	if !l.AuthorizationAllowed(tag, userKey) {
+		return false
+	}
 	value, ok := l.InboundInfo.Load(tag)
 	if !ok {
 		return true
@@ -399,6 +453,20 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 		return true
 	}
 	return fresh < deviceLimit
+}
+
+func (l *Limiter) AuthorizationAllowed(tag, userKey string) bool {
+	value, ok := l.InboundInfo.Load(tag)
+	if !ok {
+		return false
+	}
+	inbound := value.(*InboundInfo)
+	value, ok = inbound.UserInfo.Load(userKey)
+	if !ok {
+		return false
+	}
+	user := value.(UserInfo)
+	return user.ValidUntil == 0 || time.Now().Unix() < user.ValidUntil
 }
 
 // determineRate returns the minimum non-zero rate

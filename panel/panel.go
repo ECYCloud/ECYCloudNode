@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"dario.cat/mergo"
-	"github.com/r3labs/diff/v2"
+	"github.com/r3labs/diff/v3"
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"

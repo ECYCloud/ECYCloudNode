@@ -2,6 +2,7 @@ package hysteria2
 
 import (
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,14 +13,30 @@ import (
 // authID 是 Authenticate 交还给内核的连接标识。内核只把它原样回传给各个回调，
 // 自身不解析内容，因此把来源地址编进去；否则不带地址的回调（LogTraffic）无法
 // 区分同一凭据下的多条连接，第三方按出口 IP 计的名额就定位不到。
-func authID(cred, host string) string {
-	return cred + "|" + host
+func authID(cred, host string, uid ...int) string {
+	id := cred + "|" + host
+	if len(uid) > 0 {
+		id = "uid:" + strconv.Itoa(uid[0]) + "|" + id
+	}
+	return id
+}
+
+func trafficUID(id string) int {
+	prefix, _, ok := strings.Cut(id, "|")
+	if !ok || !strings.HasPrefix(prefix, "uid:") {
+		return 0
+	}
+	uid, _ := strconv.Atoi(strings.TrimPrefix(prefix, "uid:"))
+	return uid
 }
 
 // splitAuthID 从连接标识拆回凭据与来源地址。按最后一个分隔符切分：IPv6 地址不含
 // "|"，而凭据理论上可能含，从右侧拆才不会把凭据截断。旧格式（无分隔符）退化为
 // 只有凭据，此时按无地址处理。
 func splitAuthID(id string) (cred, host string) {
+	if trafficUID(id) > 0 {
+		_, id, _ = strings.Cut(id, "|")
+	}
 	if i := strings.LastIndex(id, "|"); i >= 0 {
 		return id[:i], id[i+1:]
 	}
@@ -56,7 +73,6 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		a.svc.mu.Unlock()
 		logger.WithFields(log.Fields{
 			"remote": host,
-			"auth":   auth,
 		}).Warn("Hysteria2 auth failed: unknown UUID")
 		return false, ""
 	}
@@ -101,7 +117,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		return false, ""
 	}
 
-	return true, authID(auth, host)
+	return true, authID(auth, host, user.UID)
 }
 
 // slot 解析该凭据在 host 上占用的名额标识，与 Authenticate 同一口径：
@@ -110,7 +126,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 // 调用方须自行持锁。
 func (h *Hysteria2Service) slot(cred, host string) (string, userRecord, bool) {
 	user, ok := h.users[cred]
-	if !ok {
+	if !ok || (user.ValidUntil != 0 && time.Now().Unix() >= user.ValidUntil) {
 		return "", user, false
 	}
 	return limiter.OnlineKey(user.ClientID, host), user, true

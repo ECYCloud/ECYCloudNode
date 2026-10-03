@@ -19,12 +19,17 @@ import (
 	"github.com/go-resty/resty/v2"
 
 	"github.com/ECYCloud/ECYCloudNode/api"
+	"github.com/ECYCloud/ECYCloudNode/common/traffic"
 )
 
 // APIClient create a api client to the panel.
 type APIClient struct {
+	trafficMu        sync.RWMutex
+	trafficReportMu  sync.Mutex
+	trafficDir       string
+	trafficState     *traffic.Store
 	client           *resty.Client
-	trafficClient    *resty.Client // 流量上报专用，禁用重试避免超时重试导致流量重复提交
+	trafficClient    *resty.Client
 	APIHost          string
 	NodeID           int
 	Key              string
@@ -110,16 +115,9 @@ func New(apiConfig *api.Config) *APIClient {
 	// Add support for muKey
 	client.SetQueryParam("muKey", apiConfig.Key)
 
-	// 流量上报专用客户端：禁用重试，避免超时重试导致流量重复提交
 	trafficClient := resty.New()
 	trafficClient.SetRetryCount(0)
 	trafficClient.SetTimeout(30 * time.Second)
-	trafficClient.OnError(func(req *resty.Request, err error) {
-		var v *resty.ResponseError
-		if errors.As(err, &v) {
-			log.Print(v.Err)
-		}
-	})
 	trafficClient.SetBaseURL(apiConfig.APIHost)
 	trafficClient.SetQueryParam("key", apiConfig.Key)
 	trafficClient.SetQueryParam("muKey", apiConfig.Key)
@@ -141,6 +139,7 @@ func New(apiConfig *api.Config) *APIClient {
 	}
 
 	return &APIClient{
+		trafficDir:              trafficDirectory(apiConfig.TrafficDir),
 		client:                  client,
 		trafficClient:           trafficClient,
 		NodeID:                  nodeID,
@@ -544,32 +543,6 @@ func (c *APIClient) consumeReclaim(uid int, value, path, field string) (bool, st
 	return payload.OK, payload.TargetSlot, nil
 }
 
-// ReportUserTraffic reports the user traffic
-func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
-
-	data := make([]UserTraffic, len(*userTraffic))
-	for i, traffic := range *userTraffic {
-		data[i] = UserTraffic{
-			UID:      traffic.UID,
-			Upload:   traffic.Upload,
-			Download: traffic.Download}
-	}
-	postData := &PostData{Data: data}
-	path := "/mod_mu/users/traffic"
-	res, err := c.trafficClient.R().
-		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
-		SetBody(postData).
-		SetResult(&Response{}).
-		ForceContentType("application/json").
-		Post(path)
-	_, err = c.parseResponse(res, path, err)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // GetNodeRule will pull the audit rule form ssPanel
 func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	ruleList := c.LocalRuleList
@@ -773,6 +746,7 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 			speedLimit = uint64((user.SpeedLimit * 1000000) / 8)
 		}
 		userList = append(userList, api.UserInfo{
+			ValidUntil:  user.ValidUntil,
 			UID:         user.ID,
 			ClientID:    user.ClientID,
 			UUID:        user.UUID,

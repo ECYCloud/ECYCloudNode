@@ -13,26 +13,48 @@ import (
 
 type Writer struct {
 	writer  buf.Writer
-	limiter *rate.Limiter
+	limiter *Limiter
+	tag     string
+	userKey string
 	w       io.Writer
 }
 
 type Reader struct {
 	reader  buf.Reader
-	limiter *rate.Limiter
+	limiter *Limiter
+	tag     string
+	userKey string
 }
 
-func (l *Limiter) RateWriter(writer buf.Writer, limiter *rate.Limiter) buf.Writer {
+func (l *Limiter) RateWriter(writer buf.Writer, tag, userKey string) buf.Writer {
 	return &Writer{
 		writer:  writer,
-		limiter: limiter,
+		limiter: l,
+		tag:     tag,
+		userKey: userKey,
 	}
 }
 
-func (l *Limiter) RateReader(reader buf.Reader, limiter *rate.Limiter) buf.Reader {
+func WaitN(ctx context.Context, limiter *rate.Limiter, n int) error {
+	if limiter.Limit() == rate.Inf || n <= 0 {
+		return limiter.WaitN(ctx, n)
+	}
+	for n > 0 {
+		part := min(n, max(limiter.Burst(), 1))
+		if err := limiter.WaitN(ctx, part); err != nil {
+			return err
+		}
+		n -= part
+	}
+	return nil
+}
+
+func (l *Limiter) RateReader(reader buf.Reader, tag, userKey string) buf.Reader {
 	return &Reader{
 		reader:  reader,
-		limiter: limiter,
+		limiter: l,
+		tag:     tag,
+		userKey: userKey,
 	}
 }
 
@@ -41,19 +63,42 @@ func (w *Writer) Close() error {
 }
 
 func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	ctx := context.Background()
-	w.limiter.WaitN(ctx, int(mb.Len()))
+	if bucket := w.limiter.rateBucket(w.tag, w.userKey); bucket != nil {
+		if err := WaitN(context.Background(), bucket, int(mb.Len())); err != nil {
+			buf.ReleaseMulti(mb)
+			return err
+		}
+	}
+	if !w.limiter.AuthorizationAllowed(w.tag, w.userKey) {
+		buf.ReleaseMulti(mb)
+		return errors.New("user authorization expired or revoked")
+	}
 	return w.writer.WriteMultiBuffer(mb)
 }
 
 func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	mb, err := r.reader.ReadMultiBuffer()
-	if err != nil || mb.IsEmpty() {
-		return mb, err
+	return r.wait(mb, err)
+}
+
+func (r *Reader) Interrupt() {
+	common.Interrupt(r.reader)
+}
+
+func (r *Reader) wait(mb buf.MultiBuffer, err error) (buf.MultiBuffer, error) {
+	if !mb.IsEmpty() {
+		if bucket := r.limiter.rateBucket(r.tag, r.userKey); bucket != nil {
+			if waitErr := WaitN(context.Background(), bucket, int(mb.Len())); waitErr != nil {
+				buf.ReleaseMulti(mb)
+				return nil, waitErr
+			}
+		}
+		if !r.limiter.AuthorizationAllowed(r.tag, r.userKey) {
+			buf.ReleaseMulti(mb)
+			return nil, errors.New("user authorization expired or revoked")
+		}
 	}
-	ctx := context.Background()
-	r.limiter.WaitN(ctx, int(mb.Len()))
-	return mb, nil
+	return mb, err
 }
 
 // GuardReader / GuardWriter 周期性复查连接的在线名额，被挤出且名额已满时
@@ -73,6 +118,9 @@ type guardState struct {
 }
 
 func (g *guardState) check() error {
+	if !g.l.AuthorizationAllowed(g.tag, g.userKey) {
+		return errors.New("user authorization expired or revoked")
+	}
 	if now := time.Now().Unix(); now >= g.next {
 		g.next = now + onlineTouchSec
 		var allowed bool
@@ -119,7 +167,18 @@ func (r *GuardReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if err := r.check(); err != nil {
 		return nil, err
 	}
-	return r.reader.ReadMultiBuffer()
+	mb, err := r.reader.ReadMultiBuffer()
+	if err == nil {
+		if rejected := r.check(); rejected != nil {
+			buf.ReleaseMulti(mb)
+			return nil, rejected
+		}
+	}
+	return mb, err
+}
+
+func (r *GuardReader) Interrupt() {
+	common.Interrupt(r.reader)
 }
 
 func (w *GuardWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -141,18 +200,7 @@ func (r *Reader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer,
 	}
 	if tr, ok := r.reader.(timeoutReader); ok {
 		mb, err := tr.ReadMultiBufferTimeout(timeout)
-		if err != nil || mb.IsEmpty() {
-			return mb, err
-		}
-		ctx := context.Background()
-		r.limiter.WaitN(ctx, int(mb.Len()))
-		return mb, nil
+		return r.wait(mb, err)
 	}
-	mb, err := r.reader.ReadMultiBuffer()
-	if err != nil || mb.IsEmpty() {
-		return mb, err
-	}
-	ctx := context.Background()
-	r.limiter.WaitN(ctx, int(mb.Len()))
-	return mb, nil
+	return r.ReadMultiBuffer()
 }

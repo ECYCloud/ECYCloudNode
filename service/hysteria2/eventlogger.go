@@ -67,7 +67,7 @@ func (l *hyEventLogger) auditRequest(addr net.Addr, id, reqAddr string) {
 		// the Hysteria2 core to disconnect the client immediately.
 		if l.svc.blockedIDs != nil {
 			l.svc.mu.Lock()
-			l.svc.blockedIDs[id] = true
+			l.svc.blockedIDs[authID(cred, host)] = true
 			l.svc.mu.Unlock()
 		}
 

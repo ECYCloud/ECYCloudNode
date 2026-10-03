@@ -215,7 +215,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 	if user != nil && len(user.Email) > 0 {
 		// Speed Limit and Device Limit
-		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
+		_, _, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
 		if reject {
 			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
 			common.Close(outboundLink.Writer)
@@ -224,10 +224,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, newError("Devices reach the limit: ", user.Email)
 		}
-		if ok {
-			inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, bucket)
-			outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, bucket)
-		}
+		inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, sessionInbound.Tag, user.Email)
+		outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, sessionInbound.Tag, user.Email)
 		// 存活连接周期复查在线名额，超限被挤出的 IP 会被强制断开；
 		// 上行（客户端数据）续期在线时间，下行只核查不续期
 		srcIP := sessionInbound.Source.Address.IP().String()
