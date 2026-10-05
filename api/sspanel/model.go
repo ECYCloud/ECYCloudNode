@@ -71,6 +71,7 @@ type CustomConfig struct {
 // UserResponse is the response of user
 type UserResponse struct {
 	ValidUntil  int64   `json:"valid_until"`
+	KickVersion uint64  `json:"kick_version"`
 	ID          int     `json:"id"`
 	ClientID    int     `json:"client_id"`
 	Passwd      string  `json:"passwd"`

@@ -164,6 +164,7 @@ type TuicConfig struct {
 
 type UserInfo struct {
 	ValidUntil  int64
+	KickVersion uint64
 	UID         int
 	ClientID    int
 	Email       string

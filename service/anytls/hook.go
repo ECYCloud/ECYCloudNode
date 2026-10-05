@@ -28,11 +28,12 @@ func remoteHost(remote string) string {
 
 type connCounter struct {
 	net.Conn
-	svc     *AnyTLSService
-	user    string
-	uid     int
-	host    string
-	blocked bool
+	svc         *AnyTLSService
+	user        string
+	uid         int
+	host        string
+	blocked     bool
+	kickVersion uint64
 }
 
 func (c *connCounter) Read(p []byte) (int, error) {
@@ -47,7 +48,7 @@ func (c *connCounter) Read(p []byte) (int, error) {
 		}
 		// 仅上行（客户端发来的数据）能证明客户端存活，据此续期在线时间；
 		// 下行不续期，避免客户端离线后残留连接被远端数据无限"续命"
-		if !c.svc.ensureOnline(c.user, c.host) {
+		if !c.svc.ensureOnline(c.user, c.host, c.kickVersion) {
 			_ = c.Conn.Close()
 			return 0, io.EOF
 		}
@@ -55,7 +56,7 @@ func (c *connCounter) Read(p []byte) (int, error) {
 			_ = c.Close()
 			return 0, waitErr
 		}
-		if !c.svc.ensureOnline(c.user, c.host) {
+		if !c.svc.ensureOnline(c.user, c.host, c.kickVersion) {
 			_ = c.Close()
 			return 0, io.EOF
 		}
@@ -64,7 +65,7 @@ func (c *connCounter) Read(p []byte) (int, error) {
 }
 
 func (c *connCounter) Write(p []byte) (int, error) {
-	if c.blocked || (c.svc != nil && !c.svc.verifyOnline(c.user, c.host)) {
+	if c.blocked || (c.svc != nil && !c.svc.verifyOnline(c.user, c.host, c.kickVersion)) {
 		return 0, io.EOF
 	}
 	if len(p) > 0 && c.svc != nil {
@@ -76,7 +77,7 @@ func (c *connCounter) Write(p []byte) (int, error) {
 			_ = c.Close()
 			return 0, waitErr
 		}
-		if !c.svc.verifyOnline(c.user, c.host) {
+		if !c.svc.verifyOnline(c.user, c.host, c.kickVersion) {
 			_ = c.Close()
 			return 0, io.EOF
 		}
@@ -86,11 +87,12 @@ func (c *connCounter) Write(p []byte) (int, error) {
 
 type packetConnCounter struct {
 	N.PacketConn
-	svc     *AnyTLSService
-	user    string
-	uid     int
-	host    string
-	blocked bool
+	svc         *AnyTLSService
+	user        string
+	uid         int
+	host        string
+	blocked     bool
+	kickVersion uint64
 }
 
 // ReadPacket implements N.PacketReader to count upload traffic (user -> proxy).
@@ -105,7 +107,7 @@ func (c *packetConnCounter) ReadPacket(buffer *buf.Buffer) (destination M.Socksa
 			_ = c.Close()
 			return M.Socksaddr{}, recordErr
 		}
-		if !c.svc.ensureOnline(c.user, c.host) {
+		if !c.svc.ensureOnline(c.user, c.host, c.kickVersion) {
 			_ = c.PacketConn.Close()
 			return M.Socksaddr{}, io.EOF
 		}
@@ -113,7 +115,7 @@ func (c *packetConnCounter) ReadPacket(buffer *buf.Buffer) (destination M.Socksa
 			_ = c.Close()
 			return M.Socksaddr{}, waitErr
 		}
-		if !c.svc.ensureOnline(c.user, c.host) {
+		if !c.svc.ensureOnline(c.user, c.host, c.kickVersion) {
 			_ = c.Close()
 			return M.Socksaddr{}, io.EOF
 		}
@@ -123,7 +125,7 @@ func (c *packetConnCounter) ReadPacket(buffer *buf.Buffer) (destination M.Socksa
 
 // WritePacket implements N.PacketWriter to count download traffic (proxy -> user).
 func (c *packetConnCounter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	if c.blocked || (c.svc != nil && !c.svc.verifyOnline(c.user, c.host)) {
+	if c.blocked || (c.svc != nil && !c.svc.verifyOnline(c.user, c.host, c.kickVersion)) {
 		buffer.Release()
 		return io.EOF
 	}
@@ -139,7 +141,7 @@ func (c *packetConnCounter) WritePacket(buffer *buf.Buffer, destination M.Socksa
 			_ = c.Close()
 			return waitErr
 		}
-		if !c.svc.verifyOnline(c.user, c.host) {
+		if !c.svc.verifyOnline(c.user, c.host, c.kickVersion) {
 			buffer.Release()
 			_ = c.Close()
 			return io.EOF
@@ -220,10 +222,10 @@ func (t *anyTLSTracker) RoutedConnection(_ context.Context, conn net.Conn, m ada
 
 	if blocked {
 		_ = conn.Close()
-		return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, blocked: true}
+		return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, kickVersion: userRec.KickVersion, blocked: true}
 	}
 
-	return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host}
+	return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, kickVersion: userRec.KickVersion}
 }
 
 func (t *anyTLSTracker) RoutedPacketConnection(_ context.Context, conn N.PacketConn, m adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) N.PacketConn {
@@ -292,10 +294,10 @@ func (t *anyTLSTracker) RoutedPacketConnection(_ context.Context, conn N.PacketC
 
 	if blocked {
 		_ = conn.Close()
-		return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, blocked: true}
+		return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, kickVersion: userRec.KickVersion, blocked: true}
 	}
 
-	return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host}
+	return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, kickVersion: userRec.KickVersion}
 }
 
 // RoutedFlow 仅在 TUN inbound 的 pre-match 流转发路径上被调用，AnyTLS 节点不注册

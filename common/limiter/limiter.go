@@ -23,6 +23,7 @@ const (
 
 type UserInfo struct {
 	ValidUntil  int64
+	KickVersion uint64
 	UID         int
 	ClientID    int
 	SpeedLimit  uint64
@@ -84,6 +85,7 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 		userKey := u.Key(tag)
 		userMap.Store(userKey, UserInfo{
 			ValidUntil:  u.ValidUntil,
+			KickVersion: u.KickVersion,
 			UID:         u.UID,
 			ClientID:    u.ClientID,
 			SpeedLimit:  u.SpeedLimit,
@@ -91,6 +93,7 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 		})
 	}
 	inboundInfo.UserInfo = userMap
+	inboundInfo.GlobalLimit.SyncUsers(userList)
 	l.InboundInfo.Store(tag, inboundInfo) // Replace the old inbound info
 	return nil
 }
@@ -115,6 +118,7 @@ func (l *Limiter) TrafficRecorder(tag, userKey string) func(int64, int64) error 
 func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserInfo, replace ...bool) error {
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
+		inboundInfo.slotMu.Lock()
 		if len(replace) > 0 && replace[0] {
 			keys := make(map[string]bool, len(*updatedUserList))
 			for _, user := range *updatedUserList {
@@ -130,32 +134,67 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 		// Update User info
 		for _, u := range *updatedUserList {
 			userKey := u.Key(tag)
+			kickVersion := u.KickVersion
+			if old, ok := inboundInfo.UserInfo.Load(userKey); ok {
+				kickVersion = max(kickVersion, old.(UserInfo).KickVersion)
+				if old.(UserInfo).KickVersion != kickVersion {
+					if slots, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, u.UID, u.ClientID)); ok {
+						slots.(*sync.Map).Delete(OnlineKey(u.ClientID, ""))
+					}
+				}
+			}
 			inboundInfo.UserInfo.Store(userKey, UserInfo{
 				ValidUntil:  u.ValidUntil,
+				KickVersion: kickVersion,
 				UID:         u.UID,
 				ClientID:    u.ClientID,
 				SpeedLimit:  u.SpeedLimit,
 				DeviceLimit: u.DeviceLimit,
 			})
-			if u.ClientID != 0 {
-				userKey = fmt.Sprintf("%s|%d", tag, u.UID)
-			}
-			// Update old limiter bucket
-			limit := determineRate(inboundInfo.NodeSpeedLimit, u.SpeedLimit)
-			if limit > 0 {
-				if bucket, ok := inboundInfo.BucketHub.Load(userKey); ok {
-					lim := bucket.(*rate.Limiter)
-					lim.SetLimit(rate.Limit(limit))
-					lim.SetBurst(int(limit))
-				}
-			} else {
-				inboundInfo.BucketHub.Delete(userKey)
-			}
+			inboundInfo.updateRateBucket(userKey, u.UID, u.ClientID, u.SpeedLimit)
 		}
+		inboundInfo.slotMu.Unlock()
+		inboundInfo.GlobalLimit.SyncUsers(updatedUserList)
 	} else {
 		return fmt.Errorf("no such inbound in limiter: %s", tag)
 	}
 	return nil
+}
+
+func (l *Limiter) UpdateInboundSpeedLimit(tag string, users *[]api.UserInfo) error {
+	value, ok := l.InboundInfo.Load(tag)
+	if !ok {
+		return fmt.Errorf("no such inbound in limiter: %s", tag)
+	}
+	info := value.(*InboundInfo)
+	info.slotMu.Lock()
+	defer info.slotMu.Unlock()
+	for _, update := range *users {
+		key := update.Key(tag)
+		value, ok := info.UserInfo.Load(key)
+		if !ok {
+			continue
+		}
+		user := value.(UserInfo)
+		user.SpeedLimit = update.SpeedLimit
+		info.UserInfo.Store(key, user)
+		info.updateRateBucket(key, user.UID, user.ClientID, user.SpeedLimit)
+	}
+	return nil
+}
+
+func (info *InboundInfo) updateRateBucket(key string, uid, clientID int, speed uint64) {
+	if clientID != 0 {
+		key = fmt.Sprintf("%s|%d", info.Tag, uid)
+	}
+	limit := determineRate(info.NodeSpeedLimit, speed)
+	if limit == 0 {
+		info.BucketHub.Delete(key)
+	} else if bucket, ok := info.BucketHub.Load(key); ok {
+		lim := bucket.(*rate.Limiter)
+		lim.SetLimit(rate.Limit(limit))
+		lim.SetBurst(int(limit))
+	}
 }
 
 func (l *Limiter) DeleteInboundLimiter(tag string) error {
@@ -261,8 +300,10 @@ func (l *Limiter) rateBucket(tag, userKey string) *rate.Limiter {
 // 官方客户端按设备标识占名额，第三方按出口 IP 占名额，两组各自独立计数。
 func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit int) bool {
 	clientID := 0
+	user := UserInfo{}
 	if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
-		clientID = v.(UserInfo).ClientID
+		user = v.(UserInfo)
+		clientID = user.ClientID
 	}
 	slot := OnlineKey(clientID, ip)
 	bucket := onlineBucket(inboundInfo.Tag, uid, clientID)
@@ -322,8 +363,8 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 	inboundInfo.slotMu.Unlock()
 
 	// 全局（跨节点）限制
-	if !inboundInfo.GlobalLimit.Allow(uid, slot, deviceLimit, grant) {
-		slotMap.Delete(slot)
+	if !inboundInfo.GlobalLimit.Allow(uid, slot, deviceLimit, grant, user) {
+		inboundInfo.releaseRejectedSlot(userKey, slot, slotMap, user.KickVersion)
 		return false
 	}
 	return true
@@ -378,8 +419,10 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	inboundInfo := value.(*InboundInfo)
 
 	var uid, deviceLimit, clientID int
+	var user UserInfo
 	if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
 		u := v.(UserInfo)
+		user = u
 		uid = u.UID
 		deviceLimit = u.DeviceLimit
 		clientID = u.ClientID
@@ -396,11 +439,19 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: time.Now().Unix()})
 	inboundInfo.slotMu.Unlock()
 
-	if !inboundInfo.GlobalLimit.Refresh(uid, slot, deviceLimit) {
-		slotMap.Delete(slot)
+	if !inboundInfo.GlobalLimit.Refresh(uid, slot, deviceLimit, user) {
+		inboundInfo.releaseRejectedSlot(userKey, slot, slotMap, user.KickVersion)
 		return false
 	}
 	return true
+}
+
+func (info *InboundInfo) releaseRejectedSlot(userKey, slot string, slots *sync.Map, version uint64) {
+	info.slotMu.Lock()
+	defer info.slotMu.Unlock()
+	if user, ok := info.UserInfo.Load(userKey); ok && user.(UserInfo).KickVersion == version {
+		slots.Delete(slot)
+	}
 }
 
 // VerifyOnline 供下行方向（远端→客户端）周期性复查：只读、不续期、不登记。
@@ -455,7 +506,16 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 	return fresh < deviceLimit
 }
 
-func (l *Limiter) AuthorizationAllowed(tag, userKey string) bool {
+func (l *Limiter) KickVersion(tag, userKey string) uint64 {
+	if value, ok := l.InboundInfo.Load(tag); ok {
+		if user, ok := value.(*InboundInfo).UserInfo.Load(userKey); ok {
+			return user.(UserInfo).KickVersion
+		}
+	}
+	return 0
+}
+
+func (l *Limiter) AuthorizationAllowed(tag, userKey string, version ...uint64) bool {
 	value, ok := l.InboundInfo.Load(tag)
 	if !ok {
 		return false
@@ -466,7 +526,8 @@ func (l *Limiter) AuthorizationAllowed(tag, userKey string) bool {
 		return false
 	}
 	user := value.(UserInfo)
-	return user.ValidUntil == 0 || time.Now().Unix() < user.ValidUntil
+	return (len(version) == 0 || user.KickVersion == version[0]) &&
+		(user.ValidUntil == 0 || time.Now().Unix() < user.ValidUntil)
 }
 
 // determineRate returns the minimum non-zero rate

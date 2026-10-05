@@ -175,15 +175,16 @@ func (w *dataPathWrapper) Dispatch(ctx context.Context, link *transport.Link) {
 				return
 			}
 			link.Reader = w.limiter.RateReader(link.Reader, nodeTag, email)
-			link.Writer = w.limiter.RateWriter(link.Writer, nodeTag, email)
 			if record := w.limiter.TrafficRecorder(nodeTag, email); record != nil {
 				link.Reader = &mydispatcher.SizeStatReader{Reader: link.Reader, Record: func(n int64) error { return record(n, 0) }}
 				link.Writer = &mydispatcher.SizeStatWriter{Writer: link.Writer, Record: func(n int64) error { return record(0, n) }}
 			}
 			// 存活连接周期复查在线名额，超限被挤出的 IP 会被强制断开；
 			// 上行（客户端数据）续期在线时间，下行只核查不续期
-			link.Reader = w.limiter.GuardReader(link.Reader, nodeTag, email, srcIP)
-			link.Writer = w.limiter.GuardWriter(link.Writer, nodeTag, email, srcIP)
+			kickVersion := w.limiter.KickVersion(nodeTag, email)
+			link.Reader = w.limiter.GuardReader(link.Reader, nodeTag, email, srcIP, kickVersion)
+			link.Writer = w.limiter.GuardWriter(link.Writer, nodeTag, email, srcIP, kickVersion)
+			link.Writer = w.limiter.RateWriter(link.Writer, nodeTag, email)
 		}
 	}
 

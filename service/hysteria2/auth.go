@@ -22,6 +22,9 @@ func authID(cred, host string, uid ...int) string {
 }
 
 func trafficUID(id string) int {
+	if strings.HasPrefix(id, "kick:") {
+		_, id, _ = strings.Cut(id, "|")
+	}
 	prefix, _, ok := strings.Cut(id, "|")
 	if !ok || !strings.HasPrefix(prefix, "uid:") {
 		return 0
@@ -34,6 +37,9 @@ func trafficUID(id string) int {
 // "|"，而凭据理论上可能含，从右侧拆才不会把凭据截断。旧格式（无分隔符）退化为
 // 只有凭据，此时按无地址处理。
 func splitAuthID(id string) (cred, host string) {
+	if strings.HasPrefix(id, "kick:") {
+		_, id, _ = strings.Cut(id, "|")
+	}
 	if trafficUID(id) > 0 {
 		_, id, _ = strings.Cut(id, "|")
 	}
@@ -41,6 +47,15 @@ func splitAuthID(id string) (cred, host string) {
 		return id[:i], id[i+1:]
 	}
 	return id, ""
+}
+
+func authKickVersion(id string) uint64 {
+	if !strings.HasPrefix(id, "kick:") {
+		return 0
+	}
+	prefix, _, _ := strings.Cut(id, "|")
+	version, _ := strconv.ParseUint(strings.TrimPrefix(prefix, "kick:"), 10, 64)
+	return version
 }
 
 // hyAuthenticator implements server.Authenticator and performs user lookup
@@ -102,13 +117,8 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 	}
 
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if !a.svc.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant) {
-		a.svc.mu.Lock()
-		delete(a.svc.onlineSlots[auth], slot)
-		if am, ok := a.svc.slotLastActive[auth]; ok {
-			delete(am, slot)
-		}
-		a.svc.mu.Unlock()
+	if !a.svc.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}) {
+		a.svc.releaseOnline("kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + authID(auth, host, user.UID))
 		logger.WithFields(log.Fields{
 			"uid":         user.UID,
 			"deviceLimit": user.DeviceLimit,
@@ -117,16 +127,17 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		return false, ""
 	}
 
-	return true, authID(auth, host, user.UID)
+	return true, "kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + authID(auth, host, user.UID)
 }
 
 // slot 解析该凭据在 host 上占用的名额标识，与 Authenticate 同一口径：
 // 官方客户端按设备标识占名额，第三方按出口 IP。
 // cred 是认证凭据，不是回调传来的连接标识，后者须先经 splitAuthID 拆开。
 // 调用方须自行持锁。
-func (h *Hysteria2Service) slot(cred, host string) (string, userRecord, bool) {
+func (h *Hysteria2Service) slot(cred, host string, version ...uint64) (string, userRecord, bool) {
 	user, ok := h.users[cred]
-	if !ok || (user.ValidUntil != 0 && time.Now().Unix() >= user.ValidUntil) {
+	if !ok || (len(version) > 0 && user.KickVersion != version[0]) ||
+		(user.ValidUntil != 0 && time.Now().Unix() >= user.ValidUntil) {
 		return "", user, false
 	}
 	return limiter.OnlineKey(user.ClientID, host), user, true
@@ -134,9 +145,9 @@ func (h *Hysteria2Service) slot(cred, host string) (string, userRecord, bool) {
 
 // ensureOnline 复查并续期该凭据持有的名额，闲置过期但尚有空余名额时重新登记；
 // 已被挤出且名额已满返回 false。
-func (h *Hysteria2Service) ensureOnline(cred, host string) bool {
+func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bool {
 	h.mu.Lock()
-	slot, user, ok := h.slot(cred, host)
+	slot, user, ok := h.slot(cred, host, version...)
 	if !ok {
 		h.mu.Unlock()
 		return false
@@ -151,25 +162,22 @@ func (h *Hysteria2Service) ensureOnline(cred, host string) bool {
 		return true
 	}
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if h.globalChecker.Refresh(user.UID, slot, user.DeviceLimit) {
+	if h.globalChecker.Refresh(user.UID, slot, user.DeviceLimit, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}) {
 		return true
 	}
 	// 被全局挤出的名额不能留在本地账本继续占位，与 Authenticate 同口径
-	h.mu.Lock()
-	delete(h.onlineSlots[cred], slot)
-	delete(h.slotLastActive[cred], slot)
-	h.mu.Unlock()
+	h.releaseOnline("kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + authID(cred, host, user.UID))
 	return false
 }
 
 // verifyOnline 下行方向（远端→客户端）的复查：只核查不续期。下行流量不能证明客户端
 // 仍然存活——客户端异常离线后远端仍可能向残留连接推送数据，据此续期会让离线名额被
 // 无限续命、永不释放；但被挤出的设备必须断开，否则大文件下载之类的长连接能一直跑完。
-func (h *Hysteria2Service) verifyOnline(cred, host string) bool {
+func (h *Hysteria2Service) verifyOnline(cred, host string, version ...uint64) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	slot, user, ok := h.slot(cred, host)
+	slot, user, ok := h.slot(cred, host, version...)
 	if !ok {
 		return false
 	}
@@ -178,8 +186,9 @@ func (h *Hysteria2Service) verifyOnline(cred, host string) bool {
 
 // guardOnline 是存活会话的周期性复查入口：名额已被挤出时标记断开，
 // 由 LogTraffic 在下一个流量事件通知内核断连（与审计命中共用同一机制）。
-func (h *Hysteria2Service) guardOnline(cred, host string) {
-	if cred == "" || host == "" || h.ensureOnline(cred, host) {
+func (h *Hysteria2Service) guardOnline(id string) {
+	cred, host := splitAuthID(id)
+	if cred == "" || host == "" || h.ensureOnline(cred, host, authKickVersion(id)) {
 		return
 	}
 
@@ -187,20 +196,21 @@ func (h *Hysteria2Service) guardOnline(cred, host string) {
 	defer h.mu.Unlock()
 	if h.blockedIDs != nil {
 		// 断连标记按连接记：同一凭据下只断被挤掉的那条，不牵连其它在线连接
-		h.blockedIDs[authID(cred, host)] = true
+		h.blockedIDs[id] = true
 	}
 }
 
 // releaseOnline 清理连接结束时该归还的状态：名额与断连标记。一个 Hysteria2 会话就是
 // 一台设备，会话结束即可释放；异常离线不会走到这里，由活跃时间过期兜底。
-func (h *Hysteria2Service) releaseOnline(cred, host string) {
+func (h *Hysteria2Service) releaseOnline(id string) {
+	cred, host := splitAuthID(id)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	// 连接没了，断连标记再没有流量事件来消费，就地清掉；否则标记表会随来源地址无限增长
-	delete(h.blockedIDs, authID(cred, host))
+	delete(h.blockedIDs, id)
 
-	slot, _, ok := h.slot(cred, host)
+	slot, _, ok := h.slot(cred, host, authKickVersion(id))
 	if !ok {
 		return
 	}

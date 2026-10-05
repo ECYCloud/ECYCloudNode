@@ -33,13 +33,13 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 	if uid == 0 {
 		uid = t.svc.users[cred].UID
 	}
-	key := authID(cred, host)
+	key := id
 	if t.svc.blockedIDs[key] {
 		delete(t.svc.blockedIDs, key)
 		t.svc.mu.Unlock()
 		return false
 	}
-	if _, _, ok := t.svc.slot(cred, host); !ok {
+	if _, _, ok := t.svc.slot(cred, host, authKickVersion(id)); !ok {
 		t.svc.mu.Unlock()
 		return false
 	}
@@ -66,10 +66,10 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 	// 返回 false 即通知内核断开这条连接。
 	if host != "" {
 		if tx > 0 {
-			if !t.svc.ensureOnline(cred, host) {
+			if !t.svc.ensureOnline(cred, host, authKickVersion(id)) {
 				return false
 			}
-		} else if rx > 0 && !t.svc.verifyOnline(cred, host) {
+		} else if rx > 0 && !t.svc.verifyOnline(cred, host, authKickVersion(id)) {
 			return false
 		}
 	}
@@ -83,7 +83,7 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 		}
 	}
 	t.svc.mu.RLock()
-	_, _, ok := t.svc.slot(cred, host)
+	_, _, ok := t.svc.slot(cred, host, authKickVersion(id))
 	t.svc.mu.RUnlock()
 	return ok
 }
@@ -103,7 +103,10 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	defer func() {
+		h.mu.Unlock()
+		h.globalChecker.SyncUsers(userInfo)
+	}()
 
 	newUsers := make(map[string]userRecord, len(*userInfo))
 	newRateLimiters := make(map[string]*rate.Limiter)
@@ -121,11 +124,18 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 		keys := []string{u.UUID, u.Passwd}
 		rec := userRecord{
 			ValidUntil:  u.ValidUntil,
+			KickVersion: u.KickVersion,
 			UID:         u.UID,
 			ClientID:    u.ClientID,
 			Email:       u.Email,
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
+		}
+		for _, key := range keys {
+			if old, ok := h.users[key]; ok && old.KickVersion != u.KickVersion {
+				delete(h.onlineSlots[key], L.OnlineKey(u.ClientID, ""))
+				delete(h.slotLastActive[key], L.OnlineKey(u.ClientID, ""))
+			}
 		}
 		L.ShareAccountSlots(accountSlots, u.UID, u.ClientID, keys, h.onlineSlots, h.slotLastActive)
 

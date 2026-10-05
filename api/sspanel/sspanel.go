@@ -747,6 +747,7 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 		}
 		userList = append(userList, api.UserInfo{
 			ValidUntil:  user.ValidUntil,
+			KickVersion: user.KickVersion,
 			UID:         user.ID,
 			ClientID:    user.ClientID,
 			UUID:        user.UUID,

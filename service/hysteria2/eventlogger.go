@@ -67,7 +67,7 @@ func (l *hyEventLogger) auditRequest(addr net.Addr, id, reqAddr string) {
 		// the Hysteria2 core to disconnect the client immediately.
 		if l.svc.blockedIDs != nil {
 			l.svc.mu.Lock()
-			l.svc.blockedIDs[authID(cred, host)] = true
+			l.svc.blockedIDs[id] = true
 			l.svc.mu.Unlock()
 		}
 
@@ -105,7 +105,7 @@ func (l *hyEventLogger) Disconnect(addr net.Addr, id string, err error) {
 	// 归还该会话占用的名额。地址取自连接标识，与登记时同一口径
 	cred, host := splitAuthID(id)
 	if l != nil && l.svc != nil && cred != "" && host != "" {
-		l.svc.releaseOnline(cred, host)
+		l.svc.releaseOnline(id)
 	}
 
 	if err != nil {
@@ -121,7 +121,7 @@ func (l *hyEventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 	if addr != nil {
 		remote = addr.String()
 	}
-	cred, host := splitAuthID(id)
+	cred, _ := splitAuthID(id)
 
 	var (
 		user    userRecord
@@ -138,7 +138,7 @@ func (l *hyEventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 
 		// 存活会话的周期性复查：续期仍持有的名额，已被超限挤出的则断连；
 		// 被挤出后禁止靠流量抢回名额
-		l.svc.guardOnline(cred, host)
+		l.svc.guardOnline(id)
 	}
 
 	if ok {
@@ -173,7 +173,7 @@ func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, r
 	if addr != nil {
 		remote = addr.String()
 	}
-	cred, host := splitAuthID(id)
+	cred, _ := splitAuthID(id)
 
 	var (
 		user    userRecord
@@ -190,7 +190,7 @@ func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, r
 
 		// 存活会话的周期性复查：续期仍持有的名额，已被超限挤出的则断连；
 		// 被挤出后禁止靠流量抢回名额
-		l.svc.guardOnline(cred, host)
+		l.svc.guardOnline(id)
 	}
 
 	if ok {

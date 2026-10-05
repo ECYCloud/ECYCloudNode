@@ -109,16 +109,17 @@ func (r *Reader) wait(mb buf.MultiBuffer, err error) (buf.MultiBuffer, error) {
 // 不续期，避免客户端异常离线后残留连接被远端数据无限"续命"、名额永不释放。
 
 type guardState struct {
-	l       *Limiter
-	tag     string
-	userKey string
-	ip      string
-	refresh bool
-	next    int64
+	kickVersion uint64
+	l           *Limiter
+	tag         string
+	userKey     string
+	ip          string
+	refresh     bool
+	next        int64
 }
 
 func (g *guardState) check() error {
-	if !g.l.AuthorizationAllowed(g.tag, g.userKey) {
+	if !g.l.AuthorizationAllowed(g.tag, g.userKey, g.kickVersion) {
 		return errors.New("user authorization expired or revoked")
 	}
 	if now := time.Now().Unix(); now >= g.next {
@@ -149,18 +150,26 @@ type GuardWriter struct {
 }
 
 // GuardReader 上行方向（读客户端数据）：核查并续期。
-func (l *Limiter) GuardReader(reader buf.Reader, tag, userKey, ip string) buf.Reader {
-	return &GuardReader{reader: reader, guardState: guardState{l: l, tag: tag, userKey: userKey, ip: ip, refresh: true}}
+func (l *Limiter) GuardReader(reader buf.Reader, tag, userKey, ip string, version ...uint64) buf.Reader {
+	return &GuardReader{reader: reader, guardState: l.connectionGuard(tag, userKey, ip, true, version)}
+}
+
+func (l *Limiter) connectionGuard(tag, userKey, ip string, refresh bool, version []uint64) guardState {
+	kickVersion := l.KickVersion(tag, userKey)
+	if len(version) > 0 {
+		kickVersion = version[0]
+	}
+	return guardState{l: l, tag: tag, userKey: userKey, ip: ip, refresh: refresh, kickVersion: kickVersion}
 }
 
 // GuardWriter 下行方向（向客户端写数据）：只核查不续期。
-func (l *Limiter) GuardWriter(writer buf.Writer, tag, userKey, ip string) buf.Writer {
-	return &GuardWriter{writer: writer, guardState: guardState{l: l, tag: tag, userKey: userKey, ip: ip}}
+func (l *Limiter) GuardWriter(writer buf.Writer, tag, userKey, ip string, version ...uint64) buf.Writer {
+	return &GuardWriter{writer: writer, guardState: l.connectionGuard(tag, userKey, ip, false, version)}
 }
 
 // GuardUplinkWriter 上行方向的写端（承载客户端→远端的数据）：核查并续期。
-func (l *Limiter) GuardUplinkWriter(writer buf.Writer, tag, userKey, ip string) buf.Writer {
-	return &GuardWriter{writer: writer, guardState: guardState{l: l, tag: tag, userKey: userKey, ip: ip, refresh: true}}
+func (l *Limiter) GuardUplinkWriter(writer buf.Writer, tag, userKey, ip string, version ...uint64) buf.Writer {
+	return &GuardWriter{writer: writer, guardState: l.connectionGuard(tag, userKey, ip, true, version)}
 }
 
 func (r *GuardReader) ReadMultiBuffer() (buf.MultiBuffer, error) {

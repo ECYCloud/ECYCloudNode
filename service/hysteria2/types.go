@@ -71,6 +71,7 @@ type Hysteria2Service struct {
 
 type userRecord struct {
 	ValidUntil  int64
+	KickVersion uint64
 	ClientID    int
 	UID         int
 	Email       string

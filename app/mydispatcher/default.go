@@ -224,13 +224,14 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, newError("Devices reach the limit: ", user.Email)
 		}
-		inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, sessionInbound.Tag, user.Email)
-		outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, sessionInbound.Tag, user.Email)
 		// 存活连接周期复查在线名额，超限被挤出的 IP 会被强制断开；
 		// 上行（客户端数据）续期在线时间，下行只核查不续期
 		srcIP := sessionInbound.Source.Address.IP().String()
-		inboundLink.Writer = d.Limiter.GuardUplinkWriter(inboundLink.Writer, sessionInbound.Tag, user.Email, srcIP)
-		outboundLink.Writer = d.Limiter.GuardWriter(outboundLink.Writer, sessionInbound.Tag, user.Email, srcIP)
+		kickVersion := d.Limiter.KickVersion(sessionInbound.Tag, user.Email)
+		inboundLink.Writer = d.Limiter.GuardUplinkWriter(inboundLink.Writer, sessionInbound.Tag, user.Email, srcIP, kickVersion)
+		outboundLink.Writer = d.Limiter.GuardWriter(outboundLink.Writer, sessionInbound.Tag, user.Email, srcIP, kickVersion)
+		inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, sessionInbound.Tag, user.Email)
+		outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, sessionInbound.Tag, user.Email)
 
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {

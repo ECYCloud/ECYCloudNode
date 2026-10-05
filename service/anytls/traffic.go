@@ -21,7 +21,10 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		s.globalChecker.SyncUsers(userInfo)
+	}()
 
 	newUsers := make(map[string]userRecord, len(*userInfo))
 	authUsers := make([]option.AnyTLSUser, 0, len(*userInfo)*2)
@@ -38,11 +41,18 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 		keys := []string{u.UUID, u.Passwd}
 		rec := userRecord{
 			ValidUntil:  u.ValidUntil,
+			KickVersion: u.KickVersion,
 			UID:         u.UID,
 			ClientID:    u.ClientID,
 			Email:       u.Email,
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
+		}
+		for _, key := range keys {
+			if old, ok := s.users[key]; ok && old.KickVersion != u.KickVersion {
+				delete(s.onlineSlots[key], limiter.OnlineKey(u.ClientID, ""))
+				delete(s.slotLastActive[key], limiter.OnlineKey(u.ClientID, ""))
+			}
 		}
 		limiter.ShareAccountSlots(accountSlots, u.UID, u.ClientID, keys, s.onlineSlots, s.slotLastActive)
 
@@ -147,9 +157,10 @@ func (s *AnyTLSService) addTraffic(uid int, up, down int64) error {
 // slot 解析该凭据在 host 上占用的名额标识：官方客户端按设备标识占名额，换网络不
 // 重复占用；第三方仍按出口 IP。登记、续期、归还必须共用它，口径一旦分叉名额就对不上。
 // 调用方须自行持锁。
-func (s *AnyTLSService) slot(uuid, host string) (string, userRecord, bool) {
+func (s *AnyTLSService) slot(uuid, host string, version ...uint64) (string, userRecord, bool) {
 	user, ok := s.users[uuid]
-	if !ok || (user.ValidUntil != 0 && time.Now().Unix() >= user.ValidUntil) {
+	if !ok || (len(version) > 0 && user.KickVersion != version[0]) ||
+		(user.ValidUntil != 0 && time.Now().Unix() >= user.ValidUntil) {
 		return "", user, false
 	}
 	return limiter.OnlineKey(user.ClientID, host), user, true
@@ -189,13 +200,8 @@ func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 	}
 
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if !s.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant) {
-		s.mu.Lock()
-		delete(s.onlineSlots[uuid], slot)
-		if am, ok := s.slotLastActive[uuid]; ok {
-			delete(am, slot)
-		}
-		s.mu.Unlock()
+	if !s.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}) {
+		s.releaseOnline(uuid, host, user.KickVersion)
 		s.logger.WithFields(log.Fields{
 			"uid":         user.UID,
 			"deviceLimit": user.DeviceLimit,
@@ -209,9 +215,9 @@ func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 
 // ensureOnline 上行方向（客户端→服务端有真实数据）的周期性复查：续期仍持有的名额，
 // 闲置过期但尚有空余名额时重新登记；已被挤出且名额已满返回 false，调用方应断开连接。
-func (s *AnyTLSService) ensureOnline(uuid, host string) bool {
+func (s *AnyTLSService) ensureOnline(uuid, host string, version ...uint64) bool {
 	s.mu.Lock()
-	slot, user, ok := s.slot(uuid, host)
+	slot, user, ok := s.slot(uuid, host, version...)
 	if !ok {
 		s.mu.Unlock()
 		return false
@@ -226,23 +232,29 @@ func (s *AnyTLSService) ensureOnline(uuid, host string) bool {
 		return true
 	}
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if s.globalChecker.Refresh(user.UID, slot, user.DeviceLimit) {
+	if s.globalChecker.Refresh(user.UID, slot, user.DeviceLimit, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}) {
 		return true
 	}
 	// 被全局挤出的名额不能留在本地账本继续占位，与 allowConnection 同口径
-	s.mu.Lock()
-	delete(s.onlineSlots[uuid], slot)
-	delete(s.slotLastActive[uuid], slot)
-	s.mu.Unlock()
+	s.releaseOnline(uuid, host, user.KickVersion)
 	return false
 }
 
+func (s *AnyTLSService) releaseOnline(uuid, host string, version uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slot, _, ok := s.slot(uuid, host, version); ok {
+		delete(s.onlineSlots[uuid], slot)
+		delete(s.slotLastActive[uuid], slot)
+	}
+}
+
 // verifyOnline 下行方向（远端→客户端）的周期性复查：只核查不续期。
-func (s *AnyTLSService) verifyOnline(uuid, host string) bool {
+func (s *AnyTLSService) verifyOnline(uuid, host string, version ...uint64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	slot, user, ok := s.slot(uuid, host)
+	slot, user, ok := s.slot(uuid, host, version...)
 	if !ok {
 		return false
 	}

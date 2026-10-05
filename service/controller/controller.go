@@ -661,11 +661,13 @@ func compareUserList(old, next *[]api.UserInfo) (deleted, added []api.UserInfo) 
 	for _, u := range *old {
 		key := u
 		key.ValidUntil = 0
+		key.KickVersion = 0
 		previous[key] = u
 	}
 	for _, u := range *next {
 		key := u
 		key.ValidUntil = 0
+		key.KickVersion = 0
 		current[key] = u
 	}
 	for key, u := range previous {
@@ -731,7 +733,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 			}
 		}
 		if len(toReleaseUsers) > 0 {
-			if err := c.UpdateInboundLimiter(c.Tag, &toReleaseUsers); err != nil {
+			if err := c.dispatcher.Limiter.UpdateInboundSpeedLimit(c.Tag, &toReleaseUsers); err != nil {
 				c.logger.Print(err)
 			}
 		}
@@ -771,7 +773,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 		}
 	}
 	if len(limitedUsers) > 0 {
-		if err := c.UpdateInboundLimiter(c.Tag, &limitedUsers); err != nil {
+		if err := c.dispatcher.Limiter.UpdateInboundSpeedLimit(c.Tag, &limitedUsers); err != nil {
 			c.logger.Print(err)
 		}
 	}
