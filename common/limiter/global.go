@@ -63,7 +63,17 @@ if ARGV[9] == '1' then
 end
 `
 
-var syncKickScript = redis.NewScript(kickPrelude + `return authorized and 1 or 0`)
+var syncKickScript = redis.NewScript(`
+local syncKeys = KEYS
+local syncArgs = ARGV
+for i = 1, #syncKeys, 2 do
+	local offset = (i - 1) / 2 * 3 + 3
+	local KEYS = {syncKeys[i], syncKeys[i + 1]}
+	local ARGV = {syncArgs[1], syncArgs[2], syncArgs[offset], 0, 0, '', syncArgs[offset + 1], syncArgs[offset + 2], '1'}
+` + kickPrelude + `
+end
+return 1
+`)
 
 // 名额的读与写必须在 Redis 内一次做完：改成「取回在线表 → 本地增删 → 写回」的话，
 // 多节点并发时后写者会覆盖前写者刚登记的 名额，在线数可以超过上限。同理不得在前面
@@ -245,16 +255,31 @@ func (g *GlobalDeviceChecker) SyncUsers(users *[]api.UserInfo) {
 	if g == nil || users == nil {
 		return
 	}
-	for _, user := range *users {
-		if user.ClientID == 0 {
+	// 限制单次请求大小与脚本工作量。
+	const batchSize = 64
+	keys := make([]string, 0, 2*batchSize)
+	args := make([]any, 2, 2+3*batchSize)
+	args[1] = g.expiry
+	for i, user := range *users {
+		if user.ClientID != 0 {
+			slot := OnlineKey(user.ClientID, "")
+			key := fmt.Sprintf("UID|%d|client", user.UID)
+			keys = append(keys, key, key+"|kick|"+slot)
+			args = append(args, slot, strconv.FormatUint(user.KickVersion, 10), user.ValidUntil)
+		}
+		if len(keys) == 0 || (len(keys) < 2*batchSize && i < len(*users)-1) {
 			continue
 		}
-		_, err := g.eval(syncKickScript, user.UID, OnlineKey(user.ClientID, ""), 0, "",
-			UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}).Int()
+		args[0] = time.Now().Unix()
+		ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
+		_, err := syncKickScript.Run(ctx, g.client, keys, args...).Int()
+		cancel()
 		if err != nil {
 			errors.LogErrorInner(context.Background(), err, "cache service")
 			return
 		}
+		keys = keys[:0]
+		args = args[:2]
 	}
 }
 
