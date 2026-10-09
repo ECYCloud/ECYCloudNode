@@ -12,7 +12,7 @@ require (
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/pires/go-proxyproto v0.15.0
 	github.com/r3labs/diff/v3 v3.0.2
-	github.com/redis/go-redis/v9 v9.22.0
+	github.com/redis/go-redis/v9 v9.23.0
 	github.com/sagernet/bbolt v0.0.0-20260915102804-500ee1e84832
 	github.com/sagernet/sing v0.9.6
 	github.com/sagernet/sing-box v1.14.2
