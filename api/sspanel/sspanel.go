@@ -24,22 +24,18 @@ import (
 
 // APIClient create a api client to the panel.
 type APIClient struct {
-	trafficMu        sync.RWMutex
-	trafficReportMu  sync.Mutex
-	trafficDir       string
-	trafficState     *traffic.Store
-	client           *resty.Client
-	trafficClient    *resty.Client
-	APIHost          string
-	NodeID           int
-	Key              string
-	SpeedLimit       float64
-	DeviceLimit      int
-	LocalRuleList    []api.DetectRule
-	LastReportOnline map[int]int
-	// LastReportOnlineClients 本节点上报的官方在线客户端数，与 LastReportOnline 分开记
-	LastReportOnlineClients map[int]int
-	access                  sync.Mutex
+	trafficMu       sync.RWMutex
+	trafficReportMu sync.Mutex
+	trafficDir      string
+	trafficState    *traffic.Store
+	client          *resty.Client
+	trafficClient   *resty.Client
+	APIHost         string
+	NodeID          int
+	Key             string
+	SpeedLimit      float64
+	DeviceLimit     int
+	LocalRuleList   []api.DetectRule
 	// eTags 被节点与用户两个周期任务的 goroutine 共用，必须全程持锁访问：
 	// 裸 map 的并发读写是 Go 运行时 fatal error，recover 拦不住。
 	eTagsMu sync.Mutex
@@ -139,18 +135,16 @@ func New(apiConfig *api.Config) *APIClient {
 	}
 
 	return &APIClient{
-		trafficDir:              trafficDirectory(apiConfig.TrafficDir),
-		client:                  client,
-		trafficClient:           trafficClient,
-		NodeID:                  nodeID,
-		Key:                     apiConfig.Key,
-		APIHost:                 apiConfig.APIHost,
-		SpeedLimit:              apiConfig.SpeedLimit,
-		DeviceLimit:             apiConfig.DeviceLimit,
-		LocalRuleList:           localRuleList,
-		LastReportOnline:        make(map[int]int),
-		LastReportOnlineClients: make(map[int]int),
-		eTags:                   make(map[string]string),
+		trafficDir:    trafficDirectory(apiConfig.TrafficDir),
+		client:        client,
+		trafficClient: trafficClient,
+		NodeID:        nodeID,
+		Key:           apiConfig.Key,
+		APIHost:       apiConfig.APIHost,
+		SpeedLimit:    apiConfig.SpeedLimit,
+		DeviceLimit:   apiConfig.DeviceLimit,
+		LocalRuleList: localRuleList,
+		eTags:         make(map[string]string),
 	}
 }
 
@@ -419,17 +413,9 @@ func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
 	return nil
 }
 
-// ReportNodeOnlineUsers reports official clients and third-party IPs.
+// ReportNodeOnlineUsers reports official clients and third-party IPs; empty groups are not posted.
 func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) error {
-	c.access.Lock()
-	defer c.access.Unlock()
-
-	reportOnline := make(map[int]int)
-	reportOnlineClients := make(map[int]int)
-	data := map[string][]OnlineUser{
-		"/mod_mu/users/online":  {},
-		"/mod_mu/users/aliveip": {},
-	}
+	data := map[string][]OnlineUser{}
 	if onlineUserList != nil {
 		for _, user := range *onlineUserList {
 			path := "/mod_mu/users/online"
@@ -439,29 +425,19 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 				entry.IP = user.IP
 			}
 			data[path] = append(data[path], entry)
-			if user.ClientID != 0 {
-				reportOnlineClients[user.UID]++
-			} else {
-				reportOnline[user.UID]++
-			}
 		}
 	}
-	// 空列表也必须重置两类本节点计数，避免沿用已下线的记录。
-	c.LastReportOnline = reportOnline
-	c.LastReportOnlineClients = reportOnlineClients
-
 	var reportErr error
 	for _, path := range []string{"/mod_mu/users/online", "/mod_mu/users/aliveip"} {
-		if len(data[path]) > 0 {
-			first := data[path][0]
-			identity := fmt.Sprintf("IP=%s", first.IP)
-			if first.ClientID != 0 {
-				identity = fmt.Sprintf("ClientID=%d", first.ClientID)
-			}
-			log.Printf("ReportNodeOnlineUsers: node_id=%d online_count=%d example: UID=%d %s", c.NodeID, len(data[path]), first.UID, identity)
-		} else {
-			log.Printf("ReportNodeOnlineUsers: node_id=%d online_count=0 (sync purge)", c.NodeID)
+		if len(data[path]) == 0 {
+			continue
 		}
+		first := data[path][0]
+		identity := fmt.Sprintf("IP=%s", first.IP)
+		if first.ClientID != 0 {
+			identity = fmt.Sprintf("ClientID=%d", first.ClientID)
+		}
+		log.Printf("ReportNodeOnlineUsers: node_id=%d online_count=%d example: UID=%d %s", c.NodeID, len(data[path]), first.UID, identity)
 		res, err := c.client.R().
 			SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
 			SetBody(&PostData{Data: data[path]}).
@@ -474,52 +450,39 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 	return reportErr
 }
 
-// ReportKickedUsers reports device slots kicked due to device limit exceeded.
+// ReportKickedUsers reports official client slots kicked due to device limit exceeded.
+// 只有拿到回收授权才会挤人，第三方没有授权入口，所以这里只有官方设备。
 func (c *APIClient) ReportKickedUsers(kickedUserList *[]api.OnlineUser) error {
 	if kickedUserList == nil || len(*kickedUserList) == 0 {
 		return nil
 	}
 
-	data := make(map[string][]map[string]interface{})
+	data := make([]map[string]interface{}, 0, len(*kickedUserList))
 	for _, user := range *kickedUserList {
-		path, field, value := "/mod_mu/users/ipkick", "ip", user.IP
-		if user.ClientID != 0 {
-			path, field, value = "/mod_mu/users/device-kick", "slot", "client-"+strconv.Itoa(user.ClientID)
-		}
-		data[path] = append(data[path], map[string]interface{}{"user_id": user.UID, field: value})
+		data = append(data, map[string]interface{}{"user_id": user.UID, "slot": "client-" + strconv.Itoa(user.ClientID)})
 	}
-	var reportErr error
-	for path, entries := range data {
-		res, err := c.client.R().
-			SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
-			SetBody(&PostData{Data: entries}).
-			SetResult(&Response{}).
-			ForceContentType("application/json").
-			Post(path)
-		_, err = c.parseResponse(res, path, err)
-		reportErr = errors.Join(reportErr, err)
-	}
-	return reportErr
+	path := "/mod_mu/users/device-kick"
+	res, err := c.client.R().
+		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
+		SetBody(&PostData{Data: data}).
+		SetResult(&Response{}).
+		ForceContentType("application/json").
+		Post(path)
+	_, err = c.parseResponse(res, path, err)
+	return err
 }
 
 func (c *APIClient) ConsumeSlotReclaim(uid int, slot string) (bool, string, error) {
-	return c.consumeReclaim(uid, slot, "/mod_mu/users/slot-reclaim", "slot")
-}
-
-func (c *APIClient) ConsumeIpReclaim(uid int, ip string) (bool, string, error) {
-	return c.consumeReclaim(uid, ip, "/mod_mu/users/ipreclaim", "ip")
-}
-
-func (c *APIClient) consumeReclaim(uid int, value, path, field string) (bool, string, error) {
-	if uid <= 0 || value == "" {
+	if uid <= 0 || slot == "" {
 		return false, "", nil
 	}
+	path := "/mod_mu/users/slot-reclaim"
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	res, err := c.trafficClient.R().
 		SetContext(ctx).
 		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
-		SetBody(&PostData{Data: map[string]interface{}{"user_id": uid, field: value}}).
+		SetBody(&PostData{Data: map[string]interface{}{"user_id": uid, "slot": slot}}).
 		SetResult(&Response{}).
 		ForceContentType("application/json").
 		Post(path)
@@ -532,13 +495,9 @@ func (c *APIClient) consumeReclaim(uid int, value, path, field string) (bool, st
 	var payload struct {
 		OK         bool   `json:"ok"`
 		TargetSlot string `json:"target_slot"`
-		TargetIP   string `json:"target_ip"`
 	}
 	if err := json.Unmarshal(response.Data, &payload); err != nil {
-		return false, "", fmt.Errorf("unmarshal %s failed: %s", strings.TrimPrefix(path, "/mod_mu/users/"), err)
-	}
-	if field == "ip" {
-		return payload.OK, payload.TargetIP, nil
+		return false, "", fmt.Errorf("unmarshal slot-reclaim failed: %s", err)
 	}
 	return payload.OK, payload.TargetSlot, nil
 }
@@ -706,11 +665,7 @@ func (c *APIClient) ReportIllegal(detectResultList *[]api.DetectResult) error {
 
 // ParseUserListResponse parse the response for the given node info format
 func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]api.UserInfo, error) {
-	// Lock while reading LastReportOnline snapshot; do NOT clear it here.
-	c.access.Lock()
-	defer c.access.Unlock()
-
-	var deviceLimit, localDeviceLimit = 0, 0
+	var deviceLimit = 0
 	var speedLimit uint64 = 0
 	var userList []api.UserInfo
 	for _, user := range *userInfoResponse {
@@ -718,26 +673,6 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 			deviceLimit = c.DeviceLimit
 		} else {
 			deviceLimit = user.DeviceLimit
-		}
-
-		// 超限时由节点本地/Redis 踢最旧的一个，不再因全局已满而跳过下发用户。
-		// 官方按 online_count 计设备数，第三方保留 alive_ip 计 IP 数。
-		onlineCount := user.OnlineCount
-		if user.ClientID == 0 {
-			onlineCount = user.AliveIP
-		}
-		if deviceLimit > 0 && onlineCount > 0 {
-			lastOnline := 0
-			if user.ClientID != 0 {
-				lastOnline = c.LastReportOnlineClients[user.ID]
-			} else {
-				lastOnline = c.LastReportOnline[user.ID]
-			}
-			if localDeviceLimit = deviceLimit - onlineCount + lastOnline; localDeviceLimit > 0 {
-				deviceLimit = localDeviceLimit
-			} else if lastOnline > 0 {
-				deviceLimit = lastOnline
-			}
 		}
 
 		if c.SpeedLimit > 0 {

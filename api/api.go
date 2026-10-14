@@ -19,7 +19,6 @@ type API interface {
 	ReportNodeOnlineUsers(onlineUser *[]OnlineUser) (err error)
 	ReportKickedUsers(kickedUser *[]OnlineUser) (err error)
 	ConsumeSlotReclaim(uid int, slot string) (ok bool, targetSlot string, err error)
-	ConsumeIpReclaim(uid int, ip string) (ok bool, targetIP string, err error)
 	PrepareTraffic() error
 	RecordUserTraffic(uid int, upload, download int64) error
 	ReportUserTraffic() error

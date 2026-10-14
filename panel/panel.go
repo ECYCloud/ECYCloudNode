@@ -326,15 +326,13 @@ func (p *Panel) Start() {
 		}
 
 		limiter.SetReclaimConsumer(func(uid int, slot string) (bool, string) {
-			consume := apiClient.ConsumeSlotReclaim
-			operation, field := "ConsumeSlotReclaim", "slot"
+			// 第三方没有回收授权入口，判满直接拒绝，不请求面板
 			if !limiter.IsClientOnlineKey(slot) {
-				consume = apiClient.ConsumeIpReclaim
-				operation, field = "ConsumeIpReclaim", "ip"
+				return false, ""
 			}
-			ok, targetSlot, err := consume(uid, slot)
+			ok, targetSlot, err := apiClient.ConsumeSlotReclaim(uid, slot)
 			if err != nil {
-				log.Warnf("%s uid=%d %s=%s: %v", operation, uid, field, slot, err)
+				log.Warnf("ConsumeSlotReclaim uid=%d slot=%s: %v", uid, slot, err)
 				return false, ""
 			}
 			return ok, targetSlot

@@ -80,8 +80,6 @@ type UserResponse struct {
 	SpeedLimit  float64 `json:"node_speedlimit"`
 	DeviceLimit int     `json:"node_connector"`
 	UUID        string  `json:"uuid"`
-	OnlineCount int     `json:"online_count"`
-	AliveIP     int     `json:"alive_ip"`
 }
 
 // Response is the common response

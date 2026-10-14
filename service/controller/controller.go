@@ -783,7 +783,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 		}
 	}
 
-	// Report Online info（空列表也上报，供面板按节点全量同步并清零 LastReportOnline）
+	// Report Online info
 	if onlineDevice, err := c.GetOnlineDevice(c.Tag); err != nil {
 		c.logger.Print(err)
 	} else {
