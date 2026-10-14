@@ -10,8 +10,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/go-acme/lego/v4/certcrypto"
-	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v5/certcrypto"
+	"github.com/go-acme/lego/v5/certificate"
 	"golang.org/x/net/idna"
 )
 
@@ -56,7 +56,7 @@ func (s *CertificatesStorage) GetRootPath() string {
 }
 
 func (s *CertificatesStorage) SaveResource(certRes *certificate.Resource) {
-	domain := certRes.Domain
+	domain := certRes.Domains[0]
 
 	// We store the certificate, private key and metadata in different files
 	// as web servers would not be able to work with a combined file.
@@ -107,12 +107,18 @@ func (s *CertificatesStorage) ReadResource(domain string) certificate.Resource {
 		log.Panicf("Error while loading the meta data for domain %s\n\t%v", domain, err)
 	}
 
-	var resource certificate.Resource
+	var resource struct {
+		certificate.Resource
+		Domain string `json:"domain"`
+	}
 	if err = json.Unmarshal(raw, &resource); err != nil {
 		log.Panicf("Error while marshaling the meta data for domain %s\n\t%v", domain, err)
 	}
 
-	return resource
+	if len(resource.Domains) == 0 && resource.Domain != "" {
+		resource.Domains = []string{resource.Domain}
+	}
+	return resource.Resource
 }
 
 func (s *CertificatesStorage) ExistsFile(domain, extension string) bool {

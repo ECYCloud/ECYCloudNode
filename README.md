@@ -102,11 +102,22 @@ Xray 的落盘计费接在实际出站转发路径，上行与下行均在交付
 
 ## 编译
 
-需要 Go 1.27.1+（见 `go.mod`）：
+需要 Go 1.27.2+（见 `go.mod`）：
 
 ```bash
-go build -tags with_quic -o ECYCloudNode .
+go run ./tools/prepare-xray.go /tmp/ecycloud-node-build
+go build -modfile=/tmp/ecycloud-node-build/go.mod -tags with_quic -o ECYCloudNode .
 ./ECYCloudNode version
+```
+
+准备工具仅对 Xray `v1.260327.0` 且源码哈希匹配的版本应用既有 TLS 补丁。其他 Xray 版本自动停用旧补丁，使用 `go.mod` 指定的官方模块，并删除内容哈希匹配的 `patches/xray-tls-config.patch`；复用构建目录时也不会沿用旧内核替换。补丁已不存在时可重复运行，内容已改动或读取、删除失败时停止并报错。其他补丁、准备工具及旧源码副本不自动删除。
+
+版本变化不代表上游已修复 OCSP，升级后须在未打补丁的内核上通过本地 OCSP 和完整回归；回退绑定版本前须恢复已验证的补丁文件。官方模块缓存和项目 `go.mod` / `go.sum` 保持原样。
+
+Windows 本机使用 `D:\tmp\ecycloud-node-build`；交叉编译时先按宿主平台运行准备工具，再设置目标 `GOOS` / `GOARCH`。本地回归使用相同的 `-modfile`：
+
+```bash
+go test -modfile=/tmp/ecycloud-node-build/go.mod -tags with_quic -count=1 ./...
 ```
 
 Release 构建见 [`.github/workflows/release.yml`](./.github/workflows/release.yml)。

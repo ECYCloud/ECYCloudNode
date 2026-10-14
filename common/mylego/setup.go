@@ -1,18 +1,19 @@
 package mylego
 
 import (
+	"context"
 	"os"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/go-acme/lego/v4/certcrypto"
-	"github.com/go-acme/lego/v4/challenge/dns01"
-	"github.com/go-acme/lego/v4/challenge/http01"
-	"github.com/go-acme/lego/v4/challenge/tlsalpn01"
-	"github.com/go-acme/lego/v4/lego"
-	"github.com/go-acme/lego/v4/providers/dns"
-	"github.com/go-acme/lego/v4/registration"
+	"github.com/go-acme/lego/v5/certcrypto"
+	"github.com/go-acme/lego/v5/challenge/dns01"
+	"github.com/go-acme/lego/v5/challenge/http01"
+	"github.com/go-acme/lego/v5/challenge/tlsalpn01"
+	"github.com/go-acme/lego/v5/lego"
+	"github.com/go-acme/lego/v5/providers/dns"
+	"github.com/go-acme/lego/v5/registration"
 	"golang.org/x/crypto/acme"
 )
 
@@ -29,19 +30,16 @@ func setup(accountsStorage *AccountsStorage) (*Account, *lego.Client) {
 		account = &Account{Email: accountsStorage.GetUserID(), key: privateKey}
 	}
 
-	client := newClient(account, keyType)
+	client := newClient(account)
 
 	return account, client
 }
 
-func newClient(acc registration.User, keyType certcrypto.KeyType) *lego.Client {
+func newClient(acc registration.User) *lego.Client {
 	config := lego.NewConfig(acc)
 	config.CADirURL = acme.LetsEncryptURL
 
-	config.Certificate = lego.CertificateConfig{
-		KeyType: keyType,
-		Timeout: 30 * time.Second,
-	}
+	config.Certificate.Timeout = 30 * time.Second
 	config.UserAgent = "lego-cli/dev"
 
 	client, err := lego.NewClient(config)
@@ -81,6 +79,9 @@ func setupChallenges(l *LegoCMD, client *lego.Client) {
 }
 
 func setupDNS(p string, client *lego.Client) {
+	opts := dns01.NewOptions()
+	opts.Timeout = 60 * time.Second
+	dns01.SetDefaultClient(dns01.NewClient(opts))
 	provider, err := dns.NewDNSChallengeProviderByName(p)
 	if err != nil {
 		log.Panic(err)
@@ -88,9 +89,8 @@ func setupDNS(p string, client *lego.Client) {
 
 	err = client.Challenge.SetDNS01Provider(
 		provider,
-		dns01.AddDNSTimeout(60*time.Second),
 		dns01.DisableAuthoritativeNssPropagationRequirement(),
-		dns01.WrapPreCheck(func(domain, fqdn, value string, check dns01.PreCheckFunc) (bool, error) {
+		dns01.WrapPreCheck(func(ctx context.Context, domain, fqdn, value string, check dns01.PreCheckFunc) (bool, error) {
 			log.Infof("DNS record created, waiting 60s for propagation before verification...")
 			time.Sleep(60 * time.Second)
 			return true, nil

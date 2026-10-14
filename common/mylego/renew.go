@@ -1,15 +1,13 @@
 package mylego
 
 import (
-	"crypto"
 	"crypto/x509"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/go-acme/lego/v4/certcrypto"
-	"github.com/go-acme/lego/v4/certificate"
-	"github.com/go-acme/lego/v4/lego"
+	"github.com/go-acme/lego/v5/certcrypto"
+	"github.com/go-acme/lego/v5/lego"
 )
 
 func (l *LegoCMD) Renew() (bool, error) {
@@ -44,13 +42,7 @@ func renewForDomains(domain string, client *lego.Client, certsStorage *Certifica
 
 	certDomains := certcrypto.ExtractDomains(cert)
 
-	var privateKey crypto.PrivateKey
-	request := certificate.ObtainRequest{
-		Domains:    certDomains,
-		Bundle:     true,
-		PrivateKey: privateKey,
-	}
-	certRes, err := client.Certificate.Obtain(request)
+	certRes, err := obtainCertificate(certDomains, client)
 	if err != nil {
 		log.Panic(err)
 	}

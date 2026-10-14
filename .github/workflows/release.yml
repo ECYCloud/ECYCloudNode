@@ -9,6 +9,7 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "patches/**"
       - ".github/workflows/*.yml"
   pull_request:
     types: [ opened, synchronize, reopened ]
@@ -16,6 +17,7 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "patches/**"
       - ".github/workflows/*.yml"
   release:
     types: [ published ]
@@ -145,16 +147,18 @@ jobs:
           max_attempts: 3
           command: go mod download
 
+      - name: Prepare Xray build dependencies
+        run: GOOS= GOARCH= GOARM= go run ./tools/prepare-xray.go "$RUNNER_TEMP/ecycloud-node-build"
 
       - name: Build ECYCloudNode
         run: |
           mkdir -p build_assets
-          go build -v -o build_assets/ECYCloudNode -trimpath -tags "with_quic" -ldflags "-s -w -buildid= -X github.com/ECYCloud/ECYCloudNode/cmd.version=${VERSION}"
+          go build -modfile="$RUNNER_TEMP/ecycloud-node-build/go.mod" -v -o build_assets/ECYCloudNode -trimpath -tags "with_quic" -ldflags "-s -w -buildid= -X github.com/ECYCloud/ECYCloudNode/cmd.version=${VERSION}"
 
       - name: Build Mips softfloat ECYCloudNode
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
         run: |
-          GOMIPS=softfloat go build -v -o build_assets/ECYCloudNode_softfloat -trimpath -tags "with_quic" -ldflags "-s -w -buildid= -X github.com/ECYCloud/ECYCloudNode/cmd.version=${VERSION}"
+          GOMIPS=softfloat go build -modfile="$RUNNER_TEMP/ecycloud-node-build/go.mod" -v -o build_assets/ECYCloudNode_softfloat -trimpath -tags "with_quic" -ldflags "-s -w -buildid= -X github.com/ECYCloud/ECYCloudNode/cmd.version=${VERSION}"
       - name: Rename Windows ECYCloudNode
         if: matrix.goos == 'windows'
         run: |

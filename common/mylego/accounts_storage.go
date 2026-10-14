@@ -1,11 +1,10 @@
 package mylego
 
 import (
+	"context"
 	"crypto"
-	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,9 +12,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/go-acme/lego/v4/certcrypto"
-	"github.com/go-acme/lego/v4/lego"
-	"github.com/go-acme/lego/v4/registration"
+	"github.com/go-acme/lego/v5/certcrypto"
+	"github.com/go-acme/lego/v5/lego"
 	"golang.org/x/crypto/acme"
 )
 
@@ -120,7 +118,7 @@ func (s *AccountsStorage) Save(account *Account) error {
 	return os.WriteFile(s.accountFilePath, jsonBytes, filePerm)
 }
 
-func (s *AccountsStorage) LoadAccount(privateKey crypto.PrivateKey) *Account {
+func (s *AccountsStorage) LoadAccount(privateKey crypto.Signer) *Account {
 	fileBytes, err := os.ReadFile(s.accountFilePath)
 	if err != nil {
 		log.Panicf("Could not load file for account %s: %v", s.userID, err)
@@ -150,7 +148,7 @@ func (s *AccountsStorage) LoadAccount(privateKey crypto.PrivateKey) *Account {
 	return &account
 }
 
-func (s *AccountsStorage) GetPrivateKey(keyType certcrypto.KeyType) crypto.PrivateKey {
+func (s *AccountsStorage) GetPrivateKey(keyType certcrypto.KeyType) crypto.Signer {
 	accKeyPath := filepath.Join(s.keysPath, s.userID+".key")
 
 	if _, err := os.Stat(accKeyPath); os.IsNotExist(err) {
@@ -180,7 +178,7 @@ func (s *AccountsStorage) createKeysFolder() {
 	}
 }
 
-func generatePrivateKey(file string, keyType certcrypto.KeyType) (crypto.PrivateKey, error) {
+func generatePrivateKey(file string, keyType certcrypto.KeyType) (crypto.Signer, error) {
 	privateKey, err := certcrypto.GeneratePrivateKey(keyType)
 	if err != nil {
 		return nil, err
@@ -203,25 +201,16 @@ func generatePrivateKey(file string, keyType certcrypto.KeyType) (crypto.Private
 	return privateKey, nil
 }
 
-func loadPrivateKey(file string) (crypto.PrivateKey, error) {
+func loadPrivateKey(file string) (crypto.Signer, error) {
 	keyBytes, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
 
-	keyBlock, _ := pem.Decode(keyBytes)
-
-	switch keyBlock.Type {
-	case "RSA PRIVATE KEY":
-		return x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
-	case "EC PRIVATE KEY":
-		return x509.ParseECPrivateKey(keyBlock.Bytes)
-	}
-
-	return nil, errors.New("unknown private key type")
+	return certcrypto.ParsePEMPrivateKey(keyBytes)
 }
 
-func tryRecoverRegistration(privateKey crypto.PrivateKey) (*registration.Resource, error) {
+func tryRecoverRegistration(privateKey crypto.Signer) (*accountRegistration, error) {
 	// couldn't load account but got a key. Try to look the account up.
 	config := lego.NewConfig(&Account{key: privateKey})
 	config.CADirURL = acme.LetsEncryptURL
@@ -232,9 +221,9 @@ func tryRecoverRegistration(privateKey crypto.PrivateKey) (*registration.Resourc
 		return nil, err
 	}
 
-	reg, err := client.Registration.ResolveAccountByKey()
+	reg, err := client.Registration.ResolveAccountByKey(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	return reg, nil
+	return &accountRegistration{Body: reg.Account, URI: reg.Location}, nil
 }

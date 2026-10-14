@@ -1,0 +1,138 @@
+# Xray-core v1.260327.0，MPL-2.0；仅修复 TLS 证书与 OCSP 热更新。
+--- a/transport/internet/tls/config.go
++++ b/transport/internet/tls/config.go
+@@ -11,6 +11,7 @@
+ 	"slices"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/xtls/xray-core/common/errors"
+@@ -19,6 +20,7 @@
+ 	"github.com/xtls/xray-core/common/platform/filesystem"
+ 	"github.com/xtls/xray-core/common/protocol/tls/cert"
+ 	"github.com/xtls/xray-core/transport/internet"
++	"google.golang.org/protobuf/proto"
+ )
+ 
+ var globalSessionCache = tls.NewLRUClientSessionCache(128)
+@@ -47,11 +49,21 @@
+ 
+ // BuildCertificates builds a list of TLS certificates from proto definition.
+ func (c *Config) BuildCertificates() []*tls.Certificate {
+-	certs := make([]*tls.Certificate, 0, len(c.Certificate))
++	stores := c.buildCertificates()
++	certs := make([]*tls.Certificate, 0, len(stores))
++	for _, store := range stores {
++		certs = append(certs, store.Load())
++	}
++	return certs
++}
++
++func (c *Config) buildCertificates() []*atomic.Pointer[tls.Certificate] {
++	certs := make([]*atomic.Pointer[tls.Certificate], 0, len(c.Certificate))
+ 	for _, entry := range c.Certificate {
+ 		if entry.Usage != Certificate_ENCIPHERMENT {
+ 			continue
+ 		}
++		entry := proto.Clone(entry).(*Certificate)
+ 		getX509KeyPair := func() *tls.Certificate {
+ 			keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
+ 			if err != nil {
+@@ -65,14 +77,15 @@
+ 			}
+ 			return &keyPair
+ 		}
++		store := new(atomic.Pointer[tls.Certificate])
+ 		if keyPair := getX509KeyPair(); keyPair != nil {
+-			certs = append(certs, keyPair)
++			store.Store(keyPair)
++			certs = append(certs, store)
+ 		} else {
+ 			continue
+ 		}
+-		index := len(certs) - 1
+ 		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
+-			cert := certs[index]
++			cert := store.Load()
+ 			if isReloaded {
+ 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
+ 					cert = newKeyPair
+@@ -84,10 +97,12 @@
+ 				if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
+ 					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
+ 				} else if string(newOCSPData) != string(cert.OCSPStaple) {
+-					cert.OCSPStaple = newOCSPData
+-				}
+-			}
+-			certs[index] = cert
++					updated := *cert
++					updated.OCSPStaple = newOCSPData
++					cert = &updated
++				}
++			}
++			store.Store(cert)
+ 		})
+ 	}
+ 	return certs
+@@ -111,14 +126,9 @@
+ 				newCert, err := filesystem.ReadCert(entry.CertificatePath)
+ 				if err != nil {
+ 					errors.LogErrorInner(context.Background(), err, "failed to parse certificate")
+-					return
+-				}
+-				newKey, err := filesystem.ReadCert(entry.KeyPath)
+-				if err != nil {
++				} else if newKey, err := filesystem.ReadCert(entry.KeyPath); err != nil {
+ 					errors.LogErrorInner(context.Background(), err, "failed to parse key")
+-					return
+-				}
+-				if string(newCert) != string(entry.Certificate) || string(newKey) != string(entry.Key) {
++				} else if string(newCert) != string(entry.Certificate) || string(newKey) != string(entry.Key) {
+ 					entry.Certificate = newCert
+ 					entry.Key = newKey
+ 					isReloaded = true
+@@ -243,20 +253,21 @@
+ 	}
+ }
+ 
+-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
++func getNewGetCertificateFunc(certs []*atomic.Pointer[tls.Certificate], rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+ 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+ 		if len(certs) == 0 {
+ 			return nil, errNoCertificates
+ 		}
+ 		sni := strings.ToLower(hello.ServerName)
+ 		if !rejectUnknownSNI && (len(certs) == 1 || sni == "") {
+-			return certs[0], nil
++			return certs[0].Load(), nil
+ 		}
+ 		gsni := "*"
+ 		if index := strings.IndexByte(sni, '.'); index != -1 {
+ 			gsni += sni[index:]
+ 		}
+-		for _, keyPair := range certs {
++		for _, store := range certs {
++			keyPair := store.Load()
+ 			if keyPair.Leaf.Subject.CommonName == sni || keyPair.Leaf.Subject.CommonName == gsni {
+ 				return keyPair, nil
+ 			}
+@@ -269,7 +280,7 @@
+ 		if rejectUnknownSNI {
+ 			return nil, errNoCertificates
+ 		}
+-		return certs[0], nil
++		return certs[0].Load(), nil
+ 	}
+ }
+ 
+@@ -409,7 +420,7 @@
+ 	if len(caCerts) > 0 {
+ 		config.GetCertificate = getGetCertificateFunc(config, caCerts)
+ 	} else {
+-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
++		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificates(), c.RejectUnknownSni)
+ 	}
+ 
+ 	if sn := c.parseServerName(); len(sn) > 0 {

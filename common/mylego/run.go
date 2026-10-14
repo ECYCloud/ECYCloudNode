@@ -1,11 +1,13 @@
 package mylego
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/go-acme/lego/v4/certificate"
-	"github.com/go-acme/lego/v4/lego"
-	"github.com/go-acme/lego/v4/registration"
+	"github.com/go-acme/lego/v5/certcrypto"
+	"github.com/go-acme/lego/v5/certificate"
+	"github.com/go-acme/lego/v5/lego"
+	"github.com/go-acme/lego/v5/registration"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -27,12 +29,12 @@ func (l *LegoCMD) Run() error {
 	setupChallenges(l, client)
 
 	if account.Registration == nil {
-		reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+		reg, err := client.Registration.Register(context.Background(), registration.RegisterOptions{TermsOfServiceAgreed: true})
 		if err != nil {
 			log.Panicf("Could not complete registration\n\t%v", err)
 		}
 
-		account.Registration = reg
+		account.Registration = &accountRegistration{Body: reg.Account, URI: reg.Location}
 		if err = accountsStorage.Save(account); err != nil {
 			log.Panic(err)
 		}
@@ -59,10 +61,12 @@ func obtainCertificate(domains []string, client *lego.Client) (*certificate.Reso
 	if len(domains) > 0 {
 		// obtain a certificate, generating a new private key
 		request := certificate.ObtainRequest{
-			Domains: domains,
-			Bundle:  true,
+			Domains:          domains,
+			Bundle:           true,
+			KeyType:          certcrypto.EC256,
+			EnableCommonName: true,
 		}
-		return client.Certificate.Obtain(request)
+		return client.Certificate.Obtain(context.Background(), request)
 	}
 	return nil, fmt.Errorf("not a valid domain")
 }
