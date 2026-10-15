@@ -102,16 +102,14 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 		return
 	}
 
+	h.globalChecker.SyncUsers(userInfo, h.tag)
 	h.mu.Lock()
-	defer func() {
-		h.mu.Unlock()
-		h.globalChecker.SyncUsers(userInfo)
-	}()
+	defer h.mu.Unlock()
+	accountSlots := L.ReconcileDeviceSlots(h.onlineSlots, h.slotLastActive, *userInfo)
 
 	newUsers := make(map[string]userRecord, len(*userInfo))
 	newRateLimiters := make(map[string]*rate.Limiter)
 	accountLimiters := make(map[int]*rate.Limiter)
-	accountSlots := make(map[int]L.DeviceSlots)
 
 	var nodeLimit uint64
 	if h.nodeInfo != nil {

@@ -20,17 +20,15 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 		return
 	}
 
+	s.globalChecker.SyncUsers(userInfo, s.tag)
 	s.mu.Lock()
-	defer func() {
-		s.mu.Unlock()
-		s.globalChecker.SyncUsers(userInfo)
-	}()
+	defer s.mu.Unlock()
+	accountSlots := limiter.ReconcileDeviceSlots(s.onlineSlots, s.slotLastActive, *userInfo)
 
 	newUsers := make(map[string]userRecord, len(*userInfo))
 	authUsers := make([]option.AnyTLSUser, 0, len(*userInfo)*2)
 	newRateLimiters := make(map[string]*rate.Limiter)
 	accountLimiters := make(map[int]*rate.Limiter)
-	accountSlots := make(map[int]limiter.DeviceSlots)
 
 	var nodeLimit uint64
 	if s.nodeInfo != nil {
@@ -166,11 +164,31 @@ func (s *AnyTLSService) slot(uuid, host string, version ...uint64) (string, user
 	return limiter.OnlineKey(user.ClientID, host), user, true
 }
 
+func (s *AnyTLSService) currentDeviceLimit(uuid, host string, version uint64) (int, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, user, ok := s.slot(uuid, host, version)
+	return user.DeviceLimit, ok
+}
+
 func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 	s.mu.Lock()
 
 	slot, user, ok := s.slot(uuid, host)
 	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	s.mu.Unlock()
+	allowed := s.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, true, func() (int, bool) {
+		return s.currentDeviceLimit(uuid, host, user.KickVersion)
+	}, s.tag)
+	if !allowed {
+		s.releaseOnline(uuid, host, user.KickVersion)
+		return false
+	}
+	s.mu.Lock()
+	if _, _, ok := s.slot(uuid, host, user.KickVersion); !ok {
 		s.mu.Unlock()
 		return false
 	}
@@ -188,7 +206,13 @@ func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 		s.slotLastActive[uuid] = activeMap
 	}
 
-	allowed, grant := limiter.AdmitDeviceSlot(&s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit)
+	allowed, _ = limiter.AdmitDeviceSlot(&s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
+		_, latest, ok := s.slot(uuid, host, user.KickVersion)
+		if s.globalChecker != nil {
+			return 0, ok
+		}
+		return latest.DeviceLimit, ok
+	})
 	s.mu.Unlock()
 	if !allowed {
 		s.logger.WithFields(log.Fields{
@@ -196,17 +220,6 @@ func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 			"deviceLimit": user.DeviceLimit,
 			"remote":      host,
 		}).Warn("AnyTLS user exceeded device limit")
-		return false
-	}
-
-	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if !s.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}) {
-		s.releaseOnline(uuid, host, user.KickVersion)
-		s.logger.WithFields(log.Fields{
-			"uid":         user.UID,
-			"deviceLimit": user.DeviceLimit,
-			"remote":      host,
-		}).Warn("AnyTLS user exceeded global device limit")
 		return false
 	}
 
@@ -222,7 +235,11 @@ func (s *AnyTLSService) ensureOnline(uuid, host string, version ...uint64) bool 
 		s.mu.Unlock()
 		return false
 	}
-	online, due := limiter.EnsureDeviceSlot(s.onlineSlots, s.slotLastActive, uuid, slot, user.DeviceLimit)
+	localLimit := user.DeviceLimit
+	if s.globalChecker != nil {
+		localLimit = 0
+	}
+	online, due := limiter.EnsureDeviceSlot(s.onlineSlots, s.slotLastActive, uuid, slot, localLimit)
 	s.mu.Unlock()
 
 	if !online {
@@ -232,7 +249,9 @@ func (s *AnyTLSService) ensureOnline(uuid, host string, version ...uint64) bool 
 		return true
 	}
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if s.globalChecker.Refresh(user.UID, slot, user.DeviceLimit, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}) {
+	if s.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, false, func() (int, bool) {
+		return s.currentDeviceLimit(uuid, host, user.KickVersion)
+	}, s.tag) {
 		return true
 	}
 	// 被全局挤出的名额不能留在本地账本继续占位，与 allowConnection 同口径
@@ -252,13 +271,19 @@ func (s *AnyTLSService) releaseOnline(uuid, host string, version uint64) {
 // verifyOnline 下行方向（远端→客户端）的周期性复查：只核查不续期。
 func (s *AnyTLSService) verifyOnline(uuid, host string, version ...uint64) bool {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	slot, user, ok := s.slot(uuid, host, version...)
+	localAllowed := limiter.VerifyDeviceSlot(s.slotLastActive[uuid], slot, user.DeviceLimit)
+	s.mu.RUnlock()
 	if !ok {
 		return false
 	}
-	return limiter.VerifyDeviceSlot(s.slotLastActive[uuid], slot, user.DeviceLimit)
+	if s.globalChecker != nil {
+		return s.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: s.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
+			return s.currentDeviceLimit(uuid, host, user.KickVersion)
+		})
+	}
+	return localAllowed
 }
 
 func (s *AnyTLSService) collectUsage() []api.OnlineUser {
@@ -351,13 +376,10 @@ func (s *AnyTLSService) userMonitor() error {
 	}
 	if usersChanged {
 		s.syncUsers(newUserInfo)
-		// 被删用户已由 allowConnection 拦住，但新增凭据过不了 sing-box 的认证，
-		// 必须重建 inbound 才能连上；已置位待重建时交给 nodeMonitor 按退避重试，
-		// 那次重建同样会带上最新凭据，这里再触发一次只会绕开退避。
-		if s.hasUnbuiltAuthUser() && !s.awaitingRebuild() {
-			if err := s.reloadNode(s.currentNodeInfo()); err != nil {
-				s.logger.Errorf("AnyTLS rebuild for new users failed: %v", err)
-			}
+	}
+	if (usersChanged || s.hasUnbuiltAuthUser()) && !s.awaitingRebuild() {
+		if err := s.updateInboundUsers(); err != nil {
+			s.logger.Errorf("AnyTLS user update failed: %v", err)
 		}
 	}
 

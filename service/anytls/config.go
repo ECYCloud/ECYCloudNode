@@ -6,6 +6,7 @@ import (
 	"net/netip"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -33,7 +34,9 @@ func (s *AnyTLSService) buildSingBox() (*box.Box, string, error) {
 	}
 
 	ctx := context.Background()
-	ctx = box.Context(ctx, include.InboundRegistry(), include.OutboundRegistry(), include.EndpointRegistry(), include.DNSTransportRegistry(), include.ServiceRegistry(), include.CertificateProviderRegistry())
+	registry := include.InboundRegistry()
+	inbound.Register[option.AnyTLSInboundOptions](registry, "anytls", newDeviceInbound)
+	ctx = box.Context(ctx, registry, include.OutboundRegistry(), include.EndpointRegistry(), include.DNSTransportRegistry(), include.ServiceRegistry(), include.CertificateProviderRegistry())
 
 	opts := option.Options{
 		Log: &option.LogOptions{
@@ -116,13 +119,7 @@ func (s *AnyTLSService) buildSingBox() (*box.Box, string, error) {
 		s.frontListener = nil
 	}
 
-	built := make(map[string]struct{}, len(users))
-	for _, u := range users {
-		built[u.Name] = struct{}{}
-	}
-	s.mu.Lock()
-	s.builtAuthUsers = built
-	s.mu.Unlock()
+	s.recordBuiltUsers(users)
 
 	return boxInstance, s.inboundTag, nil
 }

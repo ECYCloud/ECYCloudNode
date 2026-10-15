@@ -51,6 +51,36 @@ type DeviceSlots struct {
 	Active map[string]time.Time
 }
 
+func ReconcileDeviceSlots(slots map[string]map[string]struct{}, active map[string]map[string]time.Time, users []api.UserInfo) map[int]DeviceSlots {
+	valid := make(map[string]bool)
+	for _, user := range users {
+		if user.ClientID != 0 {
+			valid[OnlineKey(user.ClientID, "")] = true
+		}
+	}
+	for key, entries := range active {
+		for slot := range entries {
+			if IsClientOnlineKey(slot) && !valid[slot] {
+				delete(entries, slot)
+				delete(slots[key], slot)
+			}
+		}
+	}
+	shared := make(map[int]DeviceSlots)
+	for _, user := range users {
+		if user.ClientID == 0 {
+			continue
+		}
+		for _, key := range []string{user.UUID, user.Passwd} {
+			if slots[key] != nil && active[key] != nil {
+				shared[user.UID] = DeviceSlots{Slots: slots[key], Active: active[key]}
+				break
+			}
+		}
+	}
+	return shared
+}
+
 // ShareAccountSlots 让同一账号的官方设备共用一份名额账本。官方客户端每台设备各有
 // 独立认证凭据，若各记一本就数不出「该账号几台在线」；第三方仍按认证凭据各自独立，
 // 与官方分开记账，两组各自使用同一个上限。
@@ -113,11 +143,19 @@ func PurgeStaleDeviceSlots(onlineSlots map[string]struct{}, activeMap map[string
 // 调用方须持 mu 进入，返回时仍持 mu：取确认是一次对面板的 HTTP 调用，不能持锁等待，
 // 这里会解锁去取、取回后重新加锁并重数一遍再踢。
 // 第二个返回值是本次消耗到的确认，供全局限制复用，避免再查一次授权。
-func AdmitDeviceSlot(mu sync.Locker, onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int) (allowed bool, grant ReclaimGrant) {
+func AdmitDeviceSlot(mu sync.Locker, onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int, current ...func() (int, bool)) (allowed bool, grant ReclaimGrant) {
 	if slot == "" {
 		return false, grant
 	}
+	grantChecked := false
 	for {
+		if len(current) > 0 {
+			var authorized bool
+			deviceLimit, authorized = current[0]()
+			if !authorized {
+				return false, grant
+			}
+		}
 		fresh := PurgeStaleDeviceSlots(onlineSlots, activeMap, OnlineSlotExpiry)
 		if _, exists := onlineSlots[slot]; exists {
 			activeMap[slot] = time.Now()
@@ -128,12 +166,13 @@ func AdmitDeviceSlot(mu sync.Locker, onlineSlots map[string]struct{}, activeMap 
 				return false, grant
 			}
 			if !grant.Granted {
-				mu.Unlock()
-				grant = ConsumeReclaimGrant(uid, slot)
-				mu.Lock()
-				if !grant.Granted {
+				if grantChecked {
 					return false, grant
 				}
+				mu.Unlock()
+				grant = ConsumeReclaimGrant(uid, slot)
+				grantChecked = true
+				mu.Lock()
 				continue
 			}
 			// 用户只选了一个，名额缺口不止一个时其余继续踢最旧的

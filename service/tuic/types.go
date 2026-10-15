@@ -42,8 +42,6 @@ type TuicService struct {
 	slotLastActive map[string]map[string]time.Time // authKey -> slot -> last active time
 	authUsers      []option.TUICUser               // users for sing-box TUIC authentication
 	rateLimiters   map[string]*rate.Limiter        // authKey -> per-user speed limiter
-	// builtAuthUsers 是运行中的 inbound 实际认识的凭据。sing-box 的 TUIC
-	// inbound 在构造时就固化用户表且没有在线更新入口，靠它判断是否必须重建。
 	builtAuthUsers map[string]struct{}
 	// rebuildPending 记录「inbound 尚未按 nodeInfo 跑起来」。面板随后会返回 304，
 	// 届时既没有新配置可比，DeepEqual 也判不出重建没走完。

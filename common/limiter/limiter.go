@@ -22,6 +22,7 @@ const (
 )
 
 type UserInfo struct {
+	Scope       string
 	ValidUntil  int64
 	KickVersion uint64
 	UID         int
@@ -93,7 +94,7 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 		})
 	}
 	inboundInfo.UserInfo = userMap
-	inboundInfo.GlobalLimit.SyncUsers(userList)
+	inboundInfo.GlobalLimit.SyncUsers(userList, tag)
 	l.InboundInfo.Store(tag, inboundInfo) // Replace the old inbound info
 	return nil
 }
@@ -118,6 +119,11 @@ func (l *Limiter) TrafficRecorder(tag, userKey string) func(int64, int64) error 
 func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserInfo, replace ...bool) error {
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
+		if len(replace) > 0 && replace[0] {
+			inboundInfo.GlobalLimit.SyncUsers(updatedUserList, tag)
+		} else {
+			inboundInfo.GlobalLimit.SyncUsers(updatedUserList)
+		}
 		inboundInfo.slotMu.Lock()
 		if len(replace) > 0 && replace[0] {
 			keys := make(map[string]bool, len(*updatedUserList))
@@ -126,6 +132,10 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 			}
 			inboundInfo.UserInfo.Range(func(key, value any) bool {
 				if !keys[key.(string)] {
+					old := value.(UserInfo)
+					if slots, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, old.UID, old.ClientID)); ok && old.ClientID != 0 {
+						slots.(*sync.Map).Delete(OnlineKey(old.ClientID, ""))
+					}
 					inboundInfo.UserInfo.Delete(key)
 				}
 				return true
@@ -154,7 +164,6 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 			inboundInfo.updateRateBucket(userKey, u.UID, u.ClientID, u.SpeedLimit)
 		}
 		inboundInfo.slotMu.Unlock()
-		inboundInfo.GlobalLimit.SyncUsers(updatedUserList)
 	} else {
 		return fmt.Errorf("no such inbound in limiter: %s", tag)
 	}
@@ -307,13 +316,30 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 	}
 	slot := OnlineKey(clientID, ip)
 	bucket := onlineBucket(inboundInfo.Tag, uid, clientID)
+	current := func() (int, bool) { return inboundInfo.currentDeviceLimit(userKey, user.KickVersion) }
+	if !inboundInfo.GlobalLimit.CheckCurrent(uid, slot, user, true, current, inboundInfo.Tag) {
+		if slots, ok := inboundInfo.UserOnlineSlots.Load(bucket); ok {
+			inboundInfo.releaseRejectedSlot(userKey, slot, slots.(*sync.Map), user.KickVersion)
+		}
+		return false
+	}
 
 	var (
-		grant   ReclaimGrant
-		slotMap *sync.Map
+		grant        ReclaimGrant
+		grantChecked bool
+		slotMap      *sync.Map
 	)
 	inboundInfo.slotMu.Lock()
 	for {
+		var authorized bool
+		deviceLimit, authorized = current()
+		if !authorized {
+			inboundInfo.slotMu.Unlock()
+			return false
+		}
+		if inboundInfo.GlobalLimit != nil {
+			deviceLimit = 0
+		}
 		now := time.Now().Unix()
 		v, _ := inboundInfo.UserOnlineSlots.LoadOrStore(bucket, new(sync.Map))
 		slotMap = v.(*sync.Map)
@@ -336,11 +362,14 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 				return false
 			}
 			if !grant.Granted {
-				// 取确认是一次对面板的 HTTP 调用，不能持锁等待；拿到后重新数一遍再踢
-				inboundInfo.slotMu.Unlock()
-				if grant = ConsumeReclaimGrant(uid, slot); !grant.Granted {
+				if grantChecked {
+					inboundInfo.slotMu.Unlock()
 					return false
 				}
+				// 取确认是一次对面板的 HTTP 调用，不能持锁等待；拿到后重新数一遍再踢
+				inboundInfo.slotMu.Unlock()
+				grant = ConsumeReclaimGrant(uid, slot)
+				grantChecked = true
 				inboundInfo.slotMu.Lock()
 				continue
 			}
@@ -362,11 +391,6 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 	}
 	inboundInfo.slotMu.Unlock()
 
-	// 全局（跨节点）限制
-	if !inboundInfo.GlobalLimit.Allow(uid, slot, deviceLimit, grant, user) {
-		inboundInfo.releaseRejectedSlot(userKey, slot, slotMap, user.KickVersion)
-		return false
-	}
 	return true
 }
 
@@ -418,19 +442,25 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	}
 	inboundInfo := value.(*InboundInfo)
 
-	var uid, deviceLimit, clientID int
+	var uid, clientID int
 	var user UserInfo
 	if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
 		u := v.(UserInfo)
 		user = u
 		uid = u.UID
-		deviceLimit = u.DeviceLimit
 		clientID = u.ClientID
 	}
 	slot := OnlineKey(clientID, ip)
+	current := func() (int, bool) { return inboundInfo.currentDeviceLimit(userKey, user.KickVersion) }
+	if !inboundInfo.GlobalLimit.CheckCurrent(uid, slot, user, false, current, inboundInfo.Tag) {
+		if v, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, uid, clientID)); ok {
+			inboundInfo.releaseRejectedSlot(userKey, slot, v.(*sync.Map), user.KickVersion)
+		}
+		return false
+	}
 
 	inboundInfo.slotMu.Lock()
-	if !l.VerifyOnline(tag, userKey, ip) {
+	if !l.AuthorizationAllowed(tag, userKey, user.KickVersion) || (inboundInfo.GlobalLimit == nil && !l.VerifyOnline(tag, userKey, ip)) {
 		inboundInfo.slotMu.Unlock()
 		return false
 	}
@@ -439,10 +469,6 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: time.Now().Unix()})
 	inboundInfo.slotMu.Unlock()
 
-	if !inboundInfo.GlobalLimit.Refresh(uid, slot, deviceLimit, user) {
-		inboundInfo.releaseRejectedSlot(userKey, slot, slotMap, user.KickVersion)
-		return false
-	}
 	return true
 }
 
@@ -469,8 +495,10 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 	inboundInfo := value.(*InboundInfo)
 
 	var uid, deviceLimit, clientID int
+	var user UserInfo
 	if v, ok := inboundInfo.UserInfo.Load(userKey); ok {
 		u := v.(UserInfo)
+		user = u
 		uid = u.UID
 		deviceLimit = u.DeviceLimit
 		clientID = u.ClientID
@@ -479,6 +507,12 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 		return true
 	}
 	slot := OnlineKey(clientID, ip)
+	if inboundInfo.GlobalLimit != nil {
+		user.Scope = tag
+		return inboundInfo.GlobalLimit.Verify(uid, slot, deviceLimit, user, func() (int, bool) {
+			return inboundInfo.currentDeviceLimit(userKey, user.KickVersion)
+		})
+	}
 
 	v, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, uid, clientID))
 	if !ok {
@@ -513,6 +547,15 @@ func (l *Limiter) KickVersion(tag, userKey string) uint64 {
 		}
 	}
 	return 0
+}
+
+func (info *InboundInfo) currentDeviceLimit(userKey string, version uint64) (int, bool) {
+	value, ok := info.UserInfo.Load(userKey)
+	if !ok {
+		return 0, false
+	}
+	user := value.(UserInfo)
+	return user.DeviceLimit, user.KickVersion == version && (user.ValidUntil == 0 || time.Now().Unix() < user.ValidUntil)
 }
 
 func (l *Limiter) AuthorizationAllowed(tag, userKey string, version ...uint64) bool {

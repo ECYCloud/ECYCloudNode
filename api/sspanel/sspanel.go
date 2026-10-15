@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -24,6 +25,7 @@ import (
 
 // APIClient create a api client to the panel.
 type APIClient struct {
+	clockOffset     atomic.Int64
 	trafficMu       sync.RWMutex
 	trafficReportMu sync.Mutex
 	trafficDir      string
@@ -387,7 +389,28 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		res, _ := json.Marshal(userListResponse)
 		return nil, fmt.Errorf("parse user list failed: %s", string(res))
 	}
+	// 授权期限与面板响应时间来自同一时钟；只在取得新列表时换算，不凭 304 续期。
+	if panelTime, err := strconv.ParseInt(res.Header().Get("X-ECY-Server-Time-Ms"), 10, 64); err == nil && panelTime > 0 {
+		now := time.Now()
+		c.clockOffset.Store(panelTime - now.UnixMilli())
+		for i := range *userList {
+			if (*userList)[i].ValidUntil != 0 {
+				remaining := (*userList)[i].ValidUntil*1000 - panelTime
+				if remaining <= 0 {
+					(*userList)[i].ValidUntil = now.Unix()
+				} else {
+					// 本地秒级期限向上取整，避免时钟小数部分导致提前失效。
+					(*userList)[i].ValidUntil = (now.UnixMilli() + remaining + 999) / 1000
+				}
+			}
+		}
+	}
 	return userList, nil
+}
+
+// OnlineClockOffset 返回面板时间减节点时间的毫秒差。
+func (c *APIClient) OnlineClockOffset() int64 {
+	return c.clockOffset.Load()
 }
 
 // ReportNodeStatus reports the node status to the ssPanel
@@ -669,7 +692,7 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 	var speedLimit uint64 = 0
 	var userList []api.UserInfo
 	for _, user := range *userInfoResponse {
-		if c.DeviceLimit > 0 {
+		if user.DeviceLimit > 0 && c.DeviceLimit > 0 {
 			deviceLimit = c.DeviceLimit
 		} else {
 			deviceLimit = user.DeviceLimit

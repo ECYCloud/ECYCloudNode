@@ -171,7 +171,7 @@ func (c *Controller) Start() error {
 		return err
 	}
 	// Update user
-	userInfo, err := c.apiClient.GetUserList()
+	userInfo, err := c.getUserList()
 	if err != nil {
 		return err
 	}
@@ -374,7 +374,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 
 	// Update User
 	var usersChanged = true
-	newUserInfo, err := c.apiClient.GetUserList()
+	newUserInfo, err := c.getUserList()
 	if err != nil {
 		if err.Error() == api.UserNotModified {
 			usersChanged = false
@@ -653,6 +653,16 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 	}
 	c.logger.Printf("Added %d new users", len(*userInfo))
 	return nil
+}
+
+func (c *Controller) getUserList() (*[]api.UserInfo, error) {
+	users, err := c.apiClient.GetUserList()
+	if err == nil {
+		if clock, ok := c.apiClient.(interface{ OnlineClockOffset() int64 }); ok {
+			limiter.NewGlobalDeviceChecker(c.config.GlobalDeviceLimitConfig).SetClockOffset(clock.OnlineClockOffset())
+		}
+	}
+	return users, err
 }
 
 func compareUserList(old, next *[]api.UserInfo) (deleted, added []api.UserInfo) {

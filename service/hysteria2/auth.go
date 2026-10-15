@@ -91,6 +91,19 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		}).Warn("Hysteria2 auth failed: unknown UUID")
 		return false, ""
 	}
+	a.svc.mu.Unlock()
+	allowed := a.svc.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, true, func() (int, bool) {
+		return a.svc.currentDeviceLimit(auth, host, user.KickVersion)
+	}, a.svc.tag)
+	if !allowed {
+		a.svc.releaseOnline("kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + authID(auth, host, user.UID))
+		return false, ""
+	}
+	a.svc.mu.Lock()
+	if _, _, ok := a.svc.slot(auth, host, user.KickVersion); !ok {
+		a.svc.mu.Unlock()
+		return false, ""
+	}
 
 	slotSet, ok := a.svc.onlineSlots[auth]
 	if !ok {
@@ -105,7 +118,13 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		a.svc.slotLastActive[auth] = activeMap
 	}
 
-	allowed, grant := limiter.AdmitDeviceSlot(&a.svc.mu, slotSet, activeMap, slot, user.UID, user.DeviceLimit)
+	allowed, _ = limiter.AdmitDeviceSlot(&a.svc.mu, slotSet, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
+		_, latest, ok := a.svc.slot(auth, host, user.KickVersion)
+		if a.svc.globalChecker != nil {
+			return 0, ok
+		}
+		return latest.DeviceLimit, ok
+	})
 	a.svc.mu.Unlock()
 	if !allowed {
 		logger.WithFields(log.Fields{
@@ -113,17 +132,6 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 			"deviceLimit": user.DeviceLimit,
 			"remote":      host,
 		}).Warn("Hysteria2 user exceeded device limit")
-		return false, ""
-	}
-
-	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if !a.svc.globalChecker.Allow(user.UID, slot, user.DeviceLimit, grant, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}) {
-		a.svc.releaseOnline("kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + authID(auth, host, user.UID))
-		logger.WithFields(log.Fields{
-			"uid":         user.UID,
-			"deviceLimit": user.DeviceLimit,
-			"remote":      host,
-		}).Warn("Hysteria2 user exceeded global device limit")
 		return false, ""
 	}
 
@@ -143,6 +151,13 @@ func (h *Hysteria2Service) slot(cred, host string, version ...uint64) (string, u
 	return limiter.OnlineKey(user.ClientID, host), user, true
 }
 
+func (h *Hysteria2Service) currentDeviceLimit(cred, host string, version uint64) (int, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, user, ok := h.slot(cred, host, version)
+	return user.DeviceLimit, ok
+}
+
 // ensureOnline 复查并续期该凭据持有的名额，闲置过期但尚有空余名额时重新登记；
 // 已被挤出且名额已满返回 false。
 func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bool {
@@ -152,7 +167,11 @@ func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bo
 		h.mu.Unlock()
 		return false
 	}
-	online, due := limiter.EnsureDeviceSlot(h.onlineSlots, h.slotLastActive, cred, slot, user.DeviceLimit)
+	localLimit := user.DeviceLimit
+	if h.globalChecker != nil {
+		localLimit = 0
+	}
+	online, due := limiter.EnsureDeviceSlot(h.onlineSlots, h.slotLastActive, cred, slot, localLimit)
 	h.mu.Unlock()
 
 	if !online {
@@ -162,7 +181,9 @@ func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bo
 		return true
 	}
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if h.globalChecker.Refresh(user.UID, slot, user.DeviceLimit, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}) {
+	if h.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, false, func() (int, bool) {
+		return h.currentDeviceLimit(cred, host, user.KickVersion)
+	}, h.tag) {
 		return true
 	}
 	// 被全局挤出的名额不能留在本地账本继续占位，与 Authenticate 同口径
@@ -175,13 +196,19 @@ func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bo
 // 无限续命、永不释放；但被挤出的设备必须断开，否则大文件下载之类的长连接能一直跑完。
 func (h *Hysteria2Service) verifyOnline(cred, host string, version ...uint64) bool {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 
 	slot, user, ok := h.slot(cred, host, version...)
+	localAllowed := limiter.VerifyDeviceSlot(h.slotLastActive[cred], slot, user.DeviceLimit)
+	h.mu.RUnlock()
 	if !ok {
 		return false
 	}
-	return limiter.VerifyDeviceSlot(h.slotLastActive[cred], slot, user.DeviceLimit)
+	if h.globalChecker != nil {
+		return h.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: h.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
+			return h.currentDeviceLimit(cred, host, user.KickVersion)
+		})
+	}
+	return localAllowed
 }
 
 // guardOnline 是存活会话的周期性复查入口：名额已被挤出时标记断开，
