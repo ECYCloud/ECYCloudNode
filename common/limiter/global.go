@@ -347,11 +347,12 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 
 	checker := &GlobalDeviceChecker{
 		client: redis.NewClient(&redis.Options{
-			Network:  config.RedisNetwork,
-			Addr:     config.RedisAddr,
-			Username: config.RedisUsername,
-			Password: config.RedisPassword,
-			DB:       config.RedisDB,
+			Network:               config.RedisNetwork,
+			Addr:                  config.RedisAddr,
+			Username:              config.RedisUsername,
+			Password:              config.RedisPassword,
+			DB:                    config.RedisDB,
+			ContextTimeoutEnabled: true,
 		}),
 		expiry:      int64(expiry),
 		timeout:     time.Duration(timeout) * time.Second,
