@@ -1,4 +1,5 @@
-# Xray-core v1.260327.0，MPL-2.0；仅修复 TLS 证书与 OCSP 热更新。
+# Xray-core v1.260327.0，MPL-2.0；修复 TLS/OCSP 热更新及 GHSA-5wf9-h793-w73c。
+# CA pin 修复来自上游 64fada32b5b9e6ae064a038fa0e4e2b766499bd5。
 --- a/transport/internet/tls/config.go
 +++ b/transport/internet/tls/config.go
 @@ -11,6 +11,7 @@
@@ -127,7 +128,17 @@
  	}
  }
  
-@@ -409,7 +420,7 @@
+@@ -331,6 +342,9 @@
+ 	}
+ 
+ 	if verifyResult == foundCA { // if found CA, we need to verify here
++		if len(r.Config.ServerName) == 0 {
++			return errors.New("Pinning CA needs a valid ServerName")
++		}
+ 		opts := x509.VerifyOptions{
+ 			Roots:         CAs,
+ 			CurrentTime:   time.Now(),
+@@ -409,7 +423,7 @@
  	if len(caCerts) > 0 {
  		config.GetCertificate = getGetCertificateFunc(config, caCerts)
  	} else {
@@ -136,3 +147,28 @@
  	}
  
  	if sn := c.parseServerName(); len(sn) > 0 {
+--- a/transport/internet/grpc/dial.go
++++ b/transport/internet/grpc/dial.go
+@@ -136,10 +136,7 @@
+ 				}
+ 
+ 				if tlsConfig != nil {
+-					config := tlsConfig.GetTLSConfig()
+-					if config.ServerName == "" && address.Family().IsDomain() {
+-						config.ServerName = address.Domain()
+-					}
++					config := tlsConfig.GetTLSConfig(tls.WithDestination(dest))
+ 					if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
+ 						return tls.UClient(c, config, fingerprint), nil
+ 					} else { // Fallback to normal gRPC TLS
+--- a/transport/internet/hysteria/dialer.go
++++ b/transport/internet/hysteria/dialer.go
+@@ -454,7 +454,7 @@
+ 			ctx:            ctx,
+ 			dest:           dest,
+ 			config:         config,
+-			tlsConfig:      tlsConfig.GetTLSConfig(),
++			tlsConfig:      tlsConfig.GetTLSConfig(tls.WithDestination(dest)),
+ 			socketConfig:   streamSettings.SocketSettings,
+ 			udpmaskManager: streamSettings.UdpmaskManager,
+ 			quicParams:     streamSettings.QuicParams,

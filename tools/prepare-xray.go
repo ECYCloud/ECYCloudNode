@@ -81,7 +81,7 @@ func prepare() error {
 		}
 		if err == nil {
 			patch = bytes.ReplaceAll(patch, []byte("\r\n"), []byte("\n"))
-			if fmt.Sprintf("%x", sha256.Sum256(patch)) != "428d482ec2e6f565c9f59c208003e3ca4e8645e86ef4778943f25001b36789b6" {
+			if fmt.Sprintf("%x", sha256.Sum256(patch)) != "1e10346cdba78951ca550cbf4a140732f3e1de31d48e87c1e5e670d9456f7b74" {
 				return fmt.Errorf("旧 TLS 补丁内容已改动，拒绝自动删除：%s", patchPath)
 			}
 			if err := os.Remove(patchPath); err != nil {
@@ -91,26 +91,44 @@ func prepare() error {
 		fmt.Printf("Xray %s：已停用旧 TLS 补丁并清理补丁文件，使用官方内核。\n", module.Version)
 		return nil
 	}
-	configPath := filepath.Join("transport", "internet", "tls", "config.go")
-	source, err := os.ReadFile(filepath.Join(module.Dir, configPath))
-	if err != nil {
-		return err
-	}
-	source = bytes.ReplaceAll(source, []byte("\r\n"), []byte("\n"))
-	if fmt.Sprintf("%x", sha256.Sum256(source)) != "331a74916d525934e9f955309455e572fab97f192e9f39cf592b8f79d997d774" {
-		return fmt.Errorf("Xray TLS 源文件与补丁基线不一致，停止构建")
-	}
 	patch, err := os.ReadFile(patchPath)
 	if err != nil {
 		return err
 	}
-	patched, err := applyPatch(source, patch)
-	if err != nil {
-		return err
+	patch = bytes.ReplaceAll(patch, []byte("\r\n"), []byte("\n"))
+	sourceHashes := map[string]string{
+		"transport/internet/tls/config.go":      "331a74916d525934e9f955309455e572fab97f192e9f39cf592b8f79d997d774",
+		"transport/internet/grpc/dial.go":       "95181bf33e1acc9a62a8303b95907da4ad911af6bf7fb19094f66b59c0b0da97",
+		"transport/internet/hysteria/dialer.go": "f7ee9e5d481034c1292f3649812494081e3f7b87597eac800d3142a3fecd0ffd",
 	}
-	patched, err = format.Source(patched)
-	if err != nil {
-		return err
+	sections := bytes.Split(patch, []byte("--- a/"))
+	if len(sections) != len(sourceHashes)+1 {
+		return fmt.Errorf("TLS 补丁文件数量与绑定基线不一致")
+	}
+	patchedFiles := make(map[string][]byte, len(sourceHashes))
+	for _, section := range sections[1:] {
+		header := strings.SplitN(string(section), "\n", 3)
+		name := header[0]
+		hash, known := sourceHashes[name]
+		if !known || patchedFiles[name] != nil || len(header) < 3 || header[1] != "+++ b/"+name {
+			return fmt.Errorf("无效的 TLS 补丁文件：%s", name)
+		}
+		source, err := os.ReadFile(filepath.Join(module.Dir, filepath.FromSlash(name)))
+		if err != nil {
+			return err
+		}
+		source = bytes.ReplaceAll(source, []byte("\r\n"), []byte("\n"))
+		if fmt.Sprintf("%x", sha256.Sum256(source)) != hash {
+			return fmt.Errorf("Xray TLS 源文件与补丁基线不一致，停止构建：%s", name)
+		}
+		patched, err := applyPatch(source, section)
+		if err != nil {
+			return err
+		}
+		patchedFiles[name], err = format.Source(patched)
+		if err != nil {
+			return err
+		}
 	}
 	localModule := filepath.Join(output, "xray-core")
 	if err := filepath.WalkDir(module.Dir, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -133,8 +151,10 @@ func prepare() error {
 	}); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(localModule, configPath), patched, 0644); err != nil {
-		return err
+	for name, patched := range patchedFiles {
+		if err := os.WriteFile(filepath.Join(localModule, filepath.FromSlash(name)), patched, 0644); err != nil {
+			return err
+		}
 	}
 	command := exec.Command("go", "mod", "edit", "-modfile="+filepath.Join(output, "go.mod"), "-replace=github.com/xtls/xray-core="+localModule)
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
