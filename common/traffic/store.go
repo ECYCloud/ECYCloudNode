@@ -76,8 +76,15 @@ func Open(path string) (*Store, error) {
 		if _, err := tx.CreateBucketIfNotExists(totalsBucket); err != nil {
 			return err
 		}
-		_, err := tx.CreateBucketIfNotExists(reportBucket)
-		return err
+		metadata, err := tx.CreateBucketIfNotExists(reportBucket)
+		if err != nil {
+			return err
+		}
+		if metadata.Get([]byte("ledger")) != nil || metadata.Get([]byte("sequence")) != nil ||
+			tx.Bucket([]byte("queued")) != nil || tx.Bucket([]byte("queued_users")) != nil || tx.Bucket([]byte("legacy")) != nil {
+			return fmt.Errorf("traffic ledger requires offline conversion with tools/traffic-revert before starting")
+		}
+		return nil
 	}); err != nil {
 		db.Close()
 		return nil, err
@@ -88,7 +95,7 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) Record(uid int, upload, download int64) error {
-	if uid <= 0 || upload < 0 || download < 0 {
+	if uid <= 0 || upload < 0 || download < 0 || upload > math.MaxInt64-download {
 		return fmt.Errorf("invalid traffic record")
 	}
 	if upload == 0 && download == 0 {
@@ -162,6 +169,7 @@ func (s *Store) Pending() (*Report, error) {
 			return validateReport(report)
 		}
 		var usage []Usage
+		var total int64
 		cursor := tx.Bucket(totalsBucket).Cursor()
 		var key, value []byte
 		if last := bucket.Get(cursorKey); last != nil {
@@ -188,6 +196,13 @@ func (s *Store) Pending() (*Report, error) {
 			if err != nil {
 				return err
 			}
+			if up > math.MaxInt64-down {
+				return fmt.Errorf("traffic counter overflow")
+			}
+			if total > math.MaxInt64-up-down {
+				break
+			}
+			total += up + down
 			uid := binary.BigEndian.Uint64(key)
 			if uid == 0 || uid > uint64(math.MaxInt) {
 				return fmt.Errorf("invalid traffic account key")
@@ -262,14 +277,18 @@ func validateReport(report *Report) error {
 	if report == nil || len(report.ID) != 32 || len(report.Data) == 0 || len(report.Data) > 1000 {
 		return fmt.Errorf("invalid pending traffic report")
 	}
-	if _, err := hex.DecodeString(report.ID); err != nil {
+	decoded, err := hex.DecodeString(report.ID)
+	if err != nil || hex.EncodeToString(decoded) != report.ID {
 		return fmt.Errorf("invalid pending traffic report")
 	}
 	lastUID := 0
+	var total int64
 	for _, u := range report.Data {
-		if u.UID <= lastUID || u.Upload < 0 || u.Download < 0 || (u.Upload == 0 && u.Download == 0) {
+		if u.UID <= lastUID || u.Upload < 0 || u.Download < 0 || (u.Upload == 0 && u.Download == 0) ||
+			u.Upload > math.MaxInt64-u.Download || total > math.MaxInt64-u.Upload-u.Download {
 			return fmt.Errorf("invalid pending traffic report")
 		}
+		total += u.Upload + u.Download
 		lastUID = u.UID
 	}
 	return nil

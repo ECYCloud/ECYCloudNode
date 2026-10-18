@@ -34,7 +34,6 @@ type APIClient struct {
 	trafficClient   *resty.Client
 	APIHost         string
 	NodeID          int
-	Key             string
 	SpeedLimit      float64
 	DeviceLimit     int
 	LocalRuleList   []api.DetectRule
@@ -110,15 +109,12 @@ func New(apiConfig *api.Config) *APIClient {
 	client.SetBaseURL(apiConfig.APIHost)
 	// Create Key for each requests
 	client.SetQueryParam("key", apiConfig.Key)
-	// Add support for muKey
-	client.SetQueryParam("muKey", apiConfig.Key)
 
 	trafficClient := resty.New()
 	trafficClient.SetRetryCount(0)
 	trafficClient.SetTimeout(30 * time.Second)
 	trafficClient.SetBaseURL(apiConfig.APIHost)
 	trafficClient.SetQueryParam("key", apiConfig.Key)
-	trafficClient.SetQueryParam("muKey", apiConfig.Key)
 
 	// Read local rule list
 	localRuleList := readLocalRuleList(apiConfig.RuleListPath)
@@ -141,7 +137,6 @@ func New(apiConfig *api.Config) *APIClient {
 		client:        client,
 		trafficClient: trafficClient,
 		NodeID:        nodeID,
-		Key:           apiConfig.Key,
 		APIHost:       apiConfig.APIHost,
 		SpeedLimit:    apiConfig.SpeedLimit,
 		DeviceLimit:   apiConfig.DeviceLimit,
@@ -200,7 +195,7 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 
 // Describe return a description of the client
 func (c *APIClient) Describe() api.ClientInfo {
-	return api.ClientInfo{APIHost: c.APIHost, NodeID: c.NodeID, Key: c.Key}
+	return api.ClientInfo{APIHost: c.APIHost, NodeID: c.NodeID}
 }
 
 // Debug set the client debug for client
@@ -415,7 +410,6 @@ func (c *APIClient) OnlineClockOffset() int64 {
 
 // ReportNodeStatus reports the node status to the ssPanel
 func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
-	// Always report node status for all panel versions
 	path := fmt.Sprintf("/mod_mu/nodes/%d/info", c.NodeID)
 	systemLoad := SystemLoad{
 		Uptime: strconv.FormatUint(nodeStatus.Uptime, 10),
@@ -721,7 +715,6 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 }
 
 // ParseSSPanelNodeInfo parse the response for the given node info format
-// Only available for SSPanel version >= 2021.11
 func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*api.NodeInfo, error) {
 	var (
 		speedLimit        uint64 = 0
@@ -881,7 +874,6 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		EnableREALITY:       nodeConfig.EnableREALITY,
 		REALITYConfig:       realityConfig,
 		AcceptProxyProtocol: nodeConfig.EnableProxyProtocol,
-		ProxyProtocolVer:    nodeConfig.ProxyProtocolVer,
 	}
 
 	// Attach Hysteria2-specific configuration when needed
@@ -1062,15 +1054,12 @@ func (c *APIClient) GetUnlockCheckConfig() (*api.UnlockCheckConfig, error) {
 		return nil, err
 	}
 
-	configResponse := new(UnlockCheckConfigResponse)
+	configResponse := new(api.UnlockCheckConfig)
 	if err := json.Unmarshal(response.Data, configResponse); err != nil {
 		return nil, fmt.Errorf("unmarshal unlock check config failed: %s", err)
 	}
 
-	return &api.UnlockCheckConfig{
-		Enabled:       configResponse.Enabled,
-		CheckInterval: configResponse.CheckInterval,
-	}, nil
+	return configResponse, nil
 }
 
 // ReportUnlockCheckResult reports the streaming unlock check results to the panel.

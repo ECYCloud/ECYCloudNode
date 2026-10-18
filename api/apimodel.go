@@ -80,37 +80,21 @@ type NodeInfo struct {
 	TransportProtocol   string
 	Host                string
 	Path                string
-	// SNI is the Server Name Indication derived from panel configuration.
-	// For custom_config nodes it prefers `sni` / `server_name`; for legacy
-	// nodes it falls back to the parsed Host when available.
-	SNI              string
-	EnableTLS        bool
-	RouteOnly        bool
-	VlessFlow        string
-	VlessDecryption  string
-	CypherMethod     string
-	ServerKey        string
-	ServiceName      string
-	Method           string
-	Header           json.RawMessage
-	Headers          map[string]string
-	Seed             string
-	EnableREALITY    bool
-	REALITYConfig    *REALITYConfig
-	Dest             string
-	ProxyProtocolVer uint64
-	ServerNames      []string
-	PrivateKey       string
-	MinClientVer     string
-	MaxClientVer     string
-	MaxTimeDiff      uint64
-	ShortIds         []string
-	Flow             string
-	Security         string
-	Key              string
-	Hysteria2Config  *Hysteria2Config
-	AnyTLSConfig     *AnyTLSConfig
-	TuicConfig       *TuicConfig
+	// SNI is derived from the panel's sni, server_name, or host.
+	SNI             string
+	EnableTLS       bool
+	VlessFlow       string
+	VlessDecryption string
+	CypherMethod    string
+	ServerKey       string
+	ServiceName     string
+	Header          json.RawMessage
+	Seed            string
+	EnableREALITY   bool
+	REALITYConfig   *REALITYConfig
+	Hysteria2Config *Hysteria2Config
+	AnyTLSConfig    *AnyTLSConfig
+	TuicConfig      *TuicConfig
 }
 
 // ECYCloudNodeCertConfig describes the certificate-related configuration
@@ -167,7 +151,6 @@ type UserInfo struct {
 	KickVersion uint64
 	UID         int
 	ClientID    int
-	Email       string
 	UUID        string
 	Passwd      string
 	Port        uint32
@@ -192,7 +175,6 @@ type OnlineUser struct {
 type ClientInfo struct {
 	APIHost string
 	NodeID  int
-	Key     string
 }
 
 type DetectRule struct {

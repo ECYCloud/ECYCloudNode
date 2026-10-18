@@ -16,7 +16,7 @@ Nodes:
   - ApiConfig:
       ApiHost: "http://127.0.0.1:667"
       ApiKey: "123"
-      NodeID: 41,42,43   # 启动多个节点 41,42,43
+      NodeID: 1,2,3   # Start multiple nodes: 1,2,3
       Timeout: 30 # Timeout for the api request
       SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
       DeviceLimit: 0 # Local settings will replace remote settings, 0 means disable
@@ -35,9 +35,9 @@ Nodes:
       GlobalDeviceLimitConfig:
         Enable: true # Enable the global device limit of a user
         RedisNetwork: tcp # Redis protocol, tcp or unix
-        RedisAddr: # 留空则自动读取面板“设置中心-节点相关-站点IP”（站点IP:6379）；填写则以本地为准
+        RedisAddr: # Leave blank to load the panel configuration automatically.
         RedisUsername: # Redis username
-        RedisPassword: # 留空则自动读取面板“设置中心-节点相关-RedisPassword”；填写则以本地为准
+        RedisPassword: # Leave blank to load the panel configuration automatically.
         RedisDB: 0 # Redis DB
         Timeout: 5 # Timeout for redis request
         Expiry: 60 # Expiry time (second)
@@ -72,9 +72,9 @@ Nodes:
 	    #      GlobalDeviceLimitConfig:
 	    #        Enable: true # Enable the global device limit of a user
 	    #        RedisNetwork: tcp # Redis protocol, tcp or unix
-	    #        RedisAddr: # 留空则自动读取面板“设置中心-节点相关-站点IP”（站点IP:6379）；填写则以本地为准
+	    #        RedisAddr: # Leave blank to load the panel configuration automatically.
 	    #        RedisUsername: # Redis username
-	    #        RedisPassword: # 留空则自动读取面板“设置中心-节点相关-RedisPassword”；填写则以本地为准
+	    #        RedisPassword: # Leave blank to load the panel configuration automatically.
 	    #        RedisDB: 0 # Redis DB
 	    #        Timeout: 5 # Timeout for redis request
 	    #        Expiry: 60 # Expiry time (second)

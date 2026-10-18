@@ -42,7 +42,6 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 			KickVersion: u.KickVersion,
 			UID:         u.UID,
 			ClientID:    u.ClientID,
-			Email:       u.Email,
 			DeviceLimit: u.DeviceLimit,
 			SpeedLimit:  u.SpeedLimit,
 		}

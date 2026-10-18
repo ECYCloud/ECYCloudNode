@@ -34,18 +34,6 @@ func (c *APIClient) PrepareTraffic() error {
 		if c.trafficDir == "" {
 			return fmt.Errorf("traffic state directory unavailable")
 		}
-		path := fmt.Sprintf("/mod_mu/nodes/%d/info", c.NodeID)
-		res, requestErr := c.client.R().SetResult(&Response{}).ForceContentType("application/json").Get(path)
-		response, err := c.parseResponse(res, path, requestErr)
-		if err != nil {
-			return fmt.Errorf("cannot verify panel traffic report protocol")
-		}
-		var protocol struct {
-			Version int `json:"traffic_report_version"`
-		}
-		if err := json.Unmarshal(response.Data, &protocol); err != nil || protocol.Version != 1 {
-			return fmt.Errorf("panel does not support idempotent traffic reports; update the panel before starting this node")
-		}
 		identity := sha256.Sum256([]byte(c.APIHost + "\n" + strconv.Itoa(c.NodeID)))
 		store, err := traffic.Open(filepath.Join(c.trafficDir, hex.EncodeToString(identity[:])+".db"))
 		if err != nil {

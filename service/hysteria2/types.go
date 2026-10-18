@@ -74,7 +74,6 @@ type userRecord struct {
 	KickVersion uint64
 	ClientID    int
 	UID         int
-	Email       string
 	DeviceLimit int
 	SpeedLimit  uint64
 }

@@ -29,7 +29,7 @@ Nodes:
   - ApiConfig:
       ApiHost: "http://127.0.0.1:667"
       ApiKey: "123"
-      NodeID: 41,42,43   # 启动多个节点 41,42,43
+      NodeID: 1,2,3   # Start multiple nodes: 1,2,3
       Timeout: 30 # Timeout for the api request
       SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
       DeviceLimit: 0 # Local settings will replace remote settings, 0 means disable
