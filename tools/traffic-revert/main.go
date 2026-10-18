@@ -41,11 +41,39 @@ func main() {
 	node := flag.Int("node-id", 0, "节点 ID")
 	file := flag.String("checkpoint-file", "", "维护期间从对应面板数据库导出的 JSON")
 	apply := flag.Bool("apply", false, "先备份，再原子转换；默认只检查")
+	inspect := flag.Bool("inspect", false, "仅检查已有账本的格式和记录数量，不需要面板进度文件")
 	flag.Parse()
-	if err := run(*state, *host, *node, *file, *apply); err != nil {
+	var err error
+	if *inspect {
+		if *apply || *host != "" || *node != 0 || *file != "" {
+			err = fmt.Errorf("--inspect 只能与 --state 一起使用，不执行转换")
+		} else {
+			err = inspectState(*state)
+		}
+	} else {
+		err = run(*state, *host, *node, *file, *apply)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func inspectState(path string) error {
+	if path == "" {
+		return fmt.Errorf("必须通过 --state 指定已有 .db 文件")
+	}
+	// 空进度仅用于只读结构校验，不据此判断已计费流量或执行转换。
+	_, plan, err := convert(path, checkpoint{}, false)
+	if err != nil {
+		return fmt.Errorf("%s：%w", path, err)
+	}
+	format := "更新前需要核对面板确认记录并转换"
+	if plan.Old {
+		format = "当前节点代码支持的格式"
+	}
+	fmt.Printf("文件：%s\n格式：%s\n本地累计记录账户数：%d\n存在待报数据：%t\n仅只读检查，未修改文件；未判定面板是否已记账。\n", path, format, len(plan.Totals), plan.Pending != nil)
+	return nil
 }
 
 func run(path, host string, node int, file string, apply bool) error {
