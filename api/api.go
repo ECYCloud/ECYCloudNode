@@ -20,7 +20,7 @@ type API interface {
 	ReportKickedUsers(kickedUser *[]OnlineUser) (err error)
 	ConsumeSlotReclaim(uid int, slot string) (ok bool, targetSlot string, err error)
 	PrepareTraffic() error
-	RecordUserTraffic(uid int, upload, download int64) error
+	RecordUserTraffic(uid int, upload, download int64, identity ...string) error
 	ReportUserTraffic() error
 	CloseTraffic() error
 	Describe() ClientInfo

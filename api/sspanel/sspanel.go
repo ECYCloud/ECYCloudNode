@@ -698,16 +698,17 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 			speedLimit = uint64((user.SpeedLimit * 1000000) / 8)
 		}
 		userList = append(userList, api.UserInfo{
-			ValidUntil:  user.ValidUntil,
-			KickVersion: user.KickVersion,
-			UID:         user.ID,
-			ClientID:    user.ClientID,
-			UUID:        user.UUID,
-			Passwd:      user.Passwd,
-			SpeedLimit:  speedLimit,
-			DeviceLimit: deviceLimit,
-			Port:        user.Port,
-			Method:      user.Method,
+			TrafficIdentity: user.TrafficIdentity,
+			ValidUntil:      user.ValidUntil,
+			KickVersion:     user.KickVersion,
+			UID:             user.ID,
+			ClientID:        user.ClientID,
+			UUID:            user.UUID,
+			Passwd:          user.Passwd,
+			SpeedLimit:      speedLimit,
+			DeviceLimit:     deviceLimit,
+			Port:            user.Port,
+			Method:          user.Method,
 		})
 	}
 

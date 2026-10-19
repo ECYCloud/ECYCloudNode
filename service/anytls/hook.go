@@ -30,6 +30,7 @@ type connCounter struct {
 	net.Conn
 	svc         *AnyTLSService
 	user        string
+	identity    string
 	uid         int
 	host        string
 	blocked     bool
@@ -42,7 +43,7 @@ func (c *connCounter) Read(p []byte) (int, error) {
 	}
 	n, err := c.Conn.Read(p)
 	if n > 0 && c.svc != nil {
-		if recordErr := c.svc.addTraffic(c.uid, int64(n), 0); recordErr != nil {
+		if recordErr := c.svc.addTraffic(c.uid, int64(n), 0, c.identity); recordErr != nil {
 			_ = c.Close()
 			return 0, recordErr
 		}
@@ -69,7 +70,7 @@ func (c *connCounter) Write(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	if len(p) > 0 && c.svc != nil {
-		if recordErr := c.svc.addTraffic(c.uid, 0, int64(len(p))); recordErr != nil {
+		if recordErr := c.svc.addTraffic(c.uid, 0, int64(len(p)), c.identity); recordErr != nil {
 			_ = c.Close()
 			return 0, recordErr
 		}
@@ -89,6 +90,7 @@ type packetConnCounter struct {
 	N.PacketConn
 	svc         *AnyTLSService
 	user        string
+	identity    string
 	uid         int
 	host        string
 	blocked     bool
@@ -103,7 +105,7 @@ func (c *packetConnCounter) ReadPacket(buffer *buf.Buffer) (destination M.Socksa
 	destination, err = c.PacketConn.ReadPacket(buffer)
 	n := buffer.Len()
 	if n > 0 && c.svc != nil {
-		if recordErr := c.svc.addTraffic(c.uid, int64(n), 0); recordErr != nil {
+		if recordErr := c.svc.addTraffic(c.uid, int64(n), 0, c.identity); recordErr != nil {
 			_ = c.Close()
 			return M.Socksaddr{}, recordErr
 		}
@@ -131,7 +133,7 @@ func (c *packetConnCounter) WritePacket(buffer *buf.Buffer, destination M.Socksa
 	}
 	n := buffer.Len()
 	if n > 0 && c.svc != nil {
-		if recordErr := c.svc.addTraffic(c.uid, 0, int64(n)); recordErr != nil {
+		if recordErr := c.svc.addTraffic(c.uid, 0, int64(n), c.identity); recordErr != nil {
 			buffer.Release()
 			_ = c.Close()
 			return recordErr
@@ -222,10 +224,10 @@ func (t *anyTLSTracker) RoutedConnection(_ context.Context, conn net.Conn, m ada
 
 	if blocked {
 		_ = conn.Close()
-		return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, kickVersion: userRec.KickVersion, blocked: true}
+		return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, identity: userRec.TrafficIdentity, host: host, kickVersion: userRec.KickVersion, blocked: true}
 	}
 
-	return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, kickVersion: userRec.KickVersion}
+	return &connCounter{Conn: conn, svc: t.svc, user: m.User, uid: userRec.UID, identity: userRec.TrafficIdentity, host: host, kickVersion: userRec.KickVersion}
 }
 
 func (t *anyTLSTracker) RoutedPacketConnection(_ context.Context, conn N.PacketConn, m adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) N.PacketConn {
@@ -294,10 +296,10 @@ func (t *anyTLSTracker) RoutedPacketConnection(_ context.Context, conn N.PacketC
 
 	if blocked {
 		_ = conn.Close()
-		return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, kickVersion: userRec.KickVersion, blocked: true}
+		return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, identity: userRec.TrafficIdentity, host: host, kickVersion: userRec.KickVersion, blocked: true}
 	}
 
-	return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, host: host, kickVersion: userRec.KickVersion}
+	return &packetConnCounter{PacketConn: conn, svc: t.svc, user: m.User, uid: userRec.UID, identity: userRec.TrafficIdentity, host: host, kickVersion: userRec.KickVersion}
 }
 
 // RoutedFlow 仅在 TUN inbound 的 pre-match 流转发路径上被调用，AnyTLS 节点不注册

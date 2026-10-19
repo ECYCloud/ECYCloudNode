@@ -33,6 +33,7 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 	if uid == 0 {
 		uid = t.svc.users[cred].UID
 	}
+	identity := trafficIdentity(id)
 	key := id
 	if t.svc.blockedIDs[key] {
 		delete(t.svc.blockedIDs, key)
@@ -53,7 +54,7 @@ func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
 		return false
 	}
 	if !t.svc.config.DisableUploadTraffic {
-		if err := t.svc.apiClient.RecordUserTraffic(uid, int64(tx), int64(rx)); err != nil {
+		if err := t.svc.apiClient.RecordUserTraffic(uid, int64(tx), int64(rx), identity); err != nil {
 			t.svc.logger.WithError(err).Error("Cannot persist user traffic")
 			return false
 		}
@@ -121,12 +122,13 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 		// use the password field for Hysteria2 authentication.
 		keys := []string{u.UUID, u.Passwd}
 		rec := userRecord{
-			ValidUntil:  u.ValidUntil,
-			KickVersion: u.KickVersion,
-			UID:         u.UID,
-			ClientID:    u.ClientID,
-			DeviceLimit: u.DeviceLimit,
-			SpeedLimit:  u.SpeedLimit,
+			ValidUntil:      u.ValidUntil,
+			KickVersion:     u.KickVersion,
+			UID:             u.UID,
+			TrafficIdentity: u.TrafficIdentity,
+			ClientID:        u.ClientID,
+			DeviceLimit:     u.DeviceLimit,
+			SpeedLimit:      u.SpeedLimit,
 		}
 		for _, key := range keys {
 			if old, ok := h.users[key]; ok && old.KickVersion != u.KickVersion {

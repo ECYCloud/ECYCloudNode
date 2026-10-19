@@ -69,12 +69,13 @@ type AnyTLSService struct {
 }
 
 type userRecord struct {
-	ValidUntil  int64
-	KickVersion uint64
-	ClientID    int
-	UID         int
-	DeviceLimit int
-	SpeedLimit  uint64
+	TrafficIdentity string
+	ValidUntil      int64
+	KickVersion     uint64
+	ClientID        int
+	UID             int
+	DeviceLimit     int
+	SpeedLimit      uint64
 }
 
 type periodicTask struct {

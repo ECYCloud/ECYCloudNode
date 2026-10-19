@@ -147,19 +147,23 @@ type TuicConfig struct {
 }
 
 type UserInfo struct {
-	ValidUntil  int64
-	KickVersion uint64
-	UID         int
-	ClientID    int
-	UUID        string
-	Passwd      string
-	Port        uint32
-	Method      string
-	SpeedLimit  uint64 // Bps
-	DeviceLimit int
+	TrafficIdentity string
+	ValidUntil      int64
+	KickVersion     uint64
+	UID             int
+	ClientID        int
+	UUID            string
+	Passwd          string
+	Port            uint32
+	Method          string
+	SpeedLimit      uint64 // Bps
+	DeviceLimit     int
 }
 
 func (u UserInfo) Key(tag string) string {
+	if u.TrafficIdentity != "" {
+		tag += "|" + u.TrafficIdentity
+	}
 	if u.ClientID != 0 {
 		return fmt.Sprintf("%s|client-%d|%d", tag, u.ClientID, u.UID)
 	}

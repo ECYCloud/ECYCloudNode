@@ -38,12 +38,13 @@ func (s *AnyTLSService) syncUsers(userInfo *[]api.UserInfo) {
 	for _, u := range *userInfo {
 		keys := []string{u.UUID, u.Passwd}
 		rec := userRecord{
-			ValidUntil:  u.ValidUntil,
-			KickVersion: u.KickVersion,
-			UID:         u.UID,
-			ClientID:    u.ClientID,
-			DeviceLimit: u.DeviceLimit,
-			SpeedLimit:  u.SpeedLimit,
+			ValidUntil:      u.ValidUntil,
+			KickVersion:     u.KickVersion,
+			UID:             u.UID,
+			TrafficIdentity: u.TrafficIdentity,
+			ClientID:        u.ClientID,
+			DeviceLimit:     u.DeviceLimit,
+			SpeedLimit:      u.SpeedLimit,
 		}
 		for _, key := range keys {
 			if old, ok := s.users[key]; ok && old.KickVersion != u.KickVersion {
@@ -144,11 +145,11 @@ func (s *AnyTLSService) waitTraffic(uuid string, n int) error {
 	return limiter.WaitN(context.Background(), bucket, n)
 }
 
-func (s *AnyTLSService) addTraffic(uid int, up, down int64) error {
+func (s *AnyTLSService) addTraffic(uid int, up, down int64, identity ...string) error {
 	if s.config.DisableUploadTraffic {
 		return nil
 	}
-	return s.apiClient.RecordUserTraffic(uid, up, down)
+	return s.apiClient.RecordUserTraffic(uid, up, down, identity...)
 }
 
 // slot 解析该凭据在 host 上占用的名额标识：官方客户端按设备标识占名额，换网络不

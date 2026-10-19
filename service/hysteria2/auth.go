@@ -25,6 +25,9 @@ func trafficUID(id string) int {
 	if strings.HasPrefix(id, "kick:") {
 		_, id, _ = strings.Cut(id, "|")
 	}
+	if strings.HasPrefix(id, "acct:") {
+		_, id, _ = strings.Cut(id, "|")
+	}
 	prefix, _, ok := strings.Cut(id, "|")
 	if !ok || !strings.HasPrefix(prefix, "uid:") {
 		return 0
@@ -40,6 +43,9 @@ func splitAuthID(id string) (cred, host string) {
 	if strings.HasPrefix(id, "kick:") {
 		_, id, _ = strings.Cut(id, "|")
 	}
+	if strings.HasPrefix(id, "acct:") {
+		_, id, _ = strings.Cut(id, "|")
+	}
 	if trafficUID(id) > 0 {
 		_, id, _ = strings.Cut(id, "|")
 	}
@@ -47,6 +53,25 @@ func splitAuthID(id string) (cred, host string) {
 		return id[:i], id[i+1:]
 	}
 	return id, ""
+}
+
+func accountAuthID(cred, host string, user userRecord) string {
+	identity := ""
+	if user.TrafficIdentity != "" {
+		identity = "acct:" + user.TrafficIdentity + "|"
+	}
+	return "kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + identity + authID(cred, host, user.UID)
+}
+
+func trafficIdentity(id string) string {
+	if strings.HasPrefix(id, "kick:") {
+		_, id, _ = strings.Cut(id, "|")
+	}
+	prefix, _, _ := strings.Cut(id, "|")
+	if strings.HasPrefix(prefix, "acct:") {
+		return strings.TrimPrefix(prefix, "acct:")
+	}
+	return ""
 }
 
 func authKickVersion(id string) uint64 {
@@ -96,7 +121,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		return a.svc.currentDeviceLimit(auth, host, user.KickVersion)
 	}, a.svc.tag)
 	if !allowed {
-		a.svc.releaseOnline("kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + authID(auth, host, user.UID))
+		a.svc.releaseOnline(accountAuthID(auth, host, user))
 		return false, ""
 	}
 	a.svc.mu.Lock()
@@ -135,7 +160,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		return false, ""
 	}
 
-	return true, "kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + authID(auth, host, user.UID)
+	return true, accountAuthID(auth, host, user)
 }
 
 // slot 解析该凭据在 host 上占用的名额标识，与 Authenticate 同一口径：
@@ -187,7 +212,7 @@ func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bo
 		return true
 	}
 	// 被全局挤出的名额不能留在本地账本继续占位，与 Authenticate 同口径
-	h.releaseOnline("kick:" + strconv.FormatUint(user.KickVersion, 10) + "|" + authID(cred, host, user.UID))
+	h.releaseOnline(accountAuthID(cred, host, user))
 	return false
 }
 

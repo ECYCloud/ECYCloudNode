@@ -51,16 +51,17 @@ type CustomConfig struct {
 
 // UserResponse is the response of user
 type UserResponse struct {
-	ValidUntil  int64   `json:"valid_until"`
-	KickVersion uint64  `json:"kick_version"`
-	ID          int     `json:"id"`
-	ClientID    int     `json:"client_id"`
-	Passwd      string  `json:"passwd"`
-	Port        uint32  `json:"port"`
-	Method      string  `json:"method"`
-	SpeedLimit  float64 `json:"node_speedlimit"`
-	DeviceLimit int     `json:"node_connector"`
-	UUID        string  `json:"uuid"`
+	TrafficIdentity string  `json:"traffic_identity"`
+	ValidUntil      int64   `json:"valid_until"`
+	KickVersion     uint64  `json:"kick_version"`
+	ID              int     `json:"id"`
+	ClientID        int     `json:"client_id"`
+	Passwd          string  `json:"passwd"`
+	Port            uint32  `json:"port"`
+	Method          string  `json:"method"`
+	SpeedLimit      float64 `json:"node_speedlimit"`
+	DeviceLimit     int     `json:"node_connector"`
+	UUID            string  `json:"uuid"`
 }
 
 // Response is the common response

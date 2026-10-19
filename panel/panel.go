@@ -319,9 +319,12 @@ func (p *Panel) Start() {
 			newHost := strings.TrimSpace(webAPI.APIHost)
 			oldHost := strings.TrimSpace(nodeConfig.ApiConfig.APIHost)
 			if newHost != "" && strings.TrimRight(newHost, "/") != strings.TrimRight(oldHost, "/") {
+				if err := apiClient.UpdateAPIHost(newHost); err != nil {
+					log.Errorf("Cannot retain traffic state for node %d after panel address change: %v", apiClient.NodeID, err)
+					continue
+				}
 				log.Infof("ApiHost updated from panel: %s -> %s", oldHost, newHost)
 				nodeConfig.ApiConfig.APIHost = newHost
-				apiClient = sspanel.New(nodeConfig.ApiConfig)
 			}
 		}
 

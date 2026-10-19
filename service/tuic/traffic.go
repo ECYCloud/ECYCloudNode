@@ -43,12 +43,13 @@ func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 		}
 
 		rec := userRecord{
-			ValidUntil:  u.ValidUntil,
-			KickVersion: u.KickVersion,
-			UID:         u.UID,
-			ClientID:    u.ClientID,
-			DeviceLimit: u.DeviceLimit,
-			SpeedLimit:  u.SpeedLimit,
+			ValidUntil:      u.ValidUntil,
+			KickVersion:     u.KickVersion,
+			UID:             u.UID,
+			TrafficIdentity: u.TrafficIdentity,
+			ClientID:        u.ClientID,
+			DeviceLimit:     u.DeviceLimit,
+			SpeedLimit:      u.SpeedLimit,
 		}
 		if old, ok := s.users[key]; ok && old.KickVersion != u.KickVersion {
 			delete(s.onlineSlots[key], limiter.OnlineKey(u.ClientID, ""))
@@ -138,11 +139,11 @@ func (s *TuicService) waitTraffic(uuid string, n int) error {
 	return limiter.WaitN(context.Background(), bucket, n)
 }
 
-func (s *TuicService) addTraffic(uid int, up, down int64) error {
+func (s *TuicService) addTraffic(uid int, up, down int64, identity ...string) error {
 	if s.config.DisableUploadTraffic {
 		return nil
 	}
-	return s.apiClient.RecordUserTraffic(uid, up, down)
+	return s.apiClient.RecordUserTraffic(uid, up, down, identity...)
 }
 
 // slot 解析该凭据在 host 上占用的名额标识：官方客户端按设备标识占名额，换网络不

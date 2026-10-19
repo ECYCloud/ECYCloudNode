@@ -313,7 +313,7 @@ func (c *Controller) getTraffic(email string) (up int64, down int64) {
 }
 
 func (c *Controller) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig) error {
-	var record func(int, int64, int64) error
+	var record func(int, int64, int64, ...string) error
 	if !c.config.DisableUploadTraffic {
 		record = c.apiClient.RecordUserTraffic
 	}

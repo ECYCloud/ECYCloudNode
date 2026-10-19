@@ -22,13 +22,14 @@ const (
 )
 
 type UserInfo struct {
-	Scope       string
-	ValidUntil  int64
-	KickVersion uint64
-	UID         int
-	ClientID    int
-	SpeedLimit  uint64
-	DeviceLimit int
+	TrafficIdentity string
+	Scope           string
+	ValidUntil      int64
+	KickVersion     uint64
+	UID             int
+	ClientID        int
+	SpeedLimit      uint64
+	DeviceLimit     int
 }
 
 // onlineEntry 记录单个在线 名额 的归属与最近活跃时间（unix 秒）
@@ -44,7 +45,7 @@ type InboundInfo struct {
 	BucketHub       *sync.Map // Key: user identifier -> *rate.Limiter
 	UserOnlineSlots *sync.Map // Key: onlineBucket() -> *sync.Map (Key: OnlineKey(), Value: onlineEntry)
 	GlobalLimit     *GlobalDeviceChecker
-	RecordTraffic   func(int, int64, int64) error
+	RecordTraffic   func(int, int64, int64, ...string) error
 	// slotMu 串行化在线账本的「先数后写」：sync.Map 只保证单次操作原子，
 	// 两条连接同时数到「未满」再各自登记就会超限
 	slotMu sync.Mutex
@@ -69,7 +70,7 @@ func New() *Limiter {
 	}
 }
 
-func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalLimit *GlobalDeviceLimitConfig, recorder ...func(int, int64, int64) error) error {
+func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalLimit *GlobalDeviceLimitConfig, recorder ...func(int, int64, int64, ...string) error) error {
 	inboundInfo := &InboundInfo{
 		Tag:             tag,
 		NodeSpeedLimit:  nodeSpeedLimit,
@@ -85,12 +86,13 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 	for _, u := range *userList {
 		userKey := u.Key(tag)
 		userMap.Store(userKey, UserInfo{
-			ValidUntil:  u.ValidUntil,
-			KickVersion: u.KickVersion,
-			UID:         u.UID,
-			ClientID:    u.ClientID,
-			SpeedLimit:  u.SpeedLimit,
-			DeviceLimit: u.DeviceLimit,
+			ValidUntil:      u.ValidUntil,
+			KickVersion:     u.KickVersion,
+			UID:             u.UID,
+			TrafficIdentity: u.TrafficIdentity,
+			ClientID:        u.ClientID,
+			SpeedLimit:      u.SpeedLimit,
+			DeviceLimit:     u.DeviceLimit,
 		})
 	}
 	inboundInfo.UserInfo = userMap
@@ -112,8 +114,8 @@ func (l *Limiter) TrafficRecorder(tag, userKey string) func(int64, int64) error 
 	if !ok {
 		return func(int64, int64) error { return fmt.Errorf("traffic account is no longer authorized") }
 	}
-	uid := user.(UserInfo).UID
-	return func(up, down int64) error { return info.RecordTraffic(uid, up, down) }
+	account := user.(UserInfo)
+	return func(up, down int64) error { return info.RecordTraffic(account.UID, up, down, account.TrafficIdentity) }
 }
 
 func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserInfo, replace ...bool) error {
@@ -154,12 +156,13 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 				}
 			}
 			inboundInfo.UserInfo.Store(userKey, UserInfo{
-				ValidUntil:  u.ValidUntil,
-				KickVersion: kickVersion,
-				UID:         u.UID,
-				ClientID:    u.ClientID,
-				SpeedLimit:  u.SpeedLimit,
-				DeviceLimit: u.DeviceLimit,
+				ValidUntil:      u.ValidUntil,
+				KickVersion:     kickVersion,
+				UID:             u.UID,
+				TrafficIdentity: u.TrafficIdentity,
+				ClientID:        u.ClientID,
+				SpeedLimit:      u.SpeedLimit,
+				DeviceLimit:     u.DeviceLimit,
 			})
 			inboundInfo.updateRateBucket(userKey, u.UID, u.ClientID, u.SpeedLimit)
 		}
