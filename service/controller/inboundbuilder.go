@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf"
+	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 
 	"github.com/ECYCloud/ECYCloudNode/api"
 	"github.com/ECYCloud/ECYCloudNode/common/mylego"
@@ -38,7 +39,7 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 	// SniffingConfig
 	sniffingConfig := &conf.SniffingConfig{
 		Enabled:      true,
-		DestOverride: &conf.StringList{"http", "tls", "quic", "fakedns"},
+		DestOverride: conf.StringList{"http", "tls", "quic", "fakedns"},
 	}
 	if config.DisableSniffing {
 		sniffingConfig.Enabled = false
@@ -111,11 +112,14 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 
 		proxySetting, _ := proxySetting.(*conf.ShadowsocksServerConfig)
 		// shadowsocks must have a random password
-		// shadowsocks2022's password == user PSK, thus should a length of string >= 32 and base64 encoder
+		// shadowsocks2022's password == user PSK, its length must equal the method's key length (base64 encoded)
 		b := make([]byte, 32)
 		rand.Read(b)
 		randPasswd := hex.EncodeToString(b)
 		if C.Contains(shadowaead_2022.List, cipher) {
+			if method, err := shadowsocks_2022.GetCipherMethod(cipher); err == nil {
+				b = b[:method.KeySaltLength]
+			}
 			proxySetting.Users = append(proxySetting.Users, &conf.ShadowsocksUserConfig{
 				Password: base64.StdEncoding.EncodeToString(b),
 			})
@@ -152,23 +156,17 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 		}
 		streamSetting.TCPSettings = tcpSetting
 	case "mkcp":
-		// xray 已移除 mKCP 的伪装头与 seed，两者只要非空就会构建失败。
-		// 这里照原样下发，让内核报出移除原因，而不是起一个客户端连不上的 inbound。
-		kcpSetting := &conf.KCPConfig{
-			HeaderConfig: nodeInfo.Header,
+		// xray 已移除 mKCP 的伪装头与 seed，且新版内核构建时会静默忽略这两项；
+		// 两者只要非空就在此拒绝，而不是起一个客户端连不上的 inbound。
+		if nodeInfo.Header != nil || nodeInfo.Seed != "" {
+			return nil, fmt.Errorf("mKCP header & seed have been removed from Xray-core, please migrate to finalmask")
 		}
-		if nodeInfo.Seed != "" {
-			kcpSetting.Seed = &nodeInfo.Seed
-		}
-		streamSetting.KCPSettings = kcpSetting
+		streamSetting.KCPSettings = &conf.KCPConfig{}
 	case "websocket":
-		headers := make(map[string]string)
-		headers["Host"] = nodeInfo.Host
 		wsSettings := &conf.WebSocketConfig{
 			AcceptProxyProtocol: nodeInfo.AcceptProxyProtocol,
 			Host:                nodeInfo.Host,
 			Path:                nodeInfo.Path,
-			Headers:             headers,
 		}
 		streamSetting.WSSettings = wsSettings
 	case "grpc":
@@ -239,6 +237,13 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 			AcceptProxyProtocol: nodeInfo.AcceptProxyProtocol,
 		}
 		streamSetting.SocketSettings = sockoptConfig
+	}
+	// 套 CDN / 反代时，请求带有面板配置的可信请求头才采信 X-Forwarded-For 作为用户真实 IP
+	if len(nodeInfo.TrustedXForwardedFor) > 0 {
+		if streamSetting.SocketSettings == nil {
+			streamSetting.SocketSettings = &conf.SocketConfig{}
+		}
+		streamSetting.SocketSettings.TrustedXForwardedFor = nodeInfo.TrustedXForwardedFor
 	}
 	inboundDetourConfig.StreamSetting = streamSetting
 

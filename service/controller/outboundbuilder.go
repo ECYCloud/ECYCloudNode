@@ -20,17 +20,17 @@ func OutboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.
 	outboundDetourConfig.SendThrough = &config.SendIP
 
 	// Freedom Protocol setting
-	var domainStrategy = "Asis"
+	// freedom.domainStrategy 已弃用，内核改由 sockopt.domainStrategy 解析目标域名
 	if config.EnableDNS {
+		domainStrategy := "UseIP"
 		if config.DNSType != "" {
 			domainStrategy = config.DNSType
-		} else {
-			domainStrategy = "UseIP"
+		}
+		outboundDetourConfig.StreamSetting = &conf.StreamConfig{
+			SocketSettings: &conf.SocketConfig{DomainStrategy: domainStrategy},
 		}
 	}
-	proxySetting := &conf.FreedomConfig{
-		DomainStrategy: domainStrategy,
-	}
+	proxySetting := &conf.FreedomConfig{}
 	var setting json.RawMessage
 	setting, err := json.Marshal(proxySetting)
 	if err != nil {

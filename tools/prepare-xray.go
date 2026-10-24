@@ -74,14 +74,14 @@ func prepare() error {
 		}
 	}
 	patchPath := filepath.Join(workingDir, "patches", "xray-tls-config.patch")
-	if module.Version != "v1.260327.0" {
+	if module.Version != "v1.260327.1-0.20261021115930-1b1647cd9ddf" {
 		patch, err := os.ReadFile(patchPath)
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("读取旧 TLS 补丁：%w", err)
 		}
 		if err == nil {
 			patch = bytes.ReplaceAll(patch, []byte("\r\n"), []byte("\n"))
-			if fmt.Sprintf("%x", sha256.Sum256(patch)) != "1e10346cdba78951ca550cbf4a140732f3e1de31d48e87c1e5e670d9456f7b74" {
+			if fmt.Sprintf("%x", sha256.Sum256(patch)) != "d2b2b924662f4e982bd396eceae4bfc7cabf9e9aef3d17ef14200ca6f53090bf" {
 				return fmt.Errorf("旧 TLS 补丁内容已改动，拒绝自动删除：%s", patchPath)
 			}
 			if err := os.Remove(patchPath); err != nil {
@@ -97,9 +97,7 @@ func prepare() error {
 	}
 	patch = bytes.ReplaceAll(patch, []byte("\r\n"), []byte("\n"))
 	sourceHashes := map[string]string{
-		"transport/internet/tls/config.go":      "331a74916d525934e9f955309455e572fab97f192e9f39cf592b8f79d997d774",
-		"transport/internet/grpc/dial.go":       "95181bf33e1acc9a62a8303b95907da4ad911af6bf7fb19094f66b59c0b0da97",
-		"transport/internet/hysteria/dialer.go": "f7ee9e5d481034c1292f3649812494081e3f7b87597eac800d3142a3fecd0ffd",
+		"transport/internet/tls/config.go": "159270ac6ce0bc87f48b29acdddf3676349d3b8c0ec5f183be4397ed8e69d8e8",
 	}
 	sections := bytes.Split(patch, []byte("--- a/"))
 	if len(sections) != len(sourceHashes)+1 {

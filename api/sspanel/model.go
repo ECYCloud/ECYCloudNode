@@ -45,6 +45,8 @@ type CustomConfig struct {
 	Heartbeat         string `json:"heartbeat"`
 
 	EnableProxyProtocol bool `json:"enable_proxy_protocol"`
+	// 请求带有其中任一请求头时才采信 X-Forwarded-For（套 CDN / 反代时由面板配置）
+	TrustedXForwardedFor []string `json:"trusted_x_forwarded_for"`
 	// VLESS Encryption 加密配置
 	Decryption string `json:"decryption"`
 }

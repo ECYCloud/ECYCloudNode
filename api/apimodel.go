@@ -72,14 +72,15 @@ type NodeStatus struct {
 }
 
 type NodeInfo struct {
-	AcceptProxyProtocol bool
-	NodeType            string // Must be Vmess, VLESS, Trojan, Shadowsocks, Hysteria2, AnyTLS, Tuic
-	NodeID              int
-	Port                uint32
-	SpeedLimit          uint64 // Bps
-	TransportProtocol   string
-	Host                string
-	Path                string
+	AcceptProxyProtocol  bool
+	TrustedXForwardedFor []string
+	NodeType             string // Must be Vmess, VLESS, Trojan, Shadowsocks, Hysteria2, AnyTLS, Tuic
+	NodeID               int
+	Port                 uint32
+	SpeedLimit           uint64 // Bps
+	TransportProtocol    string
+	Host                 string
+	Path                 string
 	// SNI is derived from the panel's sni, server_name, or host.
 	SNI             string
 	EnableTLS       bool

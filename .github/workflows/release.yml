@@ -150,10 +150,13 @@ jobs:
       - name: Prepare Xray build dependencies
         run: GOOS= GOARCH= GOARM= go run ./tools/prepare-xray.go "$RUNNER_TEMP/ecycloud-node-build"
 
+      # Xray 依赖的 wlynxg/anet 在 Android 上使用 go:linkname，与上游一致仅对 Android 关闭链接名检查。
       - name: Build ECYCloudNode
         run: |
           mkdir -p build_assets
-          go build -modfile="$RUNNER_TEMP/ecycloud-node-build/go.mod" -v -o build_assets/ECYCloudNode -trimpath -tags "with_quic" -ldflags "-s -w -buildid= -X github.com/ECYCloud/ECYCloudNode/cmd.version=${VERSION}"
+          LINKNAME_FLAG=""
+          [ "$GOOS" = "android" ] && LINKNAME_FLAG="-checklinkname=0"
+          go build -modfile="$RUNNER_TEMP/ecycloud-node-build/go.mod" -v -o build_assets/ECYCloudNode -trimpath -tags "with_quic" -ldflags "-s -w -buildid= ${LINKNAME_FLAG} -X github.com/ECYCloud/ECYCloudNode/cmd.version=${VERSION}"
 
       - name: Build Mips softfloat ECYCloudNode
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
