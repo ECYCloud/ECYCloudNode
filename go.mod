@@ -16,7 +16,7 @@ require (
 	github.com/r3labs/diff/v3 v3.0.2
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/sagernet/bbolt v0.0.0-20260915102804-500ee1e84832
-	github.com/sagernet/quic-go v0.61.0-sing-box-mod.9
+	github.com/sagernet/quic-go v0.61.0-sing-box-mod.12
 	github.com/sagernet/sing v0.9.7-0.20260929150544-0ad23b637bd4
 	github.com/sagernet/sing-box v1.14.3
 	github.com/sagernet/sing-quic v0.7.2-0.20261002084117-75c3ac4fa12b
