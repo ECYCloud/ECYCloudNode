@@ -1,4 +1,4 @@
-# Xray-core v26.10.21（模块伪版本 v1.260327.1-0.20261021115930-1b1647cd9ddf），MPL-2.0；修复 TLS 证书 / OCSP 热更新。
+# Xray-core v26.10.29（模块伪版本 v1.260327.1-0.20261029083850-0afec66085a8），MPL-2.0；修复 TLS 证书 / OCSP 热更新。
 --- a/transport/internet/tls/config.go
 +++ b/transport/internet/tls/config.go
 @@ -11,6 +11,7 @@
