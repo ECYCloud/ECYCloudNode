@@ -246,7 +246,7 @@ func (h *Hysteria2Service) collectUsage() []api.OnlineUser {
 				continue
 			}
 			seen[key] = struct{}{}
-			onlineUsers = append(onlineUsers, L.OnlineUser(user.UID, slot))
+			onlineUsers = append(onlineUsers, L.OnlineUsers(user.UID, slot)...)
 		}
 	}
 

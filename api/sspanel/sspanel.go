@@ -430,16 +430,15 @@ func (c *APIClient) ReportNodeStatus(nodeStatus *api.NodeStatus) (err error) {
 	return nil
 }
 
-// ReportNodeOnlineUsers reports official clients and third-party IPs; empty groups are not posted.
+// ReportNodeOnlineUsers reports official clients with their recent egress IPs and third-party IPs; empty groups are not posted.
 func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) error {
 	data := map[string][]OnlineUser{}
 	if onlineUserList != nil {
 		for _, user := range *onlineUserList {
 			path := "/mod_mu/users/online"
-			entry := OnlineUser{UID: user.UID, ClientID: user.ClientID}
+			entry := OnlineUser{UID: user.UID, IP: user.IP, ClientID: user.ClientID}
 			if user.ClientID == 0 {
 				path = "/mod_mu/users/aliveip"
-				entry.IP = user.IP
 			}
 			data[path] = append(data[path], entry)
 		}

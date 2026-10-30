@@ -17,6 +17,74 @@ func OnlineUser(uid int, slot string) api.OnlineUser {
 	return user
 }
 
+// OnlineUsers 把名额展开成在线上报条目：第三方名额本身就是 IP；官方客户端设备按近期上行
+// 出口 IP 各报一条，供面板发现同一份配置在多处同时使用，不影响名额计数。
+func OnlineUsers(uid int, slot string) []api.OnlineUser {
+	user := OnlineUser(uid, slot)
+	ips := recentClientIPs(user.ClientID)
+	if len(ips) == 0 {
+		return []api.OnlineUser{user}
+	}
+	users := make([]api.OnlineUser, len(ips))
+	for i, ip := range ips {
+		users[i] = api.OnlineUser{UID: uid, ClientID: user.ClientID, IP: ip}
+	}
+	return users
+}
+
+var clientIPs = struct {
+	sync.Mutex
+	seen      map[int]map[string]time.Time
+	lastSweep time.Time
+}{seen: make(map[int]map[string]time.Time)}
+
+// NoteClientIP 在上行确认在线时登记官方客户端设备的出口 IP。下行流量不能证明设备仍在
+// 该网络上，不登记；第三方名额本身就是 IP，无需另记。
+func NoteClientIP(clientID int, ip string) {
+	if clientID == 0 || ip == "" {
+		return
+	}
+	clientIPs.Lock()
+	defer clientIPs.Unlock()
+	ips := clientIPs.seen[clientID]
+	if ips == nil {
+		ips = make(map[string]time.Time)
+		clientIPs.seen[clientID] = ips
+	}
+	ips[ip] = time.Now()
+}
+
+// recentClientIPs 返回设备在 OnlineSlotExpiry 内用过的出口 IP；顺带按同一时效整表清理，
+// 下线设备不会再被查询，只靠单设备清理会一直留在表里。
+func recentClientIPs(clientID int) []string {
+	if clientID == 0 {
+		return nil
+	}
+	clientIPs.Lock()
+	defer clientIPs.Unlock()
+	now := time.Now()
+	if now.Sub(clientIPs.lastSweep) > OnlineSlotExpiry {
+		clientIPs.lastSweep = now
+		for id, ips := range clientIPs.seen {
+			for ip, last := range ips {
+				if now.Sub(last) > OnlineSlotExpiry {
+					delete(ips, ip)
+				}
+			}
+			if len(ips) == 0 {
+				delete(clientIPs.seen, id)
+			}
+		}
+	}
+	var fresh []string
+	for ip, last := range clientIPs.seen[clientID] {
+		if now.Sub(last) <= OnlineSlotExpiry {
+			fresh = append(fresh, ip)
+		}
+	}
+	return fresh
+}
+
 const clientKeyPrefix = "client-"
 
 // OnlineKey 是占名额的标识。官方客户端按设备计名额，标识与出口 IP 无关，

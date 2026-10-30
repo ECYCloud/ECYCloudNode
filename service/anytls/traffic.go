@@ -222,6 +222,7 @@ func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 		}).Warn("AnyTLS user exceeded device limit")
 		return false
 	}
+	limiter.NoteClientIP(user.ClientID, host)
 
 	return true
 }
@@ -252,6 +253,7 @@ func (s *AnyTLSService) ensureOnline(uuid, host string, version ...uint64) bool 
 	if s.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, false, func() (int, bool) {
 		return s.currentDeviceLimit(uuid, host, user.KickVersion)
 	}, s.tag) {
+		limiter.NoteClientIP(user.ClientID, host)
 		return true
 	}
 	// 被全局挤出的名额不能留在本地账本继续占位，与 allowConnection 同口径
@@ -320,7 +322,7 @@ func (s *AnyTLSService) collectUsage() []api.OnlineUser {
 				continue
 			}
 			seen[key] = struct{}{}
-			online = append(online, limiter.OnlineUser(user.UID, slot))
+			online = append(online, limiter.OnlineUsers(user.UID, slot)...)
 		}
 	}
 

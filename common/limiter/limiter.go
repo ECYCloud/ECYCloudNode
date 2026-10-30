@@ -236,7 +236,7 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 				}
 				active++
 				slot := slotKey.(string)
-				onlineUser = append(onlineUser, OnlineUser(entry.UID, slot))
+				onlineUser = append(onlineUser, OnlineUsers(entry.UID, slot)...)
 				return true
 			})
 			if active == 0 {
@@ -393,6 +393,7 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 		break
 	}
 	inboundInfo.slotMu.Unlock()
+	NoteClientIP(clientID, ip)
 
 	return true
 }
@@ -471,6 +472,7 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	slotMap := v.(*sync.Map)
 	slotMap.Store(slot, onlineEntry{UID: uid, LastSeen: time.Now().Unix()})
 	inboundInfo.slotMu.Unlock()
+	NoteClientIP(clientID, ip)
 
 	return true
 }
