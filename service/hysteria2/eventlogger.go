@@ -3,9 +3,18 @@ package hysteria2
 import (
 	"fmt"
 	"net"
+	"time"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 )
+
+// maxUDPSessionsPerConn 是单条连接同时保有的 UDP 会话上限：内核不限会话数，每个会话各占一个出站
+// UDP 套接字，一条连接就能耗尽本机的临时端口与文件描述符。上限放宽到正常客户端用不到的量。
+const maxUDPSessionsPerConn = 1024
+
+// udpSessionLimitLog 让超限日志每分钟最多一条：超限的连接在断开前还可能继续开会话。
+var udpSessionLimitLog = rate.Sometimes{Interval: time.Minute}
 
 // hyEventLogger implements server.EventLogger and prints useful
 // diagnostics so that connection and handshake issues can be
@@ -41,23 +50,18 @@ func (l *hyEventLogger) userFields(id string) log.Fields {
 	return fields
 }
 
-func (l *hyEventLogger) auditRequest(addr net.Addr, id, reqAddr string) {
+func (l *hyEventLogger) auditRequest(id, reqAddr string) bool {
 	if l == nil || l.svc == nil || l.svc.rules == nil {
-		return
+		return false
 	}
 
-	host := addr.String()
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	cred, _ := splitAuthID(id)
+	cred, host := splitAuthID(id)
 
 	l.svc.mu.RLock()
 	user, ok := l.svc.users[cred]
 	l.svc.mu.RUnlock()
 	if !ok || reqAddr == "" {
-		return
+		return false
 	}
 
 	userKey := fmt.Sprintf("%d", user.UID)
@@ -76,7 +80,9 @@ func (l *hyEventLogger) auditRequest(addr net.Addr, id, reqAddr string) {
 			"reqAddr": reqAddr,
 			"uid":     user.UID,
 		}).Warn("Hysteria2 audit rule hit, scheduling disconnect")
+		return true
 	}
+	return false
 }
 
 func (l *hyEventLogger) Connect(addr net.Addr, id string, tx uint64) {
@@ -149,7 +155,7 @@ func (l *hyEventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 			remote, reqAddr, nodeTag)
 	}
 
-	l.auditRequest(addr, id, reqAddr)
+	l.auditRequest(id, reqAddr)
 }
 
 func (l *hyEventLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
@@ -201,10 +207,58 @@ func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, r
 			remote, reqAddr, nodeTag)
 	}
 
-	l.auditRequest(addr, id, reqAddr)
+	l.auditRequest(id, reqAddr)
+
+	if l != nil && l.svc != nil && l.svc.trackUDPSession(id, sessionID) {
+		udpSessionLimitLog.Do(func() {
+			l.logger().WithFields(log.Fields{
+				"remote": remote,
+				"uid":    user.UID,
+				"limit":  maxUDPSessionsPerConn,
+			}).Warn("Hysteria2 connection exceeded the UDP session limit, disconnecting")
+		})
+	}
+}
+
+// trackUDPSession 登记连接新开的 UDP 会话；超出上限时标记断连，由 LogTraffic 在下一个流量事件
+// 通知内核断开整条连接（与审计命中共用同一机制）。
+func (h *Hysteria2Service) trackUDPSession(id string, sessionID uint32) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.udpSessions == nil {
+		h.udpSessions = make(map[string]map[uint32]struct{})
+	}
+	sessions := h.udpSessions[id]
+	if sessions == nil {
+		sessions = make(map[uint32]struct{})
+		h.udpSessions[id] = sessions
+	}
+	sessions[sessionID] = struct{}{}
+	if len(sessions) <= maxUDPSessionsPerConn {
+		return false
+	}
+	if h.blockedIDs != nil {
+		h.blockedIDs[id] = true
+	}
+	return true
+}
+
+// untrackUDPSession 归还已关闭会话的额度。连接断开时内核会逐个关闭其全部会话，账目随之清空。
+func (h *Hysteria2Service) untrackUDPSession(id string, sessionID uint32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if sessions := h.udpSessions[id]; sessions != nil {
+		delete(sessions, sessionID)
+		if len(sessions) == 0 {
+			delete(h.udpSessions, id)
+		}
+	}
 }
 
 func (l *hyEventLogger) UDPError(addr net.Addr, id string, sessionID uint32, err error) {
+	if l != nil && l.svc != nil {
+		l.svc.untrackUDPSession(id, sessionID)
+	}
 	fields := log.Fields{
 		"remote":    addr.String(),
 		"sessionID": sessionID,

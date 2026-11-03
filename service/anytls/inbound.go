@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	protocol "github.com/anytls/sing-anytls"
 	"github.com/anytls/sing-anytls/padding"
@@ -13,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/auth"
@@ -94,9 +96,26 @@ func (h *deviceInbound) NewConnection(ctx context.Context, conn net.Conn, metada
 	h.mu.RLock()
 	current := h.protocol
 	h.mu.RUnlock()
-	if err := current.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose); err != nil {
+	// 握手完成后迟迟不发认证首包的连接会一直占着协程与文件描述符：首包与握手同样限时
+	_ = conn.SetReadDeadline(time.Now().Add(C.TCPTimeout))
+	if err := current.NewConnection(adapter.WithContext(ctx, &metadata), &authDeadlineConn{Conn: conn, armed: true}, metadata.Source, onClose); err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 	}
+}
+
+// authDeadlineConn 读到认证首包后撤销读期限：认证只读这一次，之后的会话可以长时间空闲。
+type authDeadlineConn struct {
+	net.Conn
+	armed bool
+}
+
+func (c *authDeadlineConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if c.armed {
+		c.armed = false
+		_ = c.Conn.SetReadDeadline(time.Time{})
+	}
+	return n, err
 }
 
 func (h *deviceInbound) NewConnectionEx(ctx context.Context, conn net.Conn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {

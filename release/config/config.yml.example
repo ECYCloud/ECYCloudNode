@@ -15,7 +15,7 @@ ConnectionConfig:
 Nodes:
   - ApiConfig:
       ApiHost: "http://127.0.0.1:667"
-      ApiKey: "123"
+      ApiKey: "123" # Credential issued by the panel for this server. Sent as a request header.
       NodeID: 1,2,3   # Start multiple nodes: 1,2,3
       Timeout: 30 # Timeout for the api request
       SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
@@ -38,9 +38,12 @@ Nodes:
         RedisAddr: # Leave blank to load the panel configuration automatically.
         RedisUsername: # Redis username
         RedisPassword: # Leave blank to load the panel configuration automatically.
+        RedisTLS: false # Connect to Redis over TLS. With RedisAddr left blank, the panel setting is applied automatically.
+        RedisCAFile: # CA certificate file for Redis TLS. Leave blank to use the CA certificate set in the panel, or the system roots if none is set.
         RedisDB: 0 # Redis DB
         Timeout: 5 # Timeout for redis request
         Expiry: 60 # Expiry time (second)
+      ProxyProtocolTrustedIPs: # Relay IPs/CIDRs allowed to send PROXY protocol headers when the panel enables PROXY protocol (AnyTLS only; for Xray nodes, restrict the port with a firewall). Leave blank to accept any source.
       EnableFallback: false # Only support for Trojan and Vless
       FallBackConfigs:  # Support multiple fallbacks
         - SNI: # TLS SNI(Server Name Indication), Empty for any
@@ -75,9 +78,12 @@ Nodes:
 	    #        RedisAddr: # Leave blank to load the panel configuration automatically.
 	    #        RedisUsername: # Redis username
 	    #        RedisPassword: # Leave blank to load the panel configuration automatically.
+	    #        RedisTLS: false # Connect to Redis over TLS. With RedisAddr left blank, the panel setting is applied automatically.
+	    #        RedisCAFile: # CA certificate file for Redis TLS. Leave blank to use the CA certificate set in the panel, or the system roots if none is set.
 	    #        RedisDB: 0 # Redis DB
 	    #        Timeout: 5 # Timeout for redis request
 	    #        Expiry: 60 # Expiry time (second)
+	    #      ProxyProtocolTrustedIPs: # Relay IPs/CIDRs allowed to send PROXY protocol headers when the panel enables PROXY protocol (AnyTLS only; for Xray nodes, restrict the port with a firewall). Leave blank to accept any source.
 	    #      EnableFallback: false # Only support for Trojan and Vless
 	    #      FallBackConfigs:  # Support multiple fallbacks
 	    #        - SNI: # TLS SNI(Server Name Indication), Empty for any

@@ -5,10 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/ECYCloud/ECYCloudNode/common/traffic"
 )
@@ -30,6 +32,19 @@ func trafficDirectory(configured string) string {
 func (c *APIClient) trafficPath(host string) string {
 	identity := sha256.Sum256([]byte(host + "\n" + strconv.Itoa(c.NodeID)))
 	return filepath.Join(c.trafficDir, hex.EncodeToString(identity[:])+".db")
+}
+
+// CheckAPIHost 校验面板下发的新地址：凭据随每个请求的请求头发送，
+// 不接受无法解析、缺主机名或带账号的地址，也不允许从 https 降级为明文 http。
+func CheckAPIHost(current, next string) error {
+	parsed, err := url.Parse(next)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return fmt.Errorf("invalid panel address")
+	}
+	if parsed.Scheme == "http" && !strings.HasPrefix(strings.ToLower(current), "http://") {
+		return fmt.Errorf("refusing to downgrade the panel address to plain http")
+	}
+	return nil
 }
 
 // UpdateAPIHost 在启动服务前切换面板下发的地址，两个地址共用同一份流量文件。
@@ -127,6 +142,10 @@ func (c *APIClient) ReportUserTraffic() error {
 	if store == nil {
 		return fmt.Errorf("traffic state is not open")
 	}
+	batches, err := store.PendingBatches()
+	if err != nil {
+		return err
+	}
 	report, err := store.Pending()
 	if err != nil {
 		return err
@@ -177,14 +196,20 @@ func (c *APIClient) ReportUserTraffic() error {
 		}
 		progress = recovery.ID
 	}
-	if report == nil {
-		return nil
+	// 面板每份最多收 1000 个账户，一个周期只报一份时大节点的其余账户要等好几轮才入账
+	for sent := 1; report != nil; sent++ {
+		receipt, err := c.sendTrafficReport(report)
+		if err != nil {
+			return err
+		}
+		if err := store.Confirm(report.ID, receipt); err != nil || sent >= batches {
+			return err
+		}
+		if report, err = store.Pending(); err != nil {
+			return err
+		}
 	}
-	receipt, err := c.sendTrafficReport(report)
-	if err != nil {
-		return err
-	}
-	return store.Confirm(report.ID, receipt)
+	return nil
 }
 
 func (c *APIClient) trafficProgress() (string, error) {

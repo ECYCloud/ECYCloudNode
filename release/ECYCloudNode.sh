@@ -83,8 +83,23 @@ before_show_menu() {
     show_menu
 }
 
+# 安装脚本先落到临时文件再执行：bash <(curl …) 下载失败时执行空内容并返回 0，会被当成安装成功
+run_install_script() {
+    local script result
+    script=$(mktemp) || return 1
+    if ! curl -fLs -o "${script}" https://github.com/ECYCloud/ECYCloudNode/releases/latest/download/install.sh; then
+        rm -f "${script}"
+        echo -e "${red}下载安装脚本失败，请检查本机能否连接 Github${plain}"
+        return 1
+    fi
+    bash "${script}" "$@"
+    result=$?
+    rm -f "${script}"
+    return ${result}
+}
+
 install() {
-    bash <(curl -Ls https://raw.githubusercontent.com/ECYCloud/ECYCloudNode/main/release/install.sh)
+    run_install_script
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -108,7 +123,7 @@ update() {
 #        fi
 #        return 0
 #    fi
-		bash <(curl -Ls https://raw.githubusercontent.com/ECYCloud/ECYCloudNode/main/release/install.sh) $version
+		run_install_script $version
 		if [[ $? == 0 ]]; then
 			# 安装脚本执行成功后，根据实际重启结果只给出“成功/失败”两种提示，避免误导维护人员
 			sleep 3
@@ -374,12 +389,18 @@ install_bbr() {
 }
 
 update_shell() {
-    wget -O /usr/bin/ECYCloudNode -N https://raw.githubusercontent.com/ECYCloud/ECYCloudNode/main/release/ECYCloudNode.sh
+    # 先下载到临时文件，下载失败时保留现有脚本
+    local shell_file
+    shell_file=$(mktemp)
+    wget -O "${shell_file}" https://github.com/ECYCloud/ECYCloudNode/releases/latest/download/ECYCloudNode.sh
     if [[ $? != 0 ]]; then
+        rm -f "${shell_file}"
         echo ""
         echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
         before_show_menu
     else
+        cp "${shell_file}" /usr/bin/ECYCloudNode
+        rm -f "${shell_file}"
         chmod +x /usr/bin/ECYCloudNode
         ln -sfn /usr/bin/ECYCloudNode /usr/bin/ecycloudnode
         echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0

@@ -25,6 +25,9 @@ var confirmedKey = []byte("confirmed")
 var historyBucket = []byte("confirmed_reports")
 var initializedKey = []byte("initialized")
 
+// maxReportUsers 是面板每份流量报告接受的账户数上限。
+const maxReportUsers = 1000
+
 type Usage struct {
 	UID      int    `json:"user_id"`
 	Upload   int64  `json:"u"`
@@ -226,12 +229,9 @@ func (s *Store) writeRecords() {
 			s.mu.Unlock()
 			return
 		}
-		count := min(len(s.queue), 1000)
-		batch := s.queue[:count:count]
-		s.queue = s.queue[count:]
-		if len(s.queue) == 0 {
-			s.queue = nil
-		}
+		// 排队中的记录全部并进一次提交：每次提交固定两次 fdatasync，按条数分批会让排在后面的连接多等几轮落盘
+		batch := s.queue
+		s.queue = nil
 		s.mu.Unlock()
 		results := make([]error, len(batch))
 		err := s.db.Update(func(tx *bolt.Tx) error {
@@ -323,7 +323,7 @@ func (s *Store) Pending() (*Report, error) {
 			usage = append(usage, Usage{UID: int(uid), Upload: up, Download: down, Identity: string(key[8:])})
 			seen[int(uid)] = true
 			lastKey = append(lastKey[:0], key...)
-			if len(usage) == 1000 {
+			if len(usage) == maxReportUsers {
 				break
 			}
 			key, value = cursor.Next()
@@ -356,6 +356,16 @@ func (s *Store) Pending() (*Report, error) {
 		return bucket.Put(reportKey, data)
 	})
 	return report, err
+}
+
+// PendingBatches 返回报完当前全部待报账户需要的报告份数。
+func (s *Store) PendingBatches() (int, error) {
+	var keys int
+	err := s.db.View(func(tx *bolt.Tx) error {
+		keys = tx.Bucket(totalsBucket).Stats().KeyN
+		return nil
+	})
+	return (keys + maxReportUsers - 1) / maxReportUsers, err
 }
 
 func (s *Store) Confirm(id string, receipt ...string) error {
@@ -407,7 +417,7 @@ func (s *Store) Confirm(id string, receipt ...string) error {
 }
 
 func validateReport(report *Report) error {
-	if report == nil || report.ReconcileReceipt != "" || len(report.ID) != 32 || len(report.Data) == 0 || len(report.Data) > 1000 {
+	if report == nil || report.ReconcileReceipt != "" || len(report.ID) != 32 || len(report.Data) == 0 || len(report.Data) > maxReportUsers {
 		return fmt.Errorf("invalid pending traffic report")
 	}
 	decoded, err := hex.DecodeString(report.ID)

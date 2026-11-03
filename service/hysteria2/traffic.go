@@ -20,10 +20,6 @@ type hyTrafficLogger struct {
 }
 
 func (t *hyTrafficLogger) LogTraffic(id string, tx, rx uint64) bool {
-	if id == "" {
-		return true
-	}
-
 	cred, host := splitAuthID(id)
 	var limiter *rate.Limiter
 
@@ -93,9 +89,13 @@ func (t *hyTrafficLogger) LogOnlineState(id string, online bool) {
 	// Online state is tracked via Authenticator using the onlineSlots map.
 }
 
-func (t *hyTrafficLogger) TraceStream(stream server.HyStream, stats *server.StreamStats) {}
+func (t *hyTrafficLogger) TraceStream(stream server.HyStream, stats *server.StreamStats) {
+	t.svc.streams.Store(stream, stats.AuthID)
+}
 
-func (t *hyTrafficLogger) UntraceStream(stream server.HyStream) {}
+func (t *hyTrafficLogger) UntraceStream(stream server.HyStream) {
+	t.svc.streams.Delete(stream)
+}
 
 // syncUsers syncs the internal user map from the panel provided user list.
 func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
@@ -282,42 +282,29 @@ func (h *Hysteria2Service) userMonitor() error {
 	}
 
 	// Update User
-	usersChanged := true
 	newUserInfo, err := h.apiClient.GetUserList()
 	if err != nil {
-		if err.Error() == api.UserNotModified {
-			usersChanged = false
-			// Reset failure counter on successful "not modified" response
-			h.consecutiveFailures = 0
-		} else {
-			h.logger.Print(err)
-			// Track consecutive API failures for recovery
-			if api.IsAPIFailure(err) {
-				h.consecutiveFailures++
-				h.lastFailureTime = time.Now()
-				h.logger.Warnf("API communication failure detected (%d/%d)", h.consecutiveFailures, api.MaxConsecutiveFailures)
-				if h.consecutiveFailures >= api.MaxConsecutiveFailures {
-					h.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", h.consecutiveFailures)
-					h.triggerRecovery()
-				}
+		h.logger.Print(err)
+		// Track consecutive API failures for recovery
+		if api.IsAPIFailure(err) {
+			failures := h.consecutiveFailures.Add(1)
+			h.logger.Warnf("API communication failure detected (%d/%d)", failures, api.MaxConsecutiveFailures)
+			if failures >= api.MaxConsecutiveFailures {
+				h.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", failures)
+				h.triggerRecovery()
 			}
-			return nil
 		}
+		return nil
 	}
-	if h.consecutiveFailures != 0 {
-		h.consecutiveFailures = 0
-	}
-	if usersChanged {
-		h.syncUsers(newUserInfo)
-	}
+	h.consecutiveFailures.Store(0)
+	h.syncUsers(newUserInfo)
 
 	// Check Rule
 	if !h.config.DisableGetRule && h.rules != nil {
 		if ruleList, err := h.apiClient.GetNodeRule(); err != nil {
-			if err.Error() != api.RuleNotModified {
-				h.logger.Printf("Get rule list filed: %s", err)
-			}
-		} else if len(*ruleList) > 0 {
+			h.logger.Printf("Get rule list filed: %s", err)
+		} else {
+			// 面板删光规则时返回空列表，也要落地，否则旧规则会一直拦到节点重启
 			if err := h.rules.UpdateRule(h.tag, *ruleList); err != nil {
 				h.logger.Print(err)
 			}
@@ -326,7 +313,7 @@ func (h *Hysteria2Service) userMonitor() error {
 		if exemptUsers, err := h.apiClient.GetExemptUsers(); err != nil {
 			h.logger.Printf("Get exempt users failed: %s", err)
 		} else {
-			h.rules.UpdateExemptUsers(exemptUsers)
+			h.rules.UpdateExemptUsers(h.tag, exemptUsers)
 		}
 	}
 
@@ -334,7 +321,7 @@ func (h *Hysteria2Service) userMonitor() error {
 	if err = h.apiClient.ReportNodeOnlineUsers(&onlineUsers); err != nil {
 		h.logger.Print(err)
 	}
-	if kicks := L.TakeDeviceKicks(); len(kicks) > 0 {
+	if kicks := L.TakeDeviceKicks(h.tag); len(kicks) > 0 {
 		if err = h.apiClient.ReportKickedUsers(&kicks); err != nil {
 			h.logger.Print(err)
 		}
@@ -368,36 +355,22 @@ func (h *Hysteria2Service) nodeMonitor() error {
 
 	nodeInfo, err := h.apiClient.GetNodeInfo()
 	if err != nil {
-		if err.Error() == api.NodeNotModified {
-			// Reset failure counter on successful "not modified" response
-			h.consecutiveFailures = 0
-			// 304 不带配置，上一轮重建没走完时只能拿缓存的 nodeInfo 重试
-			if h.needsRebuild() {
-				if err := h.reloadNode(h.nodeInfo); err != nil {
-					h.logger.Printf("Hysteria2 node rebuild retry failed: %v", err)
-				}
-			}
-			return nil
-		}
 		h.logger.Print(err)
 		// Track consecutive API failures for recovery
 		if api.IsAPIFailure(err) {
-			h.consecutiveFailures++
-			h.lastFailureTime = time.Now()
-			h.logger.Warnf("API communication failure detected (%d/%d)", h.consecutiveFailures, api.MaxConsecutiveFailures)
+			failures := h.consecutiveFailures.Add(1)
+			h.logger.Warnf("API communication failure detected (%d/%d)", failures, api.MaxConsecutiveFailures)
 
 			// Check if we should trigger auto-recovery
-			if h.consecutiveFailures >= api.MaxConsecutiveFailures {
-				h.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", h.consecutiveFailures)
+			if failures >= api.MaxConsecutiveFailures {
+				h.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", failures)
 				h.triggerRecovery()
 			}
 		}
 		return nil
 	}
 
-	if h.consecutiveFailures != 0 {
-		h.consecutiveFailures = 0
-	}
+	h.consecutiveFailures.Store(0)
 
 	if nodeInfo == nil || nodeInfo.NodeType != "Hysteria2" {
 		if h.logger != nil {
@@ -415,7 +388,7 @@ func (h *Hysteria2Service) nodeMonitor() error {
 	// to change and GetNodeInfo to return 200 each time, leading to unnecessary
 	// server restarts. Avoid that by comparing the new NodeInfo with the current
 	// one and only reloading when there is a real config change.
-	if h.nodeInfo != nil && !h.needsRebuild() && reflect.DeepEqual(h.nodeInfo, nodeInfo) {
+	if current := h.currentNodeInfo(); current != nil && !h.needsRebuild() && reflect.DeepEqual(current, nodeInfo) {
 		return nil
 	}
 

@@ -12,7 +12,28 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/ECYCloud/ECYCloudNode/common/netguard"
 )
+
+const maxAuditedTargets = 256
+
+// auditHit 同时审计目标地址与嗅探出的域名：嗅探不改写目标，只查域名会让伪造 SNI 的 IP 直连绕过 IP 规则。
+func (s *TuicService) auditHit(m adapter.InboundContext, uid int, host string) bool {
+	if s.rules == nil {
+		return false
+	}
+	targets := []string{m.Domain}
+	if m.Destination.IsValid() {
+		targets = append(targets, m.Destination.String())
+	}
+	for _, target := range targets {
+		if target != "" && s.rules.Detect(s.tag, target, fmt.Sprintf("%d", uid), host) {
+			return true
+		}
+	}
+	return false
+}
 
 // remoteHost 取出连接来源的主机部分，名额的登记与复查共用它。
 func remoteHost(remote string) string {
@@ -95,6 +116,7 @@ type packetConnCounter struct {
 	host        string
 	blocked     bool
 	kickVersion uint64
+	verdicts    map[string]bool
 }
 
 // ReadPacket implements N.PacketReader to count upload traffic (user -> proxy).
@@ -102,7 +124,16 @@ func (c *packetConnCounter) ReadPacket(buffer *buf.Buffer) (destination M.Socksa
 	if c.blocked {
 		return M.Socksaddr{}, io.EOF
 	}
-	destination, err = c.PacketConn.ReadPacket(buffer)
+	// 全锥 UDP 的后续包可发往任意目标，路由规则只检查过首包
+	start := buffer.Start()
+	for {
+		destination, err = c.PacketConn.ReadPacket(buffer)
+		var allowed bool
+		if destination, allowed = netguard.PublicDestination(destination); err != nil || (allowed && c.audited(destination)) {
+			break
+		}
+		buffer.Resize(start, 0)
+	}
 	n := buffer.Len()
 	if n > 0 && c.svc != nil {
 		if recordErr := c.svc.addTraffic(c.uid, int64(n), 0, c.identity); recordErr != nil {
@@ -123,6 +154,26 @@ func (c *packetConnCounter) ReadPacket(buffer *buf.Buffer) (destination M.Socksa
 		}
 	}
 	return destination, err
+}
+
+// audited 逐个目标审计全锥 UDP：路由时的审计只看到同一 UDP 关联的首个目标。
+func (c *packetConnCounter) audited(destination M.Socksaddr) bool {
+	if c.svc == nil || c.svc.rules == nil {
+		return true
+	}
+	target := destination.String()
+	if allowed, ok := c.verdicts[target]; ok {
+		return allowed
+	}
+	allowed := !c.svc.rules.Detect(c.svc.tag, target, fmt.Sprintf("%d", c.uid), c.host)
+	if !allowed {
+		c.svc.logger.WithFields(log.Fields{"uid": c.uid, "remote": c.host, "dest": target}).Warn("TUIC audit rule hit on UDP packet, dropping")
+	}
+	if c.verdicts == nil || len(c.verdicts) >= maxAuditedTargets {
+		c.verdicts = make(map[string]bool)
+	}
+	c.verdicts[target] = allowed
+	return allowed
 }
 
 // WritePacket implements N.PacketWriter to count download traffic (proxy -> user).
@@ -160,9 +211,6 @@ var _ adapter.ConnectionTracker = (*tuicTracker)(nil)
 
 func (t *tuicTracker) RoutedConnection(_ context.Context, conn net.Conn, m adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) net.Conn {
 	if t.svc == nil {
-		return conn
-	}
-	if m.User == "" {
 		return conn
 	}
 
@@ -208,12 +256,9 @@ func (t *tuicTracker) RoutedConnection(_ context.Context, conn net.Conn, m adapt
 	blocked := false
 
 	// Audit check: if a rule hits, mark this connection as blocked and close it.
-	if ok && dest != "" && t.svc.rules != nil {
-		userKey := fmt.Sprintf("%d", userRec.UID)
-		if t.svc.rules.Detect(t.svc.tag, dest, userKey, host) {
-			t.svc.logger.WithFields(fields).Warn("TUIC audit rule hit, closing connection")
-			blocked = true
-		}
+	if ok && t.svc.auditHit(m, userRec.UID, host) {
+		t.svc.logger.WithFields(fields).Warn("TUIC audit rule hit, closing connection")
+		blocked = true
 	}
 
 	// Device limit check (only if not already blocked by audit).
@@ -232,9 +277,6 @@ func (t *tuicTracker) RoutedConnection(_ context.Context, conn net.Conn, m adapt
 
 func (t *tuicTracker) RoutedPacketConnection(_ context.Context, conn N.PacketConn, m adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) N.PacketConn {
 	if t.svc == nil {
-		return conn
-	}
-	if m.User == "" {
 		return conn
 	}
 
@@ -279,13 +321,9 @@ func (t *tuicTracker) RoutedPacketConnection(_ context.Context, conn N.PacketCon
 	blocked := false
 
 	// Audit check for UDP: if a rule hits, block this logical session.
-	if ok && dest != "" && t.svc.rules != nil {
-		userKey := fmt.Sprintf("%d", userRec.UID)
-		srcIP := host
-		if t.svc.rules.Detect(t.svc.tag, dest, userKey, srcIP) {
-			t.svc.logger.WithFields(fields).Warn("TUIC audit rule hit on UDP, closing connection")
-			blocked = true
-		}
+	if ok && t.svc.auditHit(m, userRec.UID, host) {
+		t.svc.logger.WithFields(fields).Warn("TUIC audit rule hit on UDP, closing connection")
+		blocked = true
 	}
 
 	// Device limit check (only if not already blocked by audit).

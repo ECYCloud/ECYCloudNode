@@ -83,6 +83,7 @@ func (s *TuicService) Start() error {
 	// multiple TUIC nodes share the same listen endpoint.
 	s.tag = fmt.Sprintf("%s_%s_%d_%d", s.nodeInfo.NodeType, s.config.ListenIP, s.nodeInfo.Port, s.nodeInfo.NodeID)
 	s.startAt = time.Now()
+	limiter.SetReclaimConsumer(s.tag, limiter.PanelReclaim(s.apiClient))
 	s.inboundTag = s.tag
 
 	userInfo, err := s.apiClient.GetUserList()
@@ -93,15 +94,6 @@ func (s *TuicService) Start() error {
 		s.logger.Warn("No users found for TUIC node, authentication may fail")
 	} else {
 		s.logger.Infof("Syncing %d users for TUIC node", len(*userInfo))
-		// Log first user UUID (partial) for verification at info level so user can confirm credentials
-		if len(*userInfo) > 0 {
-			firstUser := (*userInfo)[0]
-			uuidPreview := firstUser.UUID
-			if len(uuidPreview) > 8 {
-				uuidPreview = uuidPreview[:8] + "..."
-			}
-			s.logger.Infof("First TUIC user from panel: UID=%d, UUID=%s, HasPassword=%v", firstUser.UID, uuidPreview, firstUser.Passwd != "")
-		}
 	}
 	s.syncUsers(userInfo)
 
@@ -118,7 +110,7 @@ func (s *TuicService) Start() error {
 		if exemptUsers, err := s.apiClient.GetExemptUsers(); err != nil {
 			s.logger.Printf("Get exempt users failed: %s", err)
 		} else {
-			s.rules.UpdateExemptUsers(exemptUsers)
+			s.rules.UpdateExemptUsers(s.tag, exemptUsers)
 		}
 	}
 
@@ -199,6 +191,7 @@ func (s *TuicService) Close() error {
 		}
 	}
 	s.tasks = nil
+	limiter.SetReclaimConsumer(s.tag, nil)
 	var closeErr error
 	if instance != nil {
 		closeErr = instance.Close()
@@ -389,7 +382,7 @@ func (s *TuicService) triggerRecovery() {
 	}
 
 	// Reset failure counter
-	s.consecutiveFailures = 0
+	s.consecutiveFailures.Store(0)
 
 	// Restart periodic tasks after a short delay
 	tasks := s.tasks

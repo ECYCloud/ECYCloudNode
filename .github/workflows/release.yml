@@ -108,9 +108,11 @@ jobs:
       CGO_ENABLED: 0
     steps:
       - name: Checkout codebase
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          # 本作业持有 contents: write，令牌不能留在 .git/config 里给后续步骤读取
+          persist-credentials: false
       - name: Show workflow information
         id: get_filename
         run: |
@@ -132,7 +134,7 @@ jobs:
           echo "Building version: $VERSION"
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: false
@@ -140,7 +142,7 @@ jobs:
       # 23 个矩阵作业并发拉包，proxy.golang.org 偶发 INTERNAL_ERROR 断流，
       # go mod download 首个模块失败即整步失败。已下好的模块留在本地缓存，重试只补缺口。
       - name: Get project dependencies
-        uses: nick-fields/retry@v4
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
         with:
           timeout_minutes: 15
           retry_wait_seconds: 30
@@ -169,7 +171,7 @@ jobs:
           mv ECYCloudNode ECYCloudNode.exe
 
       - name: Prepare to release
-        uses: nick-fields/retry@v4
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
         with:
           timeout_minutes: 60
           retry_wait_seconds: 60
@@ -183,6 +185,9 @@ jobs:
             cp ${GITHUB_WORKSPACE}/release/config/custom_inbound.json ./build_assets/custom_inbound.json
             cp ${GITHUB_WORKSPACE}/release/config/rulelist ./build_assets/rulelist
             cp ${GITHUB_WORKSPACE}/release/config/config.yml.example ./build_assets/config.yml
+            # install.sh 从校验过的发布包安装 service 与管理脚本，不再从 main 分支下载
+            cp ${GITHUB_WORKSPACE}/release/ECYCloudNode.service ./build_assets/ECYCloudNode.service
+            cp ${GITHUB_WORKSPACE}/release/ECYCloudNode.sh ./build_assets/ECYCloudNode.sh
             LIST=('geoip geoip geoip' 'domain-list-community dlc geosite')
             for i in "${LIST[@]}"
             do
@@ -216,7 +221,7 @@ jobs:
       # 故首次失败先不中断作业，再试一次；overwrite 让重试幂等，否则第二次会因同名资产已存在而失败。
       - name: Upload files to Artifacts
         id: upload_artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         continue-on-error: true
         with:
           name: ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}
@@ -224,7 +229,7 @@ jobs:
             ./ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}/*
       - name: Upload files to Artifacts (retry)
         if: steps.upload_artifact.outcome == 'failure'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}
           path: |
@@ -232,18 +237,29 @@ jobs:
           overwrite: true
       # 23 个矩阵作业并发调用 Release API，偶发 “other side closed”（对端关连接）。
       # svenstaro/upload-release-action 无重试入参，首个请求失败即整步失败，故改用 gh + 重试。
-      # --clobber 让重试幂等，否则第二次会因资产已存在而失败。
+      # 上传脚本让重试幂等且不覆盖已发布文件；只有退出码 1（gh 与网络错误）才重试，拒绝覆盖时立即失败。
       - name: Upload binaries to release
         if: github.event_name == 'release'
-        uses: nick-fields/retry@v4
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
         with:
           timeout_minutes: 10
           retry_wait_seconds: 30
           max_attempts: 5
-          command: |
-            gh release upload "${{ github.event.release.tag_name }}" \
-              ./ECYCloudNode-$ASSET_NAME.zip \
-              ./ECYCloudNode-$ASSET_NAME.zip.dgst \
-              --repo "$GITHUB_REPOSITORY" --clobber
+          retry_on_exit_code: 1
+          command: bash .github/build/upload-release-assets.sh "$TAG" ./ECYCloudNode-$ASSET_NAME.zip ./ECYCloudNode-$ASSET_NAME.zip.dgst
+      # 管理脚本的 install / update / update_shell 从最新 Release 取这两个脚本；只由一个矩阵作业上传，避免并发覆盖同名资产
+      - name: Upload scripts to release
+        if: github.event_name == 'release' && matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        with:
+          timeout_minutes: 10
+          retry_wait_seconds: 30
+          max_attempts: 5
+          retry_on_exit_code: 1
+          command: bash .github/build/upload-release-assets.sh "$TAG" ./release/install.sh ./release/ECYCloudNode.sh

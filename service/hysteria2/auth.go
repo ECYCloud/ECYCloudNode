@@ -4,6 +4,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ECYCloud/ECYCloudNode/common/limiter"
@@ -21,7 +22,23 @@ func authID(cred, host string, uid ...int) string {
 	return id
 }
 
+var connectionSeq atomic.Uint64
+
+// connectionAuthID 给标识加上连接序号：同一凭据可从同一 IP 建多条连接，审计断连标记
+// 若按凭据与地址共享，会被另一条连接消费或在它断开时清掉，命中的连接就断不掉。
+func connectionAuthID(id string) string {
+	return "conn:" + strconv.FormatUint(connectionSeq.Add(1), 10) + "|" + id
+}
+
+func stripConnection(id string) string {
+	if strings.HasPrefix(id, "conn:") {
+		_, id, _ = strings.Cut(id, "|")
+	}
+	return id
+}
+
 func trafficUID(id string) int {
+	id = stripConnection(id)
 	if strings.HasPrefix(id, "kick:") {
 		_, id, _ = strings.Cut(id, "|")
 	}
@@ -40,6 +57,7 @@ func trafficUID(id string) int {
 // "|"，而凭据理论上可能含，从右侧拆才不会把凭据截断。旧格式（无分隔符）退化为
 // 只有凭据，此时按无地址处理。
 func splitAuthID(id string) (cred, host string) {
+	id = stripConnection(id)
 	if strings.HasPrefix(id, "kick:") {
 		_, id, _ = strings.Cut(id, "|")
 	}
@@ -64,6 +82,7 @@ func accountAuthID(cred, host string, user userRecord) string {
 }
 
 func trafficIdentity(id string) string {
+	id = stripConnection(id)
 	if strings.HasPrefix(id, "kick:") {
 		_, id, _ = strings.Cut(id, "|")
 	}
@@ -75,6 +94,7 @@ func trafficIdentity(id string) string {
 }
 
 func authKickVersion(id string) uint64 {
+	id = stripConnection(id)
 	if !strings.HasPrefix(id, "kick:") {
 		return 0
 	}
@@ -100,8 +120,9 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		host = h
 	}
 
+	// 未认证的失败谁都能触发，按 Warn 记会被拿来刷日志
 	if auth == "" {
-		logger.WithField("remote", host).Warn("Hysteria2 auth failed: empty auth string")
+		logger.WithField("remote", host).Debug("Hysteria2 auth failed: empty auth string")
 		return false, ""
 	}
 
@@ -113,7 +134,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		a.svc.mu.Unlock()
 		logger.WithFields(log.Fields{
 			"remote": host,
-		}).Warn("Hysteria2 auth failed: unknown UUID")
+		}).Debug("Hysteria2 auth failed: unknown UUID")
 		return false, ""
 	}
 	a.svc.mu.Unlock()
@@ -143,9 +164,9 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		a.svc.slotLastActive[auth] = activeMap
 	}
 
-	allowed, _ = limiter.AdmitDeviceSlot(&a.svc.mu, slotSet, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
+	allowed, _ = limiter.AdmitDeviceSlot(a.svc.tag, &a.svc.mu, slotSet, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
 		_, latest, ok := a.svc.slot(auth, host, user.KickVersion)
-		if a.svc.globalChecker != nil {
+		if a.svc.globalChecker.Enforcing() {
 			return 0, ok
 		}
 		return latest.DeviceLimit, ok
@@ -161,7 +182,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 	}
 	limiter.NoteClientIP(user.ClientID, host)
 
-	return true, accountAuthID(auth, host, user)
+	return true, connectionAuthID(accountAuthID(auth, host, user))
 }
 
 // slot 解析该凭据在 host 上占用的名额标识，与 Authenticate 同一口径：
@@ -194,7 +215,7 @@ func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bo
 		return false
 	}
 	localLimit := user.DeviceLimit
-	if h.globalChecker != nil {
+	if h.globalChecker.Enforcing() {
 		localLimit = 0
 	}
 	online, due := limiter.EnsureDeviceSlot(h.onlineSlots, h.slotLastActive, cred, slot, localLimit)
@@ -230,10 +251,13 @@ func (h *Hysteria2Service) verifyOnline(cred, host string, version ...uint64) bo
 	if !ok {
 		return false
 	}
-	if h.globalChecker != nil {
-		return h.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: h.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
+	if h.globalChecker.Enforcing() {
+		allowed := h.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: h.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
 			return h.currentDeviceLimit(cred, host, user.KickVersion)
 		})
+		if !allowed || h.globalChecker.Enforcing() {
+			return allowed
+		}
 	}
 	return localAllowed
 }

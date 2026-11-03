@@ -83,6 +83,7 @@ func (s *AnyTLSService) Start() error {
 	// same IP/port combination.
 	s.tag = fmt.Sprintf("%s_%s_%d_%d", s.nodeInfo.NodeType, s.config.ListenIP, s.nodeInfo.Port, s.nodeInfo.NodeID)
 	s.startAt = time.Now()
+	limiter.SetReclaimConsumer(s.tag, limiter.PanelReclaim(s.apiClient))
 	s.inboundTag = s.tag
 
 	userInfo, err := s.apiClient.GetUserList()
@@ -104,7 +105,7 @@ func (s *AnyTLSService) Start() error {
 		if exemptUsers, err := s.apiClient.GetExemptUsers(); err != nil {
 			s.logger.Printf("Get exempt users failed: %s", err)
 		} else {
-			s.rules.UpdateExemptUsers(exemptUsers)
+			s.rules.UpdateExemptUsers(s.tag, exemptUsers)
 		}
 	}
 
@@ -187,6 +188,7 @@ func (s *AnyTLSService) Close() error {
 		}
 	}
 	s.tasks = nil
+	limiter.SetReclaimConsumer(s.tag, nil)
 	if front != nil {
 		front.Close()
 	}
@@ -384,7 +386,7 @@ func (s *AnyTLSService) triggerRecovery() {
 	}
 
 	// Reset failure counter
-	s.consecutiveFailures = 0
+	s.consecutiveFailures.Store(0)
 
 	// Restart periodic tasks after a short delay
 	tasks := s.tasks

@@ -22,7 +22,8 @@ func NewTask(apiClient api.API, nodeID int, logger *log.Entry) *task.Periodic {
 			mutex.Lock()
 			defer mutex.Unlock()
 
-			if HasNodeReported(nodeID) {
+			host := apiClient.Describe().APIHost
+			if HasNodeReported(host, nodeID) {
 				return nil
 			}
 
@@ -53,14 +54,14 @@ func NewTask(apiClient api.API, nodeID int, logger *log.Entry) *task.Periodic {
 			resultJSON := results.ToJSON()
 			logger.Printf("[UnlockCheck] Node %d: Results: %s", nodeID, resultJSON)
 
-			allNodeIDs := GetRegisteredNodeIDs()
+			allNodeIDs := GetRegisteredNodeIDs(host)
 			logger.Printf("[UnlockCheck] Node %d: Reporting results for %d nodes: %v", nodeID, len(allNodeIDs), allNodeIDs)
 			for _, targetNodeID := range allNodeIDs {
 				if err := apiClient.ReportUnlockCheckResultForNode(targetNodeID, resultJSON); err != nil {
 					logger.Printf("[UnlockCheck] Node %d: Failed to report for node %d: %v", nodeID, targetNodeID, err)
 				} else {
 					logger.Printf("[UnlockCheck] Node %d: Reported successfully for node %d", nodeID, targetNodeID)
-					MarkNodeReported(targetNodeID)
+					MarkNodeReported(host, targetNodeID)
 				}
 			}
 			return nil

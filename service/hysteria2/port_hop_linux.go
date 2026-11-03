@@ -18,16 +18,12 @@ import (
 //   iptables -t nat -A PREROUTING -p udp --dport 30001:50000 -j REDIRECT --to-port 30000
 func applyPortHopIptablesRules(rules []portHopRule, logger *log.Entry) {
 	for _, r := range rules {
-		args := []string{"-t", "nat", "-A", "PREROUTING", "-p", "udp"}
-		if r.FromPortStart == r.FromPortEnd {
-			args = append(args, "--dport", fmt.Sprintf("%d", r.FromPortStart))
-		} else {
-			args = append(args, "--dport", fmt.Sprintf("%d:%d", r.FromPortStart, r.FromPortEnd))
+		// 已装规则只记在内存里：进程崩溃或被强杀后残留的同一条规则直接接管，重启时不再重复追加
+		if _, err := portHopIptables("-C", r); err == nil {
+			logger.Debugf("Hysteria2 port hop: iptables rule already present (%v)", r)
+			continue
 		}
-		args = append(args, "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", r.ToPort))
-
-		cmd := exec.Command("iptables", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if out, err := portHopIptables("-A", r); err != nil {
 			logger.Errorf("Hysteria2 port hop: failed to add iptables rule (%v): %v, output: %s", r, err, string(out))
 		} else {
 			logger.Debugf("Hysteria2 port hop: added iptables rule (%v)", r)
@@ -39,16 +35,7 @@ func applyPortHopIptablesRules(rules []portHopRule, logger *log.Entry) {
 // rule must match exactly the arguments used when it was added.
 func deletePortHopIptablesRules(rules []portHopRule, logger *log.Entry) {
 	for _, r := range rules {
-		args := []string{"-t", "nat", "-D", "PREROUTING", "-p", "udp"}
-		if r.FromPortStart == r.FromPortEnd {
-			args = append(args, "--dport", fmt.Sprintf("%d", r.FromPortStart))
-		} else {
-			args = append(args, "--dport", fmt.Sprintf("%d:%d", r.FromPortStart, r.FromPortEnd))
-		}
-		args = append(args, "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", r.ToPort))
-
-		cmd := exec.Command("iptables", args...)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if out, err := portHopIptables("-D", r); err != nil {
 			// If the rule no longer exists we just log at debug level instead of
 			// failing hard, to keep behavior close to manually running iptables -D.
 			logger.Debugf("Hysteria2 port hop: failed to delete iptables rule (%v): %v, output: %s", r, err, string(out))
@@ -56,4 +43,14 @@ func deletePortHopIptablesRules(rules []portHopRule, logger *log.Entry) {
 			logger.Debugf("Hysteria2 port hop: deleted iptables rule (%v)", r)
 		}
 	}
+}
+
+// portHopIptables 以 action（-A / -C / -D）操作同一条规则：三者参数必须完全一致，iptables 才认作同一条。
+func portHopIptables(action string, r portHopRule) ([]byte, error) {
+	dport := fmt.Sprintf("%d", r.FromPortStart)
+	if r.FromPortStart != r.FromPortEnd {
+		dport = fmt.Sprintf("%d:%d", r.FromPortStart, r.FromPortEnd)
+	}
+	return exec.Command("iptables", "-t", "nat", action, "PREROUTING", "-p", "udp", "--dport", dport,
+		"-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", r.ToPort)).CombinedOutput()
 }

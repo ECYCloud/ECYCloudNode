@@ -5,7 +5,7 @@
 ## 一键安装
 
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/ECYCloud/ECYCloudNode/main/release/install.sh)
+bash <(curl -Ls https://github.com/ECYCloud/ECYCloudNode/releases/latest/download/install.sh)
 ```
 
 ## 配置示例
@@ -28,7 +28,7 @@ ConnectionConfig:
 Nodes:
   - ApiConfig:
       ApiHost: "http://127.0.0.1:667"
-      ApiKey: "123"
+      ApiKey: "123" # Credential issued by the panel for this server. Sent as a request header.
       NodeID: 1,2,3   # Start multiple nodes: 1,2,3
       Timeout: 30 # Timeout for the api request
       SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable

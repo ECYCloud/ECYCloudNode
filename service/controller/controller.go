@@ -151,6 +151,9 @@ func (c *Controller) Start() error {
 	}
 	c.nodeInfo = newNodeInfo
 	c.Tag = c.buildNodeTag()
+	if newNodeInfo.AcceptProxyProtocol {
+		c.logger.Warn("PROXY protocol is enabled: Xray accepts PROXY headers from any source, so allow only relay IPs to this port in the firewall")
+	}
 
 	// Log a clear mapping between Tag and NodeID for this controller instance.
 	// This helps diagnose any cross-node mixing issues in multi-node deployments.
@@ -202,7 +205,7 @@ func (c *Controller) Start() error {
 		if exemptUsers, err := c.apiClient.GetExemptUsers(); err != nil {
 			c.logger.Printf("Get exempt users failed: %s", err)
 		} else {
-			c.dispatcher.RuleManager.UpdateExemptUsers(exemptUsers)
+			c.dispatcher.RuleManager.UpdateExemptUsers(c.Tag, exemptUsers)
 		}
 	}
 
@@ -340,30 +343,22 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	defer c.monitorMu.Unlock()
 
 	// First fetch Node Info
-	var nodeInfoChanged = true
 	newNodeInfo, err := c.apiClient.GetNodeInfo()
 	if err != nil {
-		if err.Error() == api.NodeNotModified {
-			nodeInfoChanged = false
-			newNodeInfo = c.nodeInfo
-			// Reset failure counter on successful "not modified" response
-			c.consecutiveFailures = 0
-		} else {
-			c.logger.Print(err)
-			// Track consecutive API failures for recovery
-			if api.IsAPIFailure(err) {
-				c.consecutiveFailures++
-				c.lastFailureTime = time.Now()
-				c.logger.Warnf("API communication failure detected (%d/%d)", c.consecutiveFailures, api.MaxConsecutiveFailures)
+		c.logger.Print(err)
+		// Track consecutive API failures for recovery
+		if api.IsAPIFailure(err) {
+			c.consecutiveFailures++
+			c.lastFailureTime = time.Now()
+			c.logger.Warnf("API communication failure detected (%d/%d)", c.consecutiveFailures, api.MaxConsecutiveFailures)
 
-				// Check if we should trigger auto-recovery
-				if c.consecutiveFailures >= api.MaxConsecutiveFailures {
-					c.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", c.consecutiveFailures)
-					c.triggerRecovery()
-				}
+			// Check if we should trigger auto-recovery
+			if c.consecutiveFailures >= api.MaxConsecutiveFailures {
+				c.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", c.consecutiveFailures)
+				c.triggerRecovery()
 			}
-			return nil
 		}
+		return nil
 	}
 	if c.consecutiveFailures != 0 {
 		c.consecutiveFailures = 0
@@ -373,34 +368,26 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	}
 
 	// Update User
-	var usersChanged = true
 	newUserInfo, err := c.getUserList()
 	if err != nil {
-		if err.Error() == api.UserNotModified {
-			usersChanged = false
-			newUserInfo = c.userList
-			// Reset failure counter on successful "not modified" response
-			c.consecutiveFailures = 0
-		} else {
-			c.logger.Print(err)
-			if api.IsAPIFailure(err) {
-				c.consecutiveFailures++
-				c.lastFailureTime = time.Now()
-				c.logger.Warnf("API communication failure detected (%d/%d)", c.consecutiveFailures, api.MaxConsecutiveFailures)
-				if c.consecutiveFailures >= api.MaxConsecutiveFailures {
-					c.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", c.consecutiveFailures)
-					c.triggerRecovery()
-				}
+		c.logger.Print(err)
+		if api.IsAPIFailure(err) {
+			c.consecutiveFailures++
+			c.lastFailureTime = time.Now()
+			c.logger.Warnf("API communication failure detected (%d/%d)", c.consecutiveFailures, api.MaxConsecutiveFailures)
+			if c.consecutiveFailures >= api.MaxConsecutiveFailures {
+				c.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", c.consecutiveFailures)
+				c.triggerRecovery()
 			}
-			return nil
 		}
+		return nil
 	}
 	if c.consecutiveFailures != 0 {
 		c.consecutiveFailures = 0
 	}
 
 	// If nodeInfo changed
-	nodeInfoChanged = c.needsRebuild() || (nodeInfoChanged && !reflect.DeepEqual(c.nodeInfo, newNodeInfo))
+	nodeInfoChanged := c.needsRebuild() || !reflect.DeepEqual(c.nodeInfo, newNodeInfo)
 	if nodeInfoChanged {
 		// 置位要早于摘掉旧 inbound：中途任何一步失败都得让下一轮重来，
 		// 否则节点会停在「没有 inbound」的状态上不再自愈。
@@ -415,6 +402,11 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		// Add new tag
 		c.nodeInfo = newNodeInfo
 		c.Tag = c.buildNodeTag()
+		if c.Tag != oldTag {
+			for _, u := range *c.userList {
+				c.unregisterTraffic(u.Key(oldTag))
+			}
+		}
 		c.logger.Infof("Node info changed, rebuild tag: oldTag=%s newTag=%s NodeID=%d NodeType=%s ListenIP=%s Port=%d",
 			oldTag,
 			c.Tag,
@@ -438,10 +430,9 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	// Check Rule
 	if !c.config.DisableGetRule {
 		if ruleList, err := c.apiClient.GetNodeRule(); err != nil {
-			if err.Error() != api.RuleNotModified {
-				c.logger.Printf("Get rule list filed: %s", err)
-			}
-		} else if len(*ruleList) > 0 {
+			c.logger.Printf("Get rule list filed: %s", err)
+		} else {
+			// 面板删光规则时返回空列表，也要落地，否则旧规则会一直拦到节点重启
 			if err := c.UpdateRule(c.Tag, *ruleList); err != nil {
 				c.logger.Print(err)
 			}
@@ -450,7 +441,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		if exemptUsers, err := c.apiClient.GetExemptUsers(); err != nil {
 			c.logger.Printf("Get exempt users failed: %s", err)
 		} else {
-			c.dispatcher.RuleManager.UpdateExemptUsers(exemptUsers)
+			c.dispatcher.RuleManager.UpdateExemptUsers(c.Tag, exemptUsers)
 		}
 	}
 
@@ -462,38 +453,35 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		}
 
 		// Add Limiter
-		if err := c.AddInboundLimiter(c.Tag, newNodeInfo.SpeedLimit, newUserInfo, c.config.GlobalDeviceLimitConfig); err != nil {
+		if err := c.AddInboundLimiter(c.Tag, newNodeInfo.SpeedLimit, c.withAutoLimits(newUserInfo), c.config.GlobalDeviceLimitConfig); err != nil {
 			c.logger.Print(err)
 			return nil
 		}
 		c.setRebuildPending(false)
 	} else {
-		var deleted, added []api.UserInfo
 		syncFailed := false
-		if usersChanged {
-			deleted, added = compareUserList(c.userList, newUserInfo)
-			if len(deleted) > 0 {
-				deletedEmail := make([]string, len(deleted))
-				for i, u := range deleted {
-					deletedEmail[i] = c.buildUserTag(&u)
-				}
-				err := c.removeUsers(deletedEmail, c.Tag)
-				if err != nil {
-					c.logger.Print(err)
-					syncFailed = true
-				}
+		deleted, added := compareUserList(c.userList, newUserInfo)
+		if len(deleted) > 0 {
+			deletedEmail := make([]string, len(deleted))
+			for i, u := range deleted {
+				deletedEmail[i] = c.buildUserTag(&u)
 			}
-			if len(added) > 0 {
-				err = c.addNewUser(&added, c.nodeInfo)
-				if err != nil {
-					c.logger.Print(err)
-					syncFailed = true
-				}
-			}
-			if err := c.UpdateInboundLimiter(c.Tag, newUserInfo, true); err != nil {
+			err := c.removeUsers(deletedEmail, c.Tag)
+			if err != nil {
 				c.logger.Print(err)
 				syncFailed = true
 			}
+		}
+		if len(added) > 0 {
+			err = c.addNewUser(&added, c.nodeInfo)
+			if err != nil {
+				c.logger.Print(err)
+				syncFailed = true
+			}
+		}
+		if err := c.UpdateInboundLimiter(c.Tag, c.withAutoLimits(newUserInfo), true); err != nil {
+			c.logger.Print(err)
+			syncFailed = true
 		}
 		c.logger.Printf("%d user deleted, %d user added", len(deleted), len(added))
 		if syncFailed {
@@ -669,16 +657,10 @@ func compareUserList(old, next *[]api.UserInfo) (deleted, added []api.UserInfo) 
 	previous := make(map[api.UserInfo]api.UserInfo)
 	current := make(map[api.UserInfo]api.UserInfo)
 	for _, u := range *old {
-		key := u
-		key.ValidUntil = 0
-		key.KickVersion = 0
-		previous[key] = u
+		previous[userIdentity(u)] = u
 	}
 	for _, u := range *next {
-		key := u
-		key.ValidUntil = 0
-		key.KickVersion = 0
-		current[key] = u
+		current[userIdentity(u)] = u
 	}
 	for key, u := range previous {
 		if _, ok := current[key]; !ok {
@@ -693,15 +675,48 @@ func compareUserList(old, next *[]api.UserInfo) (deleted, added []api.UserInfo) 
 	return
 }
 
+// userIdentity 去掉每轮同步都可能变化的授权期限与下线序号，用来认出同一用户：
+// 面板时钟换算会让 ValidUntil 秒级抖动，直接拿整条记录做键，超速计数与已施加的限速每轮都对不上
+func userIdentity(user api.UserInfo) api.UserInfo {
+	user.ValidUntil = 0
+	user.KickVersion = 0
+	return user
+}
+
+func autoLimitRate(mbps int) uint64 {
+	return uint64((mbps * 1000000) / 8)
+}
+
 func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
-	c.limitedUsers[user] = LimitInfo{
+	key := userIdentity(user)
+	c.limitedUsers[key] = LimitInfo{
 		end:               time.Now().Unix() + int64(c.config.AutoSpeedLimitConfig.LimitDuration*60),
 		currentSpeedLimit: c.config.AutoSpeedLimitConfig.LimitSpeed,
 		originSpeedLimit:  user.SpeedLimit,
 	}
-	c.logger.Printf("Limit User: %s Speed: %d End: %s", c.buildUserTag(&user), c.config.AutoSpeedLimitConfig.LimitSpeed, time.Unix(c.limitedUsers[user].end, 0).Format("01-02 15:04:05"))
-	user.SpeedLimit = uint64((c.config.AutoSpeedLimitConfig.LimitSpeed * 1000000) / 8)
+	c.logger.Printf("Limit User: %s Speed: %d End: %s", c.buildUserTag(&user), c.config.AutoSpeedLimitConfig.LimitSpeed, time.Unix(c.limitedUsers[key].end, 0).Format("01-02 15:04:05"))
+	user.SpeedLimit = autoLimitRate(c.config.AutoSpeedLimitConfig.LimitSpeed)
 	*silentUsers = append(*silentUsers, user)
+}
+
+// withAutoLimits 让同步给限速器的用户列表带上仍在生效的自动限速：面板下发的是原限速，
+// 原样同步会在下一轮就把自动限速解除。限速桶按账户共用，同一 UID 的全部凭据都要带上。
+func (c *Controller) withAutoLimits(users *[]api.UserInfo) *[]api.UserInfo {
+	if len(c.limitedUsers) == 0 {
+		return users
+	}
+	limited := make(map[int]uint64, len(c.limitedUsers))
+	for user, info := range c.limitedUsers {
+		limited[user.UID] = autoLimitRate(info.currentSpeedLimit)
+	}
+	result := make([]api.UserInfo, len(*users))
+	for i, user := range *users {
+		if speed, ok := limited[user.UID]; ok {
+			user.SpeedLimit = speed
+		}
+		result[i] = user
+	}
+	return &result
 }
 
 func (c *Controller) userInfoMonitor() (err error) {
@@ -753,7 +768,10 @@ func (c *Controller) userInfoMonitor() (err error) {
 	AutoSpeedLimit := int64(c.config.AutoSpeedLimitConfig.Limit)
 	UpdatePeriodic := int64(c.config.UpdatePeriodic)
 	limitedUsers := make([]api.UserInfo, 0)
+	current := make(map[api.UserInfo]bool, len(*c.userList))
 	for _, user := range *c.userList {
+		key := userIdentity(user)
+		current[key] = true
 		userTag := c.buildUserTag(&user)
 		up, down := c.getTraffic(userTag)
 		if down > 0 {
@@ -763,23 +781,29 @@ func (c *Controller) userInfoMonitor() (err error) {
 			// Over speed users
 			if AutoSpeedLimit > 0 {
 				if down > AutoSpeedLimit*1000000*UpdatePeriodic/8 || up > AutoSpeedLimit*1000000*UpdatePeriodic/8 {
-					if _, ok := c.limitedUsers[user]; !ok {
+					if _, ok := c.limitedUsers[key]; !ok {
 						if c.config.AutoSpeedLimitConfig.WarnTimes == 0 {
 							limitUser(c, user, &limitedUsers)
 						} else {
-							c.warnedUsers[user] += 1
-							if c.warnedUsers[user] > c.config.AutoSpeedLimitConfig.WarnTimes {
+							c.warnedUsers[key] += 1
+							if c.warnedUsers[key] > c.config.AutoSpeedLimitConfig.WarnTimes {
 								limitUser(c, user, &limitedUsers)
-								delete(c.warnedUsers, user)
+								delete(c.warnedUsers, key)
 							}
 						}
 					}
 				} else {
-					delete(c.warnedUsers, user)
+					delete(c.warnedUsers, key)
 				}
 			}
 		} else {
-			delete(c.warnedUsers, user)
+			delete(c.warnedUsers, key)
+		}
+	}
+	// 面板删掉的用户不会再出现在上面的循环里，留下的警告计数要一并清掉
+	for key := range c.warnedUsers {
+		if !current[key] {
+			delete(c.warnedUsers, key)
 		}
 	}
 	if len(limitedUsers) > 0 {
@@ -814,7 +838,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 				identity,
 			)
 		}
-		if kicks := limiter.TakeDeviceKicks(); len(kicks) > 0 {
+		if kicks := limiter.TakeDeviceKicks(c.Tag); len(kicks) > 0 {
 			if err = c.apiClient.ReportKickedUsers(&kicks); err != nil {
 				c.logger.Print(err)
 			}

@@ -2,6 +2,7 @@ package tuic
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	box "github.com/sagernet/sing-box"
@@ -59,8 +60,8 @@ type TuicService struct {
 	generation  uint64
 
 	// Recovery tracking for IP whitelist / connectivity issues
-	consecutiveFailures int
-	lastFailureTime     time.Time
+	// consecutiveFailures 由用户与节点两个周期任务各自的 goroutine 同时累加、清零
+	consecutiveFailures atomic.Int32
 	recoveryMutex       sync.Mutex
 	recoveryInProgress  bool
 }

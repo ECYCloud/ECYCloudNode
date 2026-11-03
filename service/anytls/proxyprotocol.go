@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/pires/go-proxyproto"
 	box "github.com/sagernet/sing-box"
@@ -39,25 +40,44 @@ func (s *AnyTLSService) startProxyProtocolFrontend(boxInstance *box.Box, listenA
 		return nil, fmt.Errorf("listen proxy protocol frontend on %s:%d: %w", listenAddr, port, err)
 	}
 
-	ppListener := &proxyproto.Listener{
-		Listener: tcpListener,
-		Policy:   func(net.Addr) (proxyproto.Policy, error) { return proxyproto.REQUIRE, nil },
+	ppListener, err := newProxyProtocolListener(tcpListener, s.config.ProxyProtocolTrustedIPs)
+	if err != nil {
+		tcpListener.Close()
+		return nil, err
 	}
 
 	go s.acceptProxyProtocolConns(ppListener, injectable)
 	return ppListener, nil
 }
 
+// newProxyProtocolListener 配置了可信来源时只采信这些中转发来的 PROXY 头，其余来源的连接一律拒绝：
+// 端口本身仍对公网开放，任何人都能自带伪造来源 IP 的 PROXY 头直连。
+func newProxyProtocolListener(ln net.Listener, trusted []string) (*proxyproto.Listener, error) {
+	policy := proxyproto.ConnPolicyFunc(func(proxyproto.ConnPolicyOptions) (proxyproto.Policy, error) { return proxyproto.REQUIRE, nil })
+	if len(trusted) > 0 {
+		var err error
+		if policy, err = proxyproto.PolicyFromRanges(trusted, proxyproto.REQUIRE, proxyproto.REJECT); err != nil {
+			return nil, fmt.Errorf("invalid ProxyProtocolTrustedIPs: %w", err)
+		}
+	}
+	return &proxyproto.Listener{Listener: ln, ConnPolicy: policy}, nil
+}
+
 func (s *AnyTLSService) acceptProxyProtocolConns(ln net.Listener, injectable adapter.TCPInjectableInbound) {
+	var retryDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			s.logger.Warnf("AnyTLS proxy protocol frontend accept error: %v", err)
+			// 与 sing-box 自身监听器一致逐次退避：文件描述符耗尽等错误会立即重现，不等待就会空转刷日志
+			retryDelay = min(max(2*retryDelay, 5*time.Millisecond), time.Second)
+			s.logger.Warnf("AnyTLS proxy protocol frontend accept error: %v, retrying in %s", err, retryDelay)
+			time.Sleep(retryDelay)
 			continue
 		}
+		retryDelay = 0
 		go func() {
 			var metadata adapter.InboundContext
 			metadata.Inbound = s.inboundTag

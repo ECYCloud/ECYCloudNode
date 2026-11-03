@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -164,7 +165,7 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 				SpeedLimit:      u.SpeedLimit,
 				DeviceLimit:     u.DeviceLimit,
 			})
-			inboundInfo.updateRateBucket(userKey, u.UID, u.ClientID, u.SpeedLimit)
+			inboundInfo.updateRateBucket(u.UID, u.SpeedLimit)
 		}
 		inboundInfo.slotMu.Unlock()
 	} else {
@@ -190,15 +191,18 @@ func (l *Limiter) UpdateInboundSpeedLimit(tag string, users *[]api.UserInfo) err
 		user := value.(UserInfo)
 		user.SpeedLimit = update.SpeedLimit
 		info.UserInfo.Store(key, user)
-		info.updateRateBucket(key, user.UID, user.ClientID, user.SpeedLimit)
+		info.updateRateBucket(user.UID, user.SpeedLimit)
 	}
 	return nil
 }
 
-func (info *InboundInfo) updateRateBucket(key string, uid, clientID int, speed uint64) {
-	if clientID != 0 {
-		key = fmt.Sprintf("%s|%d", info.Tag, uid)
-	}
+// rateKey 是账户级限速桶：同一账户的官方设备与第三方凭据（含不同 traffic_identity）共用一份预算
+func rateKey(tag string, uid int) string {
+	return fmt.Sprintf("%s|%d", tag, uid)
+}
+
+func (info *InboundInfo) updateRateBucket(uid int, speed uint64) {
+	key := rateKey(info.Tag, uid)
 	limit := determineRate(info.NodeSpeedLimit, speed)
 	if limit == 0 {
 		info.BucketHub.Delete(key)
@@ -240,9 +244,14 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 				return true
 			})
 			if active == 0 {
-				// 用户已完全下线：释放在线表与限速桶
+				// 该组已完全下线：释放在线表；官方与第三方两组都下线后才回收共用的限速桶
 				inboundInfo.UserOnlineSlots.Delete(email)
-				inboundInfo.BucketHub.Delete(email)
+				account := strings.TrimSuffix(email, "|client")
+				if _, ok := inboundInfo.UserOnlineSlots.Load(account); !ok {
+					if _, ok := inboundInfo.UserOnlineSlots.Load(account + "|client"); !ok {
+						inboundInfo.BucketHub.Delete(account)
+					}
+				}
 			}
 			return true
 		})
@@ -296,14 +305,12 @@ func (l *Limiter) rateBucket(tag, userKey string) *rate.Limiter {
 	if limit == 0 {
 		return nil
 	}
-	if u.ClientID != 0 {
-		userKey = fmt.Sprintf("%s|%d", tag, u.UID)
-	}
-	if value, ok := inboundInfo.BucketHub.Load(userKey); ok {
+	key := rateKey(tag, u.UID)
+	if value, ok := inboundInfo.BucketHub.Load(key); ok {
 		return value.(*rate.Limiter)
 	}
 	bucket := rate.NewLimiter(rate.Limit(limit), int(limit))
-	value, _ = inboundInfo.BucketHub.LoadOrStore(userKey, bucket)
+	value, _ = inboundInfo.BucketHub.LoadOrStore(key, bucket)
 	return value.(*rate.Limiter)
 }
 
@@ -340,7 +347,7 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 			inboundInfo.slotMu.Unlock()
 			return false
 		}
-		if inboundInfo.GlobalLimit != nil {
+		if inboundInfo.GlobalLimit.Enforcing() {
 			deviceLimit = 0
 		}
 		now := time.Now().Unix()
@@ -371,7 +378,7 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 				}
 				// 取确认是一次对面板的 HTTP 调用，不能持锁等待；拿到后重新数一遍再踢
 				inboundInfo.slotMu.Unlock()
-				grant = ConsumeReclaimGrant(uid, slot)
+				grant = ConsumeReclaimGrant(inboundInfo.Tag, uid, slot)
 				grantChecked = true
 				inboundInfo.slotMu.Lock()
 				continue
@@ -384,7 +391,7 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 					inboundInfo.slotMu.Unlock()
 					return false
 				}
-				NoteDeviceKick(uid, evicted)
+				NoteDeviceKick(inboundInfo.Tag, uid, evicted)
 				target = ""
 				counter--
 			}
@@ -464,7 +471,7 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	}
 
 	inboundInfo.slotMu.Lock()
-	if !l.AuthorizationAllowed(tag, userKey, user.KickVersion) || (inboundInfo.GlobalLimit == nil && !l.VerifyOnline(tag, userKey, ip)) {
+	if !l.AuthorizationAllowed(tag, userKey, user.KickVersion) || (!inboundInfo.GlobalLimit.Enforcing() && !l.VerifyOnline(tag, userKey, ip)) {
 		inboundInfo.slotMu.Unlock()
 		return false
 	}
@@ -512,11 +519,14 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 		return true
 	}
 	slot := OnlineKey(clientID, ip)
-	if inboundInfo.GlobalLimit != nil {
+	if inboundInfo.GlobalLimit.Enforcing() {
 		user.Scope = tag
-		return inboundInfo.GlobalLimit.Verify(uid, slot, deviceLimit, user, func() (int, bool) {
+		allowed := inboundInfo.GlobalLimit.Verify(uid, slot, deviceLimit, user, func() (int, bool) {
 			return inboundInfo.currentDeviceLimit(userKey, user.KickVersion)
 		})
+		if !allowed || inboundInfo.GlobalLimit.Enforcing() {
+			return allowed
+		}
 	}
 
 	v, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, uid, clientID))

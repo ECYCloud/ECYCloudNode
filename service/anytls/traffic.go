@@ -206,9 +206,9 @@ func (s *AnyTLSService) allowConnection(uuid, host string) bool {
 		s.slotLastActive[uuid] = activeMap
 	}
 
-	allowed, _ = limiter.AdmitDeviceSlot(&s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
+	allowed, _ = limiter.AdmitDeviceSlot(s.tag, &s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
 		_, latest, ok := s.slot(uuid, host, user.KickVersion)
-		if s.globalChecker != nil {
+		if s.globalChecker.Enforcing() {
 			return 0, ok
 		}
 		return latest.DeviceLimit, ok
@@ -237,7 +237,7 @@ func (s *AnyTLSService) ensureOnline(uuid, host string, version ...uint64) bool 
 		return false
 	}
 	localLimit := user.DeviceLimit
-	if s.globalChecker != nil {
+	if s.globalChecker.Enforcing() {
 		localLimit = 0
 	}
 	online, due := limiter.EnsureDeviceSlot(s.onlineSlots, s.slotLastActive, uuid, slot, localLimit)
@@ -280,10 +280,13 @@ func (s *AnyTLSService) verifyOnline(uuid, host string, version ...uint64) bool 
 	if !ok {
 		return false
 	}
-	if s.globalChecker != nil {
-		return s.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: s.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
+	if s.globalChecker.Enforcing() {
+		allowed := s.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: s.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
 			return s.currentDeviceLimit(uuid, host, user.KickVersion)
 		})
+		if !allowed || s.globalChecker.Enforcing() {
+			return allowed
+		}
 	}
 	return localAllowed
 }
@@ -351,35 +354,23 @@ func (s *AnyTLSService) userMonitor() error {
 		}
 	}
 
-	usersChanged := true
 	newUserInfo, err := s.apiClient.GetUserList()
 	if err != nil {
-		if err.Error() == api.UserNotModified {
-			usersChanged = false
-			// Reset failure counter on successful "not modified" response
-			s.consecutiveFailures = 0
-		} else {
-			s.logger.Print(err)
-			// Track consecutive API failures for recovery
-			if api.IsAPIFailure(err) {
-				s.consecutiveFailures++
-				s.lastFailureTime = time.Now()
-				s.logger.Warnf("API communication failure detected (%d/%d)", s.consecutiveFailures, api.MaxConsecutiveFailures)
-				if s.consecutiveFailures >= api.MaxConsecutiveFailures {
-					s.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", s.consecutiveFailures)
-					s.triggerRecovery()
-				}
+		s.logger.Print(err)
+		// Track consecutive API failures for recovery
+		if api.IsAPIFailure(err) {
+			failures := s.consecutiveFailures.Add(1)
+			s.logger.Warnf("API communication failure detected (%d/%d)", failures, api.MaxConsecutiveFailures)
+			if failures >= api.MaxConsecutiveFailures {
+				s.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", failures)
+				s.triggerRecovery()
 			}
-			return nil
 		}
+		return nil
 	}
-	if s.consecutiveFailures != 0 {
-		s.consecutiveFailures = 0
-	}
-	if usersChanged {
-		s.syncUsers(newUserInfo)
-	}
-	if (usersChanged || s.hasUnbuiltAuthUser()) && !s.awaitingRebuild() {
+	s.consecutiveFailures.Store(0)
+	s.syncUsers(newUserInfo)
+	if s.hasUnbuiltAuthUser() && !s.awaitingRebuild() {
 		if err := s.updateInboundUsers(); err != nil {
 			s.logger.Errorf("AnyTLS user update failed: %v", err)
 		}
@@ -388,10 +379,9 @@ func (s *AnyTLSService) userMonitor() error {
 	// Check Rule
 	if !s.config.DisableGetRule && s.rules != nil {
 		if ruleList, err := s.apiClient.GetNodeRule(); err != nil {
-			if err.Error() != api.RuleNotModified {
-				s.logger.Printf("Get rule list filed: %s", err)
-			}
-		} else if len(*ruleList) > 0 {
+			s.logger.Printf("Get rule list filed: %s", err)
+		} else {
+			// 面板删光规则时返回空列表，也要落地，否则旧规则会一直拦到节点重启
 			if err := s.rules.UpdateRule(s.tag, *ruleList); err != nil {
 				s.logger.Print(err)
 			}
@@ -400,7 +390,7 @@ func (s *AnyTLSService) userMonitor() error {
 		if exemptUsers, err := s.apiClient.GetExemptUsers(); err != nil {
 			s.logger.Printf("Get exempt users failed: %s", err)
 		} else {
-			s.rules.UpdateExemptUsers(exemptUsers)
+			s.rules.UpdateExemptUsers(s.tag, exemptUsers)
 		}
 	}
 
@@ -408,7 +398,7 @@ func (s *AnyTLSService) userMonitor() error {
 	if err = s.apiClient.ReportNodeOnlineUsers(&onlineUsers); err != nil {
 		s.logger.Print(err)
 	}
-	if kicks := limiter.TakeDeviceKicks(); len(kicks) > 0 {
+	if kicks := limiter.TakeDeviceKicks(s.tag); len(kicks) > 0 {
 		if err = s.apiClient.ReportKickedUsers(&kicks); err != nil {
 			s.logger.Print(err)
 		}
@@ -440,36 +430,22 @@ func (s *AnyTLSService) nodeMonitor() error {
 
 	nodeInfo, err := s.apiClient.GetNodeInfo()
 	if err != nil {
-		if err.Error() == api.NodeNotModified {
-			// Reset failure counter on successful "not modified" response
-			s.consecutiveFailures = 0
-			// 304 不带配置，上一轮重建没走完时只能拿缓存的 nodeInfo 重试
-			if s.needsRebuild() {
-				if err := s.reloadNode(s.currentNodeInfo()); err != nil {
-					s.logger.Printf("AnyTLS node rebuild retry failed: %v", err)
-				}
-			}
-			return nil
-		}
 		s.logger.Print(err)
 		// Track consecutive API failures for recovery
 		if api.IsAPIFailure(err) {
-			s.consecutiveFailures++
-			s.lastFailureTime = time.Now()
-			s.logger.Warnf("API communication failure detected (%d/%d)", s.consecutiveFailures, api.MaxConsecutiveFailures)
+			failures := s.consecutiveFailures.Add(1)
+			s.logger.Warnf("API communication failure detected (%d/%d)", failures, api.MaxConsecutiveFailures)
 
 			// Check if we should trigger auto-recovery
-			if s.consecutiveFailures >= api.MaxConsecutiveFailures {
-				s.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", s.consecutiveFailures)
+			if failures >= api.MaxConsecutiveFailures {
+				s.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", failures)
 				s.triggerRecovery()
 			}
 		}
 		return nil
 	}
 
-	if s.consecutiveFailures != 0 {
-		s.consecutiveFailures = 0
-	}
+	s.consecutiveFailures.Store(0)
 
 	if nodeInfo == nil || nodeInfo.NodeType != "AnyTLS" {
 		if s.logger != nil {

@@ -2,7 +2,10 @@ package limiter
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +30,7 @@ type GlobalDeviceChecker struct {
 	users         map[string]map[int]api.UserInfo
 	pending       map[string][]api.UserInfo
 	dirty         atomic.Bool
+	unavailable   atomic.Bool
 	policyVersion atomic.Uint64
 	verified      sync.Map
 	clockOffset   atomic.Int64
@@ -345,6 +349,26 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 		timeout = 5
 	}
 
+	var tlsConfig *tls.Config
+	if config.RedisTLS {
+		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		pem := []byte(config.RedisCA)
+		if config.RedisCAFile != "" {
+			var err error
+			if pem, err = os.ReadFile(config.RedisCAFile); err != nil {
+				errors.LogErrorInner(context.Background(), err, "cache service: read RedisCAFile, global device limit disabled")
+				return nil
+			}
+		}
+		if len(pem) > 0 {
+			tlsConfig.RootCAs = x509.NewCertPool()
+			if !tlsConfig.RootCAs.AppendCertsFromPEM(pem) {
+				errors.LogError(context.Background(), "cache service: no certificate in Redis CA, global device limit disabled")
+				return nil
+			}
+		}
+	}
+
 	checker := &GlobalDeviceChecker{
 		client: redis.NewClient(&redis.Options{
 			Network:               config.RedisNetwork,
@@ -352,6 +376,7 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 			Username:              config.RedisUsername,
 			Password:              config.RedisPassword,
 			DB:                    config.RedisDB,
+			TLSConfig:             tlsConfig,
 			ContextTimeoutEnabled: true,
 		}),
 		expiry:      int64(expiry),
@@ -361,6 +386,16 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 	}
 	globalCheckers[*config] = checker
 	return checker
+}
+
+// Enforcing 为 false 时（未启用，或最近一次访问 Redis 失败）由各节点本地账本按原上限判定，
+// Redis 故障不能让名额限制整体失效。
+func (g *GlobalDeviceChecker) Enforcing() bool {
+	return g != nil && !g.unavailable.Load()
+}
+
+func (g *GlobalDeviceChecker) noteResult(err error) {
+	g.unavailable.Store(err != nil && err != redis.Nil)
 }
 
 // Allow 判定 uid 的 slot 是否允许在线（全局口径）。
@@ -439,7 +474,7 @@ func (g *GlobalDeviceChecker) check(uid int, slot string, deviceLimit int, grant
 	// 放不进 Lua，只能拆成「判满 → 取确认 → 原子腾位并登记」三步。判满与腾位
 	// 各自原子，所以中途被别的节点占了名额也不会超额登记。
 	if !grant.Granted {
-		grant = ConsumeReclaimGrant(uid, slot)
+		grant = ConsumeReclaimGrant(scope, uid, slot)
 	}
 	if current != nil {
 		var authorized bool
@@ -469,7 +504,7 @@ func (g *GlobalDeviceChecker) check(uid int, slot string, deviceLimit int, grant
 	}
 	for _, kickedSlot := range kicked[1:] {
 		g.verified.Delete(fmt.Sprintf("%d|%s", uid, kickedSlot))
-		NoteDeviceKick(uid, kickedSlot)
+		NoteDeviceKick(scope, uid, kickedSlot)
 	}
 	return true
 }
@@ -631,6 +666,7 @@ func (g *GlobalDeviceChecker) syncUsers(users *[]api.UserInfo, scope ...string) 
 		ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 		_, err := syncKickScript.Run(ctx, g.client, keys, args...).Int()
 		cancel()
+		g.noteResult(err)
 		if err != nil {
 			errors.LogErrorInner(context.Background(), err, "cache service")
 			if len(scope) > 0 {
@@ -679,9 +715,11 @@ func (g *GlobalDeviceChecker) eval(script *redis.Script, uid int, slot string, d
 	now := time.Now()
 	clockOffset := g.clockOffset.Load()
 	panelNow := (now.UnixMilli() + clockOffset) / 1000
-	return script.Run(ctx, g.client, []string{redisKey, kickKey, kickKey + "|limit|" + scope},
+	cmd := script.Run(ctx, g.client, []string{redisKey, kickKey, kickKey + "|limit|" + scope},
 		now.Unix(), g.expiry, slot, deviceLimit, onlineTouchSec, target,
 		strconv.FormatUint(user.KickVersion, 10), user.ValidUntil, official, 0, confirmed, now.UnixMilli(), g.timeout.Milliseconds(), scope, panelNow, clockOffset)
+	g.noteResult(cmd.Err())
+	return cmd
 }
 
 func (g *GlobalDeviceChecker) SetClockOffset(offset int64) {

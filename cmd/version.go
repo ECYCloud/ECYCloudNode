@@ -26,6 +26,8 @@ func init() {
 
 func showVersion() {
 	fmt.Printf("%s %s\n", codename, version)
+	// 面板部署时据此判断能否写入独立凭据：旧版本把 ApiKey 放进查询串，面板不接受这样提交的凭据。
+	fmt.Println("Features: node-credential")
 	showKernels()
 }
 

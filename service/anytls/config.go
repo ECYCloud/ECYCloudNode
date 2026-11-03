@@ -12,6 +12,8 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 
 	"github.com/ECYCloud/ECYCloudNode/common/mylego"
+	"github.com/ECYCloud/ECYCloudNode/common/netguard"
+	"github.com/ECYCloud/ECYCloudNode/common/rule"
 )
 
 func (s *AnyTLSService) buildSingBox() (*box.Box, string, error) {
@@ -99,6 +101,11 @@ func (s *AnyTLSService) buildSingBox() (*box.Box, string, error) {
 			Options: &option.DirectOutboundOptions{},
 		},
 	}
+	rules := netguard.SingBoxRules()
+	if !s.config.DisableSniffing {
+		rules = append([]option.Rule{rule.SingBoxSniffRule()}, rules...)
+	}
+	opts.Route = &option.RouteOptions{Rules: rules}
 
 	boxInstance, err := box.New(box.Options{Context: ctx, Options: opts})
 	if err != nil {

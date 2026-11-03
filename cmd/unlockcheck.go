@@ -3,9 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -53,37 +50,13 @@ func runManualUnlockCheck() error {
 
 	startTime := time.Now()
 
-	// 手动检测与后台定时检测使用独立文件，避免上报另一轮结果。
-	workDir, err := os.MkdirTemp("", "ecycloudnode-manual-")
+	// 手动检测与后台定时检测使用各自的私有目录，避免上报另一轮结果。
+	resultData, output, err := unlockcheck.RunScript("ecycloudnode-manual-")
 	if err != nil {
-		return fmt.Errorf("创建检测临时目录失败：%w", err)
-	}
-	defer os.RemoveAll(workDir)
-	scriptPath := filepath.Join(workDir, "check.sh")
-	resultPath := filepath.Join(workDir, "unlock_check_result.json")
-
-	// Get the script content from unlockcheck package
-	script := unlockcheck.GetCSMScript()
-	script = strings.ReplaceAll(script, "/tmp/ecycloudnode_unlock_check", "${ECYCLOUDNODE_UNLOCK_TMP}/unlock_check")
-
-	// Write script to temp file
-	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
-		return fmt.Errorf("写入检测脚本失败：%w", err)
-	}
-
-	// Execute the script
-	execCmd := exec.Command("bash", scriptPath)
-	execCmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "ECYCLOUDNODE_UNLOCK_TMP="+filepath.ToSlash(workDir))
-	output, err := execCmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("Output: %s\n", string(output))
-		return fmt.Errorf("执行检测脚本失败：%w", err)
-	}
-
-	// Read result JSON file
-	resultData, err := os.ReadFile(resultPath)
-	if err != nil {
-		return fmt.Errorf("读取检测结果失败：%w", err)
+		if len(output) > 0 {
+			fmt.Printf("Output: %s\n", string(output))
+		}
+		return err
 	}
 
 	// Parse JSON results

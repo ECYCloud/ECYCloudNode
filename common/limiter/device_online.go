@@ -119,7 +119,7 @@ type DeviceSlots struct {
 	Active map[string]time.Time
 }
 
-func ReconcileDeviceSlots(slots map[string]map[string]struct{}, active map[string]map[string]time.Time, users []api.UserInfo) map[int]DeviceSlots {
+func ReconcileDeviceSlots(slots map[string]map[string]struct{}, active map[string]map[string]time.Time, users []api.UserInfo, authKey ...func(api.UserInfo) string) map[int]DeviceSlots {
 	valid := make(map[string]bool)
 	for _, user := range users {
 		if user.ClientID != 0 {
@@ -139,7 +139,11 @@ func ReconcileDeviceSlots(slots map[string]map[string]struct{}, active map[strin
 		if user.ClientID == 0 {
 			continue
 		}
-		for _, key := range []string{user.UUID, user.Passwd} {
+		keys := []string{user.UUID, user.Passwd}
+		if len(authKey) > 0 {
+			keys = []string{authKey[0](user)}
+		}
+		for _, key := range keys {
 			if slots[key] != nil && active[key] != nil {
 				shared[user.UID] = DeviceSlots{Slots: slots[key], Active: active[key]}
 				break
@@ -207,11 +211,11 @@ func PurgeStaleDeviceSlots(onlineSlots map[string]struct{}, activeMap map[string
 }
 
 // AdmitDeviceSlot 在协议侧本地在线表登记 名额；名额满时须有官方客户端确认才踢人，
-// 优先踢用户在客户端选定的那个 名额。
+// 优先踢用户在客户端选定的那个 名额。tag 指明向哪个节点的面板取确认。
 // 调用方须持 mu 进入，返回时仍持 mu：取确认是一次对面板的 HTTP 调用，不能持锁等待，
 // 这里会解锁去取、取回后重新加锁并重数一遍再踢。
 // 第二个返回值是本次消耗到的确认，供全局限制复用，避免再查一次授权。
-func AdmitDeviceSlot(mu sync.Locker, onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int, current ...func() (int, bool)) (allowed bool, grant ReclaimGrant) {
+func AdmitDeviceSlot(tag string, mu sync.Locker, onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int, current ...func() (int, bool)) (allowed bool, grant ReclaimGrant) {
 	if slot == "" {
 		return false, grant
 	}
@@ -238,7 +242,7 @@ func AdmitDeviceSlot(mu sync.Locker, onlineSlots map[string]struct{}, activeMap 
 					return false, grant
 				}
 				mu.Unlock()
-				grant = ConsumeReclaimGrant(uid, slot)
+				grant = ConsumeReclaimGrant(tag, uid, slot)
 				grantChecked = true
 				mu.Lock()
 				continue
@@ -250,7 +254,7 @@ func AdmitDeviceSlot(mu sync.Locker, onlineSlots map[string]struct{}, activeMap 
 				if !ok {
 					return false, grant
 				}
-				NoteDeviceKick(uid, evicted)
+				NoteDeviceKick(tag, uid, evicted)
 				target = ""
 				fresh--
 			}

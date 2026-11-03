@@ -7,6 +7,7 @@ import (
 	"path"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -88,6 +89,8 @@ func run() error {
 
 	// Create initial panel instance.
 	p := panel.New(panelConfig)
+	// 热重载在 fsnotify 的 goroutine 里替换 p，退出时要关闭的是当时在跑的那个实例
+	var panelMu sync.Mutex
 	lastTime := time.Now()
 
 	config.OnConfigChange(func(e fsnotify.Event) {
@@ -129,6 +132,8 @@ func run() error {
 		}
 
 		// 到这里说明新配置已经成功解析，且包含有效的节点；再关闭旧实例并切换。
+		panelMu.Lock()
+		defer panelMu.Unlock()
 		p.Close()
 		// Delete old instance and trigger GC
 		runtime.GC()
@@ -147,8 +152,14 @@ func run() error {
 		lastTime = time.Now()
 	})
 
+	panelMu.Lock()
 	p.Start()
-	defer p.Close()
+	panelMu.Unlock()
+	defer func() {
+		// 关闭后不再放开锁：退出途中到来的热重载不能再拉起新实例
+		panelMu.Lock()
+		p.Close()
+	}()
 
 	// Explicitly triggering GC to remove garbage from config loading.
 	runtime.GC()

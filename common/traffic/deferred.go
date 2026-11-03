@@ -7,11 +7,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	bolt "github.com/sagernet/bbolt"
 )
 
 var deferredBucket = []byte("deferred_reports")
+
+// 没有待合并凭证的隔离记录只作核对依据，保留 90 天后清理，避免节点数据库无限增长。
+const deferredRetention = 90 * 24 * time.Hour
+
+var deferredNow = time.Now
 
 type DeferredEntry struct {
 	UID    int    `json:"user_id"`
@@ -26,6 +32,7 @@ type DeferredReport struct {
 	Entries      []DeferredEntry `json:"entries"`
 	Proofs       []string        `json:"proofs,omitempty"`
 	Evidence     []string        `json:"evidence,omitempty"`
+	HeldAt       int64           `json:"held_at,omitempty"`
 }
 
 type deferredConfirmation struct {
@@ -99,7 +106,7 @@ func rememberDeferred(tx *bolt.Tx, report *Report, receipt string) error {
 			return fmt.Errorf("deferred confirmation contains an unknown or duplicate user")
 		}
 		switch entry.Reason {
-		case "missing_identity", "identity_mismatch", "user_missing", "reset_boundary_ambiguous", "receipt_conflict":
+		case "missing_identity", "identity_mismatch", "user_missing", "user_not_on_node", "reset_boundary_ambiguous", "receipt_conflict":
 		default:
 			return fmt.Errorf("invalid deferred traffic reason")
 		}
@@ -113,10 +120,14 @@ func rememberDeferred(tx *bolt.Tx, report *Report, receipt string) error {
 	entries := ack.Entries
 	var proofs []string
 	evidence := []string{receipt}
+	heldAt := deferredNow().Unix()
 	if data := tx.Bucket(deferredBucket).Get([]byte(report.ID)); data != nil {
 		var held DeferredReport
 		if err := json.Unmarshal(data, &held); err != nil {
 			return err
+		}
+		if held.HeldAt != 0 {
+			heldAt = held.HeldAt
 		}
 		original = held.Report
 		evidence = append([]string(nil), held.Evidence...)
@@ -205,11 +216,53 @@ func rememberDeferred(tx *bolt.Tx, report *Report, receipt string) error {
 	if original.Receipt == "" {
 		original.Receipt = receipt
 	}
-	data, err = json.Marshal(DeferredReport{Report: original, Confirmation: confirmation, Entries: entries, Proofs: proofs, Evidence: evidence})
+	data, err = json.Marshal(DeferredReport{Report: original, Confirmation: confirmation, Entries: entries, Proofs: proofs, Evidence: evidence, HeldAt: heldAt})
 	if err != nil {
 		return err
 	}
-	return tx.Bucket(deferredBucket).Put([]byte(report.ID), data)
+	if err := tx.Bucket(deferredBucket).Put([]byte(report.ID), data); err != nil {
+		return err
+	}
+	return pruneDeferred(tx)
+}
+
+// 带 Proofs 的记录还要交给面板合并，不能清；旧版本写入的记录没有时间，从现在开始计时。
+func pruneDeferred(tx *bolt.Tx) error {
+	bucket := tx.Bucket(deferredBucket)
+	now := deferredNow()
+	expired := make([][]byte, 0)
+	stamped := make(map[string][]byte)
+	err := bucket.ForEach(func(key, value []byte) error {
+		var held DeferredReport
+		if err := json.Unmarshal(value, &held); err != nil {
+			return err
+		}
+		if held.HeldAt == 0 {
+			held.HeldAt = now.Unix()
+			data, err := json.Marshal(held)
+			if err != nil {
+				return err
+			}
+			stamped[string(key)] = data
+		} else if len(held.Proofs) == 0 && now.Sub(time.Unix(held.HeldAt, 0)) > deferredRetention {
+			expired = append(expired, append([]byte(nil), key...))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for key, data := range stamped {
+		if err := bucket.Put([]byte(key), data); err != nil {
+			return err
+		}
+	}
+	for _, key := range expired {
+		if err := bucket.Delete(key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // 恢复历史时只留存待核对项，不再次消费已确认的本地计数。

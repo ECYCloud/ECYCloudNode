@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"dario.cat/mergo"
 	"github.com/r3labs/diff/v3"
@@ -38,7 +39,11 @@ type Panel struct {
 	Server      *core.Instance
 	Service     []service.Service
 	Running     bool
+	retryStop   chan struct{}
+	retryDone   chan struct{}
 }
+
+var nodeRetryMin, nodeRetryMax = 30 * time.Second, 5 * time.Minute
 
 func New(panelConfig *Config) *Panel {
 	p := &Panel{panelConfig: panelConfig}
@@ -253,12 +258,14 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 			serial.ToTypedMessage(dnsConfig),
 			serial.ToTypedMessage(routeConfig),
 		},
-		Inbound:  inBoundConfig,
-		Outbound: outBoundConfig,
+		Inbound: inBoundConfig,
 	}
 	server, err := core.New(config)
 	if err != nil {
 		log.Panicf("failed to create instance: %s", err)
+	}
+	if err := controller.AddCustomOutbounds(server, outBoundConfig); err != nil {
+		log.Panicf("Failed to add custom outbound: %s", err)
 	}
 
 	return server
@@ -289,6 +296,7 @@ func (p *Panel) Start() {
 	// 预先注册所有节点 ID 用于媒体检测共享
 	// 这必须在任何节点启动之前完成，确保第一个执行检测的节点能为所有节点上报结果
 	unlockcheck.ResetNodeIDs()
+	registered := 0
 	for _, nodeConfig := range nodes {
 		if nodeConfig == nil || nodeConfig.ApiConfig == nil {
 			continue
@@ -298,10 +306,11 @@ func (p *Panel) Start() {
 			continue
 		}
 		if nodeID, err := strconv.Atoi(nodeIDStr); err == nil && nodeID > 0 {
-			unlockcheck.RegisterNodeID(nodeID)
+			unlockcheck.RegisterNodeID(nodeConfig.ApiConfig.APIHost, nodeID)
+			registered++
 		}
 	}
-	log.Printf("[UnlockCheck] Pre-registered all %d node IDs for shared detection", len(unlockcheck.GetRegisteredNodeIDs()))
+	log.Printf("[UnlockCheck] Pre-registered all %d node IDs for shared detection", registered)
 
 	// Load Core
 	server := p.loadCore(p.panelConfig)
@@ -311,225 +320,273 @@ func (p *Panel) Start() {
 	p.Server = server
 
 	// Load Nodes config
+	var failed []*NodesConfig
 	for _, nodeConfig := range nodes {
-		apiClient := sspanel.New(nodeConfig.ApiConfig)
-		if webAPI, err := apiClient.GetWebAPIConfig(); err != nil {
-			log.Warnf("Failed to get webapi config from panel: %v", err)
-		} else if webAPI != nil && nodeConfig.ApiConfig != nil {
-			newHost := strings.TrimSpace(webAPI.APIHost)
-			oldHost := strings.TrimSpace(nodeConfig.ApiConfig.APIHost)
-			if newHost != "" && strings.TrimRight(newHost, "/") != strings.TrimRight(oldHost, "/") {
-				if err := apiClient.UpdateAPIHost(newHost); err != nil {
-					log.Errorf("Cannot retain traffic state for node %d after panel address change: %v", apiClient.NodeID, err)
-					continue
-				}
-				log.Infof("ApiHost updated from panel: %s -> %s", oldHost, newHost)
-				nodeConfig.ApiConfig.APIHost = newHost
-			}
+		if svc := p.newNodeService(server, nodeConfig); svc != nil && startService(svc) {
+			p.Service = append(p.Service, svc)
+		} else {
+			failed = append(failed, nodeConfig)
 		}
-
-		limiter.SetReclaimConsumer(func(uid int, slot string) (bool, string) {
-			// 第三方没有回收授权入口，判满直接拒绝，不请求面板
-			if !limiter.IsClientOnlineKey(slot) {
-				return false, ""
-			}
-			ok, targetSlot, err := apiClient.ConsumeSlotReclaim(uid, slot)
-			if err != nil {
-				log.Warnf("ConsumeSlotReclaim uid=%d slot=%s: %v", uid, slot, err)
-				return false, ""
-			}
-			return ok, targetSlot
-		})
-
-		// Register service for this node
-		controllerConfig := getDefaultControllerConfig()
-		if nodeConfig.ControllerConfig != nil {
-			if err := mergo.Merge(controllerConfig, nodeConfig.ControllerConfig, mergo.WithOverride); err != nil {
-				log.Panicf("Read Controller Config Failed")
-			}
-		}
-		// 证书相关配置改为完全由面板下发和自动推导，不再支持通过
-		// config.yml 的 ControllerConfig.CertConfig 手动填写。为避免旧
-		// 配置产生干扰，这里直接丢弃来自本地配置文件的 CertConfig。
-		controllerConfig.CertConfig = nil
-
-		var svc service.Service
-		var nodeInfo *api.NodeInfo
-
-		// If the panel exposes global ECYCloudNode cert settings, merge Provider/Email/
-		// DNSEnv into the controller's CertConfig. When CertConfig is missing
-		// from config.yml (which is common now that certificate settings are
-		// managed from the panel), allocate a minimal struct on demand and
-		// default CertMode to "dns" so that TLS nodes work out-of-the-box.
-		panelCert, err := apiClient.GetECYCloudNodeCertConfig()
-		if err != nil {
-			log.Warnf("Failed to get ECYCloudNode cert config from panel: %v", err)
-		} else if panelCert != nil {
-			if controllerConfig.CertConfig == nil {
-				controllerConfig.CertConfig = &mylego.CertConfig{}
-			}
-			// panel 仅下发 Provider/Email/DNSEnv，不关心 CertMode，若此时
-			// 仍为空则默认使用 DNS-01 ACME（"dns"），避免后续出现
-			// "unsupported certmode: " 之类错误。
-			if controllerConfig.CertConfig.CertMode == "" {
-				controllerConfig.CertConfig.CertMode = "dns"
-			}
-			if panelCert.Provider != "" {
-				controllerConfig.CertConfig.Provider = panelCert.Provider
-			}
-			if panelCert.Email != "" {
-				controllerConfig.CertConfig.Email = panelCert.Email
-			}
-			if len(panelCert.DNSEnv) > 0 {
-				if controllerConfig.CertConfig.DNSEnv == nil {
-					controllerConfig.CertConfig.DNSEnv = make(map[string]string)
-				}
-				for k, v := range panelCert.DNSEnv {
-					controllerConfig.CertConfig.DNSEnv[k] = v
-				}
-			}
-		}
-
-		// 全局设备限制的 Redis 连接信息由面板下发（设置中心-节点相关：
-		// 站点IP、RedisPassword）。config.yml 中 RedisAddr/RedisPassword
-		// 留空时自动读取面板值；本地填写值优先，便于特殊网络拓扑覆盖。
-		if glc := controllerConfig.GlobalDeviceLimitConfig; glc != nil && glc.Enable && (glc.RedisAddr == "" || glc.RedisPassword == "") {
-			panelGlobal, err := apiClient.GetGlobalLimitConfig()
-			if err != nil {
-				log.Warnf("Failed to get global limit config from panel: %v", err)
-			} else if panelGlobal != nil {
-				if glc.RedisAddr == "" && panelGlobal.SiteIP != "" {
-					glc.RedisAddr = panelGlobal.SiteIP + ":6379"
-				}
-				if glc.RedisPassword == "" && panelGlobal.RedisPassword != "" {
-					glc.RedisPassword = panelGlobal.RedisPassword
-				}
-			}
-			if glc.RedisAddr == "" {
-				log.Warn("GlobalDeviceLimitConfig enabled but RedisAddr is empty (config.yml 未填且面板“站点IP”为空), global device limit will not work")
-			}
-		}
-
-		nodeInfo, err = apiClient.GetNodeInfo()
-		if err != nil {
-			// 对于单个节点的拉取失败，不再直接 panic 终止整个进程，而是
-			// 打印错误并跳过该节点，保证其它已正确配置的节点仍然可以正常
-			// 启动和提供服务。
-			apiCfg := nodeConfig.ApiConfig
-			log.Errorf("Get node info failed, skip this node (ApiHost=%s, NodeID=%s): %v",
-				func() string {
-					if apiCfg != nil {
-						return apiCfg.APIHost
-					}
-					return ""
-				}(),
-				func() string {
-					if apiCfg != nil {
-						return apiCfg.NodeID
-					}
-					return ""
-				}(),
-				err,
-			)
-			continue
-		}
-
-		// Derive per-node certificate configuration from panel SNI / Host
-		// when TLS is enabled and REALITY is not in use. This allows using
-		// different certificates per node without duplicating config.yml.
-		if nodeInfo != nil && nodeInfo.EnableTLS && !nodeInfo.EnableREALITY {
-			// When CertConfig is missing, create one; if CertMode is still
-			// empty at this point, default it to dns so that DNS-01 ACME is
-			// used by default for TLS nodes.
-			if controllerConfig.CertConfig == nil {
-				controllerConfig.CertConfig = &mylego.CertConfig{}
-			}
-			if controllerConfig.CertConfig.CertMode == "" {
-				controllerConfig.CertConfig.CertMode = "dns"
-			}
-
-			sni := nodeInfo.SNI
-			if sni == "" {
-				// Fallback to Host when SNI is not explicitly provided
-				sni = nodeInfo.Host
-			}
-			if sni != "" {
-				baseCert := *controllerConfig.CertConfig // copy value
-				nodeCert := &baseCert
-
-				switch nodeCert.CertMode {
-				case "file":
-					// When CertFile/KeyFile are not explicitly configured, use a
-					// simple convention based on SNI under /etc/ECYCloudNode/cert.
-					if nodeCert.CertFile == "" && nodeCert.KeyFile == "" {
-						nodeCert.CertDomain = sni
-						nodeCert.CertFile = "/etc/ECYCloudNode/cert/" + sni + ".cert"
-						nodeCert.KeyFile = "/etc/ECYCloudNode/cert/" + sni + ".key"
-					} else if nodeCert.CertDomain == "" {
-						// If a static path is configured but CertDomain is empty,
-						// still record the logical domain for ACME/renewal logs.
-						nodeCert.CertDomain = sni
-					}
-				case "dns", "http", "tls":
-					// For ACME modes, prefer panel SNI as CertDomain when it is
-					// not explicitly specified in config.yml.
-					if nodeCert.CertDomain == "" {
-						nodeCert.CertDomain = sni
-					}
-				}
-
-				controllerConfig.CertConfig = nodeCert
-			}
-		}
-
-		if nodeInfo != nil {
-			switch nodeInfo.NodeType {
-			case "Hysteria2":
-				// For Hysteria2 we don't use xray-core controller, instead we
-				// start a dedicated Hysteria2 service.
-				serviceConfig := *controllerConfig // shallow copy
-				serviceConfig.CertConfig = controllerConfig.CertConfig
-				svc = hysteria2.New(apiClient, &serviceConfig)
-			case "AnyTLS":
-				// AnyTLS uses a sing-box based independent service.
-				serviceConfig := *controllerConfig // shallow copy
-				serviceConfig.CertConfig = controllerConfig.CertConfig
-				svc = anytls.New(apiClient, &serviceConfig)
-			case "Tuic":
-				// TUIC uses a sing-box based independent service.
-				serviceConfig := *controllerConfig // shallow copy
-				serviceConfig.CertConfig = controllerConfig.CertConfig
-				svc = tuic.New(apiClient, &serviceConfig)
-			}
-		}
-
-		if svc == nil {
-			// Default behaviour: use the original controller service.
-			svc = controller.New(server, apiClient, controllerConfig)
-		}
-
-		p.Service = append(p.Service, svc)
-
 	}
 
-	// Start all the service
 	if len(p.Service) == 0 {
 		log.Warn("No services started for any node; please check your Nodes config and panel connectivity")
-	} else {
-		for _, s := range p.Service {
-			if err := s.Start(); err != nil {
-				// 同样不再因为单个 service 启动失败而直接 panic，避免影响其它
-				// 已经可以正常工作的节点。
-				log.Errorf("Panel Start failed for a service: %s", err)
-			}
-		}
+	}
+	if len(failed) > 0 {
+		p.retryStop = make(chan struct{})
+		p.retryDone = make(chan struct{})
+		go p.retryNodes(failed, func(nodeConfig *NodesConfig) service.Service { return p.newNodeService(server, nodeConfig) }, p.retryStop, p.retryDone)
 	}
 	p.Running = true
 	return
 }
 
+// startService 不因单个节点启动失败而 panic，以免影响其它节点；失败时先关闭以释放已占用的端口与账本。
+func startService(svc service.Service) bool {
+	if err := svc.Start(); err != nil {
+		log.Errorf("Panel Start failed for a service: %s", err)
+		if err := svc.Close(); err != nil {
+			log.Errorf("Panel Close failed for a service: %s", err)
+		}
+		return false
+	}
+	return true
+}
+
+// retryNodes 在后台重试启动失败的节点（面板暂时不可达、证书未就绪等），恢复后无需重启进程。
+func (p *Panel) retryNodes(nodes []*NodesConfig, build func(*NodesConfig) service.Service, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	delay := nodeRetryMin
+	for len(nodes) > 0 {
+		select {
+		case <-stop:
+			return
+		case <-time.After(delay):
+		}
+		var still []*NodesConfig
+		for _, nodeConfig := range nodes {
+			svc := build(nodeConfig)
+			if svc == nil || !startService(svc) {
+				still = append(still, nodeConfig)
+				continue
+			}
+			p.access.Lock()
+			select {
+			case <-stop:
+				p.access.Unlock()
+				if err := svc.Close(); err != nil {
+					log.Errorf("Panel Close failed for a service: %s", err)
+				}
+				return
+			default:
+			}
+			p.Service = append(p.Service, svc)
+			p.access.Unlock()
+		}
+		nodes = still
+		delay = min(delay*2, nodeRetryMax)
+	}
+}
+
+// newNodeService 拉取节点信息并按节点类型创建服务；节点信息拉取失败时返回 nil。
+func (p *Panel) newNodeService(server *core.Instance, nodeConfig *NodesConfig) service.Service {
+	apiClient := sspanel.New(nodeConfig.ApiConfig)
+	if webAPI, err := apiClient.GetWebAPIConfig(); err != nil {
+		log.Warnf("Failed to get webapi config from panel: %v", err)
+	} else if webAPI != nil && nodeConfig.ApiConfig != nil {
+		newHost := strings.TrimSpace(webAPI.APIHost)
+		oldHost := strings.TrimSpace(nodeConfig.ApiConfig.APIHost)
+		if newHost != "" && strings.TrimRight(newHost, "/") != strings.TrimRight(oldHost, "/") {
+			if err := sspanel.CheckAPIHost(oldHost, newHost); err != nil {
+				log.Warnf("Ignoring panel-provided ApiHost %q for node %d: %v", newHost, apiClient.NodeID, err)
+			} else if err := apiClient.UpdateAPIHost(newHost); err != nil {
+				log.Errorf("Cannot retain traffic state for node %d after panel address change: %v", apiClient.NodeID, err)
+				return nil
+			} else {
+				log.Infof("ApiHost updated from panel: %s -> %s", oldHost, newHost)
+				nodeConfig.ApiConfig.APIHost = newHost
+				// 共享检测按面板地址分组，换地址后要按新地址登记，否则本节点收不到结果
+				unlockcheck.RegisterNodeID(newHost, apiClient.NodeID)
+			}
+		}
+	}
+
+	// Register service for this node
+	controllerConfig := getDefaultControllerConfig()
+	if nodeConfig.ControllerConfig != nil {
+		if err := mergo.Merge(controllerConfig, nodeConfig.ControllerConfig, mergo.WithOverride); err != nil {
+			log.Panicf("Read Controller Config Failed")
+		}
+	}
+	// 证书相关配置改为完全由面板下发和自动推导，不再支持通过
+	// config.yml 的 ControllerConfig.CertConfig 手动填写。为避免旧
+	// 配置产生干扰，这里直接丢弃来自本地配置文件的 CertConfig。
+	controllerConfig.CertConfig = nil
+
+	var svc service.Service
+	var nodeInfo *api.NodeInfo
+
+	// If the panel exposes global ECYCloudNode cert settings, merge Provider/Email/
+	// DNSEnv into the controller's CertConfig. When CertConfig is missing
+	// from config.yml (which is common now that certificate settings are
+	// managed from the panel), allocate a minimal struct on demand and
+	// default CertMode to "dns" so that TLS nodes work out-of-the-box.
+	panelCert, err := apiClient.GetECYCloudNodeCertConfig()
+	if err != nil {
+		log.Warnf("Failed to get ECYCloudNode cert config from panel: %v", err)
+	} else if panelCert != nil {
+		if controllerConfig.CertConfig == nil {
+			controllerConfig.CertConfig = &mylego.CertConfig{}
+		}
+		// panel 仅下发 Provider/Email/DNSEnv，不关心 CertMode，若此时
+		// 仍为空则默认使用 DNS-01 ACME（"dns"），避免后续出现
+		// "unsupported certmode: " 之类错误。
+		if controllerConfig.CertConfig.CertMode == "" {
+			controllerConfig.CertConfig.CertMode = "dns"
+		}
+		if panelCert.Provider != "" {
+			controllerConfig.CertConfig.Provider = panelCert.Provider
+		}
+		if panelCert.Email != "" {
+			controllerConfig.CertConfig.Email = panelCert.Email
+		}
+		if len(panelCert.DNSEnv) > 0 {
+			if controllerConfig.CertConfig.DNSEnv == nil {
+				controllerConfig.CertConfig.DNSEnv = make(map[string]string)
+			}
+			for k, v := range panelCert.DNSEnv {
+				controllerConfig.CertConfig.DNSEnv[k] = v
+			}
+		}
+	}
+
+	// 全局设备限制的 Redis 连接信息由面板下发（设置中心-节点相关：
+	// 站点IP、RedisPassword、TLS 与 CA）。config.yml 中 RedisAddr/RedisPassword
+	// 留空时自动读取面板值；本地填写值优先，便于特殊网络拓扑覆盖。
+	if glc := controllerConfig.GlobalDeviceLimitConfig; glc != nil && glc.Enable && (glc.RedisAddr == "" || glc.RedisPassword == "") {
+		panelGlobal, err := apiClient.GetGlobalLimitConfig()
+		if err != nil {
+			log.Warnf("Failed to get global limit config from panel: %v", err)
+		} else if panelGlobal != nil {
+			applyPanelRedis(glc, panelGlobal)
+		}
+		if glc.RedisAddr == "" {
+			log.Warn("GlobalDeviceLimitConfig enabled but RedisAddr is empty (config.yml 未填且面板“站点IP”为空), global device limit will not work")
+		}
+	}
+
+	nodeInfo, err = apiClient.GetNodeInfo()
+	if err != nil {
+		// 对于单个节点的拉取失败，不再直接 panic 终止整个进程，而是
+		// 打印错误并跳过该节点，保证其它已正确配置的节点仍然可以正常
+		// 启动和提供服务。
+		apiCfg := nodeConfig.ApiConfig
+		log.Errorf("Get node info failed, skip this node (ApiHost=%s, NodeID=%s): %v",
+			func() string {
+				if apiCfg != nil {
+					return apiCfg.APIHost
+				}
+				return ""
+			}(),
+			func() string {
+				if apiCfg != nil {
+					return apiCfg.NodeID
+				}
+				return ""
+			}(),
+			err,
+		)
+		return nil
+	}
+
+	// Derive per-node certificate configuration from panel SNI / Host
+	// when TLS is enabled and REALITY is not in use. This allows using
+	// different certificates per node without duplicating config.yml.
+	if nodeInfo != nil && nodeInfo.EnableTLS && !nodeInfo.EnableREALITY {
+		// When CertConfig is missing, create one; if CertMode is still
+		// empty at this point, default it to dns so that DNS-01 ACME is
+		// used by default for TLS nodes.
+		if controllerConfig.CertConfig == nil {
+			controllerConfig.CertConfig = &mylego.CertConfig{}
+		}
+		if controllerConfig.CertConfig.CertMode == "" {
+			controllerConfig.CertConfig.CertMode = "dns"
+		}
+
+		sni := nodeInfo.SNI
+		if sni == "" {
+			// Fallback to Host when SNI is not explicitly provided
+			sni = nodeInfo.Host
+		}
+		if sni != "" {
+			baseCert := *controllerConfig.CertConfig // copy value
+			nodeCert := &baseCert
+
+			switch nodeCert.CertMode {
+			case "file":
+				// When CertFile/KeyFile are not explicitly configured, use a
+				// simple convention based on SNI under /etc/ECYCloudNode/cert.
+				if nodeCert.CertFile == "" && nodeCert.KeyFile == "" {
+					nodeCert.CertDomain = sni
+					nodeCert.CertFile = "/etc/ECYCloudNode/cert/" + sni + ".cert"
+					nodeCert.KeyFile = "/etc/ECYCloudNode/cert/" + sni + ".key"
+				} else if nodeCert.CertDomain == "" {
+					// If a static path is configured but CertDomain is empty,
+					// still record the logical domain for ACME/renewal logs.
+					nodeCert.CertDomain = sni
+				}
+			case "dns", "http", "tls":
+				// For ACME modes, prefer panel SNI as CertDomain when it is
+				// not explicitly specified in config.yml.
+				if nodeCert.CertDomain == "" {
+					nodeCert.CertDomain = sni
+				}
+			}
+
+			controllerConfig.CertConfig = nodeCert
+		}
+	}
+
+	if nodeInfo != nil {
+		switch nodeInfo.NodeType {
+		case "Hysteria2":
+			// For Hysteria2 we don't use xray-core controller, instead we
+			// start a dedicated Hysteria2 service.
+			serviceConfig := *controllerConfig // shallow copy
+			serviceConfig.CertConfig = controllerConfig.CertConfig
+			svc = hysteria2.New(apiClient, &serviceConfig)
+		case "AnyTLS":
+			// AnyTLS uses a sing-box based independent service.
+			serviceConfig := *controllerConfig // shallow copy
+			serviceConfig.CertConfig = controllerConfig.CertConfig
+			svc = anytls.New(apiClient, &serviceConfig)
+		case "Tuic":
+			// TUIC uses a sing-box based independent service.
+			serviceConfig := *controllerConfig // shallow copy
+			serviceConfig.CertConfig = controllerConfig.CertConfig
+			svc = tuic.New(apiClient, &serviceConfig)
+		}
+	}
+
+	if svc == nil {
+		// Default behaviour: use the original controller service.
+		svc = controller.New(server, apiClient, controllerConfig)
+	}
+
+	return svc
+}
+
 // Close the panel
 func (p *Panel) Close() {
+	p.access.Lock()
+	stop, done := p.retryStop, p.retryDone
+	p.retryStop, p.retryDone = nil, nil
+	p.access.Unlock()
+	// 先等重试协程退出：它登记服务时要拿 access，且仍在使用即将关闭的内核实例
+	if stop != nil {
+		close(stop)
+		<-done
+	}
 	p.access.Lock()
 	defer p.access.Unlock()
 	for _, s := range p.Service {
@@ -568,4 +625,19 @@ func parseConnectionConfig(c *ConnectionConfig) (policy *conf.Policy) {
 	}
 
 	return
+}
+
+// applyPanelRedis 按面板下发值补齐 config.yml 未填的 Redis 连接信息。
+// TLS 与 CA 只随面板地址一起生效：本地另填 RedisAddr 时指向的是别的 Redis，不能套用面板的 TLS 设置。
+func applyPanelRedis(glc *limiter.GlobalDeviceLimitConfig, panelGlobal *api.GlobalLimitConfig) {
+	if glc.RedisAddr == "" && panelGlobal.SiteIP != "" {
+		glc.RedisAddr = panelGlobal.SiteIP + ":6379"
+		glc.RedisTLS = glc.RedisTLS || panelGlobal.RedisTLS
+		if glc.RedisCAFile == "" {
+			glc.RedisCA = panelGlobal.RedisCA
+		}
+	}
+	if glc.RedisPassword == "" && panelGlobal.RedisPassword != "" {
+		glc.RedisPassword = panelGlobal.RedisPassword
+	}
 }

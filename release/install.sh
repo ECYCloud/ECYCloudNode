@@ -100,23 +100,25 @@ install_acme() {
 }
 
 install_ECYCloudNode() {
-    if [[ -e /usr/local/ECYCloudNode/ ]]; then
-        rm /usr/local/ECYCloudNode/ -rf
+    # 先下载到临时目录，成功后再替换旧版本：下载失败时不能让已安装的节点在下次重启后起不来
+    download_dir=$(mktemp -d)
+    if [[ $? -ne 0 ]]; then
+        echo -e "${red}创建临时目录失败${plain}"
+        exit 1
     fi
-
-    mkdir /usr/local/ECYCloudNode/ -p
-	cd /usr/local/ECYCloudNode/
 
     if  [ $# == 0 ] ;then
         last_version=$(curl -Ls "https://api.github.com/repos/ECYCloud/ECYCloudNode/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [[ ! -n "$last_version" ]]; then
             echo -e "${red}检测 ECYCloudNode 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 ECYCloudNode 版本安装${plain}"
+            rm -rf ${download_dir}
             exit 1
         fi
         echo -e "检测到 ECYCloudNode 最新版本：${last_version}，开始安装"
-        wget -q -N -O /usr/local/ECYCloudNode/ECYCloudNode-linux.zip https://github.com/ECYCloud/ECYCloudNode/releases/download/${last_version}/ECYCloudNode-linux-${arch}.zip
+        wget -q -N -O ${download_dir}/ECYCloudNode-linux.zip https://github.com/ECYCloud/ECYCloudNode/releases/download/${last_version}/ECYCloudNode-linux-${arch}.zip
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 ECYCloudNode 失败，请确保你的服务器能够下载 Github 的文件${plain}"
+            rm -rf ${download_dir}
             exit 1
         fi
     else
@@ -127,51 +129,78 @@ install_ECYCloudNode() {
 	fi
         url="https://github.com/ECYCloud/ECYCloudNode/releases/download/${last_version}/ECYCloudNode-linux-${arch}.zip"
         echo -e "开始安装 ECYCloudNode ${last_version}"
-        wget -q -N -O /usr/local/ECYCloudNode/ECYCloudNode-linux.zip ${url}
+        wget -q -N -O ${download_dir}/ECYCloudNode-linux.zip ${url}
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 ECYCloudNode ${last_version} 失败，请确保此版本存在${plain}"
+            rm -rf ${download_dir}
             exit 1
         fi
     fi
 
-    unzip ECYCloudNode-linux.zip
-    rm ECYCloudNode-linux.zip -f
+    # 用同一 Release 的 .dgst 核对 sha256，并确认包内自带 service 与管理脚本；不满足即中止，不动已安装的节点
+    wget -q -O "${download_dir}/ECYCloudNode-linux.zip.dgst" "https://github.com/ECYCloud/ECYCloudNode/releases/download/${last_version}/ECYCloudNode-linux-${arch}.zip.dgst"
+    expected_sha256=$(sed -nE 's/^SHA(2-)?256= ([0-9a-f]{64})$/\2/p' "${download_dir}/ECYCloudNode-linux.zip.dgst")
+    actual_sha256=$(sha256sum "${download_dir}/ECYCloudNode-linux.zip" | awk '{print $1}')
+    if [[ -z "${expected_sha256}" || "${actual_sha256}" != "${expected_sha256}" ]]; then
+        echo -e "${red}ECYCloudNode ${last_version} 校验失败（.dgst 中的 sha256：${expected_sha256:-缺失或无法解析}，实际：${actual_sha256}），已中止安装，已安装的节点保持原样${plain}"
+        rm -rf "${download_dir}"
+        exit 1
+    fi
+    if ! unzip -qq -t "${download_dir}/ECYCloudNode-linux.zip" ECYCloudNode.service ECYCloudNode.sh; then
+        echo -e "${red}ECYCloudNode ${last_version} 发布包缺少 ECYCloudNode.service 或 ECYCloudNode.sh，已中止安装，已安装的节点保持原样${plain}"
+        rm -rf "${download_dir}"
+        exit 1
+    fi
+
+    if [[ -e /usr/local/ECYCloudNode/ ]]; then
+        rm /usr/local/ECYCloudNode/ -rf
+    fi
+    mkdir /usr/local/ECYCloudNode/ -p
+	cd /usr/local/ECYCloudNode/
+    unzip ${download_dir}/ECYCloudNode-linux.zip
+    rm -rf ${download_dir}
     chmod +x ECYCloudNode
     mkdir /etc/ECYCloudNode/ -p
     rm /etc/systemd/system/ECYCloudNode.service -f
-    file="https://github.com/ECYCloud/ECYCloudNode/raw/main/release/ECYCloudNode.service"
-    wget -q -N -O /etc/systemd/system/ECYCloudNode.service ${file}
-    #cp -f ECYCloudNode.service /etc/systemd/system/
+    cp -f ECYCloudNode.service /etc/systemd/system/
     systemctl daemon-reload
     systemctl stop ECYCloudNode
     systemctl enable ECYCloudNode
 
-    # 禁用 rsyslog 防止日志写满磁盘
-    # rsyslog 会将 systemd journal 转写到 /var/log/syslog 导致无限增长
-    # journald 自身有大小限制，禁用 rsyslog 后不会撑爆磁盘
-    if systemctl is-active --quiet rsyslog 2>/dev/null; then
-        systemctl stop rsyslog
-        systemctl disable rsyslog
-        echo -e "${green}已禁用 rsyslog 以防止日志写满磁盘${plain}"
+    # ECYCloudNode 的日志（含逐连接的访问日志）已在 journald 里，rsyslog 再转写一份到 /var/log/syslog
+    # 会随之膨胀：只丢弃本程序的日志，auth.log 等系统日志与依赖它们的 fail2ban 照常工作。
+    # 旧版本脚本曾全局停用 rsyslog，规则装好后重新启用；未安装 rsyslog 的系统跳过
+    if command -v rsyslogd >/dev/null 2>&1; then
+        mkdir -p /etc/rsyslog.d
+        cat > /etc/rsyslog.d/30-ecycloudnode.conf <<'EOF'
+if $programname == 'ECYCloudNode' then stop
+EOF
+        systemctl enable rsyslog >/dev/null 2>&1
+        if systemctl restart rsyslog >/dev/null 2>&1; then
+            echo -e "${green}rsyslog 已不再转写 ECYCloudNode 日志，系统日志照常记录${plain}"
+        else
+            echo -e "${yellow}已写入 rsyslog 丢弃规则，但 rsyslog 未能启动，请用 systemctl status rsyslog 查看${plain}"
+        fi
     fi
 
-    # 配置 journald 日志保留时间为 3 天（ECYCloudNode 日志全部进 journald）
-    # 使用 drop-in 配置文件而非直接改 journald.conf，避免覆盖用户其他设置
+    # journald 按容量封顶，不再按 3 天清理整台机器的日志；使用 drop-in 而非直接改 journald.conf，避免覆盖用户其他设置
+    journal_max=500M
     mkdir -p /etc/systemd/journald.conf.d
-    cat > /etc/systemd/journald.conf.d/ecycloudnode-retention.conf <<EOF
+    rm -f /etc/systemd/journald.conf.d/ecycloudnode-retention.conf
+    cat > /etc/systemd/journald.conf.d/ecycloudnode.conf <<EOF
 [Journal]
-MaxRetentionSec=3day
+SystemMaxUse=${journal_max}
 EOF
     systemctl restart systemd-journald 2>/dev/null
-    journalctl --vacuum-time=3d >/dev/null 2>&1
-    echo -e "${green}已配置 journald 日志保留 3 天${plain}"
+    journalctl --vacuum-size=${journal_max} >/dev/null 2>&1
+    echo -e "${green}已限制 journald 持久日志最多占用 ${journal_max}${plain}"
 
     echo -e "${green}ECYCloudNode ${last_version}${plain} 安装完成，已设置开机自启"
     cp geoip.dat /etc/ECYCloudNode/
     cp geosite.dat /etc/ECYCloudNode/
 
     if [[ ! -f /etc/ECYCloudNode/config.yml ]]; then
-        cp config.yml /etc/ECYCloudNode/
+        install -m 600 config.yml /etc/ECYCloudNode/config.yml
         echo -e ""
         echo -e "全新安装，请先参看教程：https://github.com/ECYCloud/ECYCloudNode，配置必要的内容"
     else
@@ -186,6 +215,9 @@ EOF
             echo -e "${red}ECYCloudNode 可能启动失败，请稍后使用 ECYCloudNode log 查看日志信息，若无法启动，则可能更改了配置格式，请前往 wiki 查看：https://github.com/ECYCloud/ECYCloudNode/wiki${plain}"
         fi
     fi
+
+    # config.yml 含面板全局 ApiKey，旧版本按默认 umask 落成 0644，本机其它用户可读
+    chmod 600 /etc/ECYCloudNode/config.yml
 
     if [[ ! -f /etc/ECYCloudNode/dns.json ]]; then
         cp dns.json /etc/ECYCloudNode/
@@ -202,11 +234,12 @@ EOF
     if [[ ! -f /etc/ECYCloudNode/rulelist ]]; then
         cp rulelist /etc/ECYCloudNode/
     fi
-    curl -o /usr/bin/ECYCloudNode -Ls https://raw.githubusercontent.com/ECYCloud/ECYCloudNode/main/release/ECYCloudNode.sh
-    chmod +x /usr/bin/ECYCloudNode
+    # install 先删后建，正在执行的旧管理脚本不会读到被原位改写的内容
+    install -m 755 ECYCloudNode.sh /usr/bin/ECYCloudNode
     ln -sfn /usr/bin/ECYCloudNode /usr/bin/ecycloudnode
     cd $cur_dir
-    rm -f install.sh
+    # 只删一键命令下载到当前目录的本脚本；经管理脚本的临时文件或进程替换运行时，当前目录里的同名文件与本次安装无关
+    [[ "$0" -ef install.sh ]] && rm -f install.sh
     echo -e ""
     echo "ECYCloudNode 管理脚本使用方法 (亦可用 ecycloudnode): "
     echo "------------------------------------------"

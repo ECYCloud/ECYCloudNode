@@ -2,28 +2,38 @@ package limiter
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/ECYCloud/ECYCloudNode/api"
 )
 
-var deviceKickBuffer sync.Map // key: "uid|slot" -> api.OnlineUser
+type deviceKick struct {
+	tag  string
+	user api.OnlineUser
+}
 
-// NoteDeviceKick 记录因在线 名额 超限被挤出的 名额，供上报面板后通知官方客户端。
-func NoteDeviceKick(uid int, slot string) {
+var deviceKickBuffer sync.Map // key: "tag|uid|slot" -> deviceKick
+
+// NoteDeviceKick 记录 tag 节点因在线 名额 超限挤出的 名额，供该节点上报面板后通知官方客户端。
+func NoteDeviceKick(tag string, uid int, slot string) {
 	if uid <= 0 || slot == "" {
 		return
 	}
-	deviceKickBuffer.Store(fmt.Sprintf("%d|%s", uid, slot), OnlineUser(uid, slot))
+	deviceKickBuffer.Store(fmt.Sprintf("%s|%d|%s", tag, uid, slot), deviceKick{tag: tag, user: OnlineUser(uid, slot)})
 }
 
-// TakeDeviceKicks 取出并清空待上报的踢下线记录。
-func TakeDeviceKicks() []api.OnlineUser {
+// TakeDeviceKicks 取出并清空 tags 节点（不传时为全部节点）待上报的踢下线记录。
+// 面板按上报节点校验用户归属，每个节点只报自己的记录。
+func TakeDeviceKicks(tags ...string) []api.OnlineUser {
 	var out []api.OnlineUser
 	deviceKickBuffer.Range(func(key, value interface{}) bool {
-		out = append(out, value.(api.OnlineUser))
-		deviceKickBuffer.Delete(key)
+		kick := value.(deviceKick)
+		if len(tags) == 0 || slices.Contains(tags, kick.tag) {
+			out = append(out, kick.user)
+			deviceKickBuffer.Delete(key)
+		}
 		return true
 	})
 	return out

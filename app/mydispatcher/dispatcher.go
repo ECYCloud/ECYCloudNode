@@ -2,8 +2,6 @@
 // online device counting on top of the core Xray dispatcher.
 package mydispatcher
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
-
 // Type returns the feature type for the custom dispatcher itself. This keeps
 // ECYCloudNode's dispatcher registered as a *separate* feature, without overriding
 // the core routing.Dispatcher (github.com/xtls/xray-core/app/dispatcher).

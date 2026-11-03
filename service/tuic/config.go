@@ -13,6 +13,8 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 
 	"github.com/ECYCloud/ECYCloudNode/common/mylego"
+	"github.com/ECYCloud/ECYCloudNode/common/netguard"
+	"github.com/ECYCloud/ECYCloudNode/common/rule"
 )
 
 func (s *TuicService) buildSingBox() (*box.Box, string, error) {
@@ -96,6 +98,9 @@ func (s *TuicService) buildSingBox() (*box.Box, string, error) {
 		InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
 			TLS: tlsOpt,
 		},
+		// 内核默认每条连接可开 1<<60 条并发双向流，未认证的连接在认证超时内就能大量开流占用内存；
+		// 1024 与 Hysteria2 内核的默认值一致。认证前的单向流上限写死在内核里，这里改不到
+		QUICOptions: option.QUICOptions{HTTP2Options: option.HTTP2Options{MaxConcurrentStreams: 1024}},
 	}
 
 	opts.Inbounds = []option.Inbound{
@@ -112,6 +117,11 @@ func (s *TuicService) buildSingBox() (*box.Box, string, error) {
 			Options: &option.DirectOutboundOptions{},
 		},
 	}
+	rules := netguard.SingBoxRules()
+	if !s.config.DisableSniffing {
+		rules = append([]option.Rule{rule.SingBoxSniffRule()}, rules...)
+	}
+	opts.Route = &option.RouteOptions{Rules: rules}
 
 	boxInstance, err := box.New(box.Options{Context: ctx, Options: opts})
 	if err != nil {

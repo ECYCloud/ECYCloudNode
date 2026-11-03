@@ -200,7 +200,8 @@ func InboundBuilder(config *Config, nodeInfo *api.NodeInfo, tag string) (*core.I
 			isREALITY = true
 			streamSetting.Security = "reality"
 			streamSetting.REALITYSettings = &conf.REALITYConfig{
-				Show:         true,
+				// Show 会绕过日志级别逐次握手打印来源 IP、SNI 与 AuthKey 前缀
+				Show:         false,
 				Dest:         []byte(`"` + r.Dest + `"`),
 				Xver:         r.ProxyProtocolVer,
 				ServerNames:  r.ServerNames,

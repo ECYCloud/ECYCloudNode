@@ -67,6 +67,10 @@ type AccountsStorage struct {
 // NewAccountsStorage Creates a new AccountsStorage.
 func NewAccountsStorage(l *LegoCMD) *AccountsStorage {
 	email := l.C.Email
+	// 邮箱可由面板下发，又直接作目录名和私钥文件名：只接受单个文件名，否则 ../ 能在证书目录外建目录、覆盖 *.key
+	if email != "" && (email != filepath.Base(email) || email == "." || email == "..") {
+		log.Panicf("Invalid ACME account email %q", email)
+	}
 
 	serverURL, err := url.Parse(acme.LetsEncryptURL)
 	if err != nil {

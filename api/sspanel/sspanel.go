@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,21 +42,40 @@ type APIClient struct {
 	// eTags 被节点与用户两个周期任务的 goroutine 共用，必须全程持锁访问：
 	// 裸 map 的并发读写是 Go 运行时 fatal error，recover 拦不住。
 	eTagsMu sync.Mutex
-	eTags   map[string]string
+	eTags   map[string]cachedResponse
 	// exemptUsers caches the latest exempt user list from the panel
 	exemptUsers []api.ExemptUser
+}
+
+// cachedResponse 是最近一次带 ETag 的成功响应。
+type cachedResponse struct {
+	eTag string
+	res  *resty.Response
 }
 
 func (c *APIClient) eTag(key string) string {
 	c.eTagsMu.Lock()
 	defer c.eTagsMu.Unlock()
-	return c.eTags[key]
+	return c.eTags[key].eTag
 }
 
-func (c *APIClient) setETag(key, value string) {
+// revalidate 把 304 换成上次带 ETag 的响应交给调用方照常解析与应用：「未修改」只说明面板没变，
+// 不说明节点已应用成功（上次可能应用失败，或刚由另一处调用取走）。200 不带 ETag 时丢弃缓存，下次无条件拉取。
+func (c *APIClient) revalidate(key string, res *resty.Response) *resty.Response {
 	c.eTagsMu.Lock()
 	defer c.eTagsMu.Unlock()
-	c.eTags[key] = value
+	if res.StatusCode() == http.StatusNotModified {
+		if cached, ok := c.eTags[key]; ok {
+			return cached.res
+		}
+		return res
+	}
+	if eTag := res.Header().Get("ETag"); eTag != "" && res.StatusCode() == http.StatusOK {
+		c.eTags[key] = cachedResponse{eTag: eTag, res: res}
+	} else {
+		delete(c.eTags, key)
+	}
+	return res
 }
 
 // mapSortToNodeType
@@ -87,6 +108,23 @@ func mapSortToNodeType(sort int) string {
 	}
 }
 
+// panelKeyHeader 携带节点访问面板的凭据（config.yml 的 ApiKey）。放在请求头里才不会进面板和中间设备的访问日志。
+const panelKeyHeader = "X-ECY-Node-Key"
+
+// panelRedirectPolicy 只跟随同主机、不降级的跳转：net/http 跟随跳转时会带上自定义请求头，跳到别的主机就把凭据交出去了。
+func panelRedirectPolicy() resty.RedirectPolicy {
+	return resty.RedirectPolicyFunc(func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		origin := via[0].URL
+		if req.URL.Hostname() != origin.Hostname() || (origin.Scheme == "https" && req.URL.Scheme != "https") {
+			return fmt.Errorf("refusing panel redirect to %s", req.URL.Host)
+		}
+		return nil
+	})
+}
+
 // New create api instance
 func New(apiConfig *api.Config) *APIClient {
 	client := resty.New()
@@ -97,24 +135,28 @@ func New(apiConfig *api.Config) *APIClient {
 	} else {
 		client.SetTimeout(5 * time.Second)
 	}
+	client.SetLogger(restyLogger{})
 	client.OnError(func(req *resty.Request, err error) {
 		var v *resty.ResponseError
 		if errors.As(err, &v) {
 			// v.Response contains the last response from the server
 			// v.Err contains the original error
-			log.Print(v.Err)
+			log.Print(v.Err.Error())
 		}
 	})
 
 	client.SetBaseURL(apiConfig.APIHost)
+	client.SetRedirectPolicy(panelRedirectPolicy())
 	// Create Key for each requests
-	client.SetQueryParam("key", apiConfig.Key)
+	client.SetHeader(panelKeyHeader, apiConfig.Key)
 
 	trafficClient := resty.New()
+	trafficClient.SetLogger(restyLogger{})
 	trafficClient.SetRetryCount(0)
 	trafficClient.SetTimeout(30 * time.Second)
 	trafficClient.SetBaseURL(apiConfig.APIHost)
-	trafficClient.SetQueryParam("key", apiConfig.Key)
+	trafficClient.SetRedirectPolicy(panelRedirectPolicy())
+	trafficClient.SetHeader(panelKeyHeader, apiConfig.Key)
 
 	// Read local rule list
 	localRuleList := readLocalRuleList(apiConfig.RuleListPath)
@@ -141,7 +183,7 @@ func New(apiConfig *api.Config) *APIClient {
 		SpeedLimit:    apiConfig.SpeedLimit,
 		DeviceLimit:   apiConfig.DeviceLimit,
 		LocalRuleList: localRuleList,
-		eTags:         make(map[string]string),
+		eTags:         make(map[string]cachedResponse),
 	}
 }
 
@@ -173,7 +215,7 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 			if line == "" {
 				continue
 			}
-			pattern, err := regexp.Compile(line)
+			pattern, err := compileDetectRule(line)
 			if err != nil {
 				log.Printf("Invalid local rule pattern %q, skipped: %s", line, err)
 				continue
@@ -207,9 +249,33 @@ func (c *APIClient) assembleURL(path string) string {
 	return c.APIHost + path
 }
 
+// compileDetectRule 按主机名的语义不区分大小写匹配：客户端把域名写成大写照样能解析，不能借此绕过审计
+func compileDetectRule(pattern string) (*regexp.Regexp, error) {
+	return regexp.Compile("(?i)" + pattern)
+}
+
+// restyLogger 把 resty 的日志并入 logrus。
+type restyLogger struct{}
+
+func (restyLogger) Errorf(format string, v ...interface{}) {
+	log.Errorf(format, v...)
+}
+
+func (restyLogger) Warnf(format string, v ...interface{}) {
+	log.Warnf(format, v...)
+}
+
+func (restyLogger) Debugf(format string, v ...interface{}) {
+	log.Debugf(format, v...)
+}
+
+func (c *APIClient) requestError(path string, err error) error {
+	return fmt.Errorf("request %s failed: %s", c.assembleURL(path), err.Error())
+}
+
 func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (*Response, error) {
 	if err != nil {
-		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
+		return nil, c.requestError(path, err)
 	}
 
 	if res.StatusCode() > 400 {
@@ -233,14 +299,11 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		SetHeader("If-None-Match", c.eTag("node")).
 		ForceContentType("application/json").
 		Get(path)
-	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
-	if res.StatusCode() == 304 {
-		return nil, errors.New(api.NodeNotModified)
+	// 地址无法解析时 resty 返回 nil 响应，先判错误才能读状态码
+	if err != nil {
+		return nil, c.requestError(path, err)
 	}
-
-	if eTag := res.Header().Get("ETag"); eTag != "" {
-		c.setETag("node", eTag)
-	}
+	res = c.revalidate("node", res)
 
 	response, err := c.parseResponse(res, path, err)
 	if err != nil {
@@ -255,8 +318,8 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 
 	nodeInfo, err = c.ParseSSPanelNodeInfo(nodeInfoResponse)
 	if err != nil {
-		res, _ := json.Marshal(nodeInfoResponse)
-		return nil, fmt.Errorf("parse node info failed: %s, \nError: %s", string(res), err)
+		// 原始节点配置含 REALITY 私钥、服务端密钥等，不能进日志
+		return nil, fmt.Errorf("parse node info failed: %w", err)
 	}
 
 	return nodeInfo, nil
@@ -274,7 +337,8 @@ func (c *APIClient) GetECYCloudNodeCertConfig() (*api.ECYCloudNodeCertConfig, er
 func (c *APIClient) fetchCertConfigByType(configType string) (*api.ECYCloudNodeCertConfig, error) {
 	path := "/mod_mu/nodes/config"
 	payload := map[string]string{
-		"type": configType,
+		"type":    configType,
+		"node_id": strconv.Itoa(c.NodeID),
 	}
 
 	res, err := c.client.R().
@@ -302,7 +366,8 @@ func (c *APIClient) fetchCertConfigByType(configType string) (*api.ECYCloudNodeC
 func (c *APIClient) GetGlobalLimitConfig() (*api.GlobalLimitConfig, error) {
 	path := "/mod_mu/nodes/config"
 	payload := map[string]string{
-		"type": "global_limit",
+		"type":    "global_limit",
+		"node_id": strconv.Itoa(c.NodeID),
 	}
 
 	res, err := c.client.R().
@@ -329,7 +394,8 @@ func (c *APIClient) GetGlobalLimitConfig() (*api.GlobalLimitConfig, error) {
 func (c *APIClient) GetWebAPIConfig() (*api.WebAPIConfig, error) {
 	path := "/mod_mu/nodes/config"
 	payload := map[string]string{
-		"type": "webapi",
+		"type":    "webapi",
+		"node_id": strconv.Itoa(c.NodeID),
 	}
 
 	res, err := c.client.R().
@@ -360,14 +426,10 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		SetResult(&Response{}).
 		ForceContentType("application/json").
 		Get(path)
-	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
-	if res.StatusCode() == 304 {
-		return nil, errors.New(api.UserNotModified)
+	if err != nil {
+		return nil, c.requestError(path, err)
 	}
-
-	if eTag := res.Header().Get("ETag"); eTag != "" {
-		c.setETag("users", eTag)
-	}
+	res = c.revalidate("users", res)
 
 	response, err := c.parseResponse(res, path, err)
 	if err != nil {
@@ -384,9 +446,9 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		res, _ := json.Marshal(userListResponse)
 		return nil, fmt.Errorf("parse user list failed: %s", string(res))
 	}
-	// 授权期限与面板响应时间来自同一时钟；只在取得新列表时换算，不凭 304 续期。
+	// 授权期限与面板响应时间来自同一时钟，按收到该响应的时刻换算：304 复用旧响应时不能凭此续期。
 	if panelTime, err := strconv.ParseInt(res.Header().Get("X-ECY-Server-Time-Ms"), 10, 64); err == nil && panelTime > 0 {
-		now := time.Now()
+		now := res.ReceivedAt()
 		c.clockOffset.Store(panelTime - now.UnixMilli())
 		for i := range *userList {
 			if (*userList)[i].ValidUntil != 0 {
@@ -520,28 +582,22 @@ func (c *APIClient) ConsumeSlotReclaim(uid int, slot string) (bool, string, erro
 
 // GetNodeRule will pull the audit rule form ssPanel
 func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
-	ruleList := c.LocalRuleList
+	// 复制一份再追加：本地规则表有剩余容量时直接追加会改写上一轮交给规则管理器、仍在审计中使用的列表
+	ruleList := slices.Clone(c.LocalRuleList)
 	path := "/mod_mu/func/detect_rules"
 	res, err := c.client.R().
+		SetQueryParam("node_id", strconv.Itoa(c.NodeID)).
 		SetHeader("If-None-Match", c.eTag("rules")).
 		ForceContentType("application/json").
 		Get(path)
 
 	if err != nil {
-		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
+		return nil, c.requestError(path, err)
 	}
-
-	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
-	if res.StatusCode() == 304 {
-		return nil, errors.New(api.RuleNotModified)
-	}
+	res = c.revalidate("rules", res)
 
 	if res.StatusCode() > 400 {
 		return nil, fmt.Errorf("request %s failed with status: %d", c.assembleURL(path), res.StatusCode())
-	}
-
-	if eTag := res.Header().Get("ETag"); eTag != "" {
-		c.setETag("rules", eTag)
 	}
 
 	// Parse the full response including exempt_users
@@ -561,7 +617,7 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 
 	for _, r := range *ruleListResponse {
 		// 规则内容由面板管理员填写，一条写坏不能连带整个节点崩溃
-		pattern, err := regexp.Compile(r.Content)
+		pattern, err := compileDetectRule(r.Content)
 		if err != nil {
 			log.Printf("Invalid detect rule %d pattern %q, skipped: %s", r.ID, r.Content, err)
 			continue

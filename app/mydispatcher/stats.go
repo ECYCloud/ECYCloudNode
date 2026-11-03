@@ -3,24 +3,17 @@ package mydispatcher
 import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/features/stats"
 )
 
 type SizeStatWriter struct {
-	Counter stats.Counter
-	Writer  buf.Writer
-	Record  func(int64) error
+	Writer buf.Writer
+	Record func(int64) error
 }
 
 func (w *SizeStatWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	if w.Record != nil {
-		if err := w.Record(int64(mb.Len())); err != nil {
-			buf.ReleaseMulti(mb)
-			return err
-		}
-	}
-	if w.Counter != nil {
-		w.Counter.Add(int64(mb.Len()))
+	if err := w.Record(int64(mb.Len())); err != nil {
+		buf.ReleaseMulti(mb)
+		return err
 	}
 	return w.Writer.WriteMultiBuffer(mb)
 }

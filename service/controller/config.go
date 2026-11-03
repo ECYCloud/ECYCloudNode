@@ -19,6 +19,7 @@ type Config struct {
 	AutoSpeedLimitConfig    *AutoSpeedLimitConfig            `mapstructure:"AutoSpeedLimitConfig"`
 	GlobalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig `mapstructure:"GlobalDeviceLimitConfig"`
 	FallBackConfigs         []*FallBackConfig                `mapstructure:"FallBackConfigs"`
+	ProxyProtocolTrustedIPs []string                         `mapstructure:"ProxyProtocolTrustedIPs"`
 }
 
 type AutoSpeedLimitConfig struct {

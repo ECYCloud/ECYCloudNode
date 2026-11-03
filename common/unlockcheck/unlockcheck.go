@@ -9,8 +9,11 @@ package unlockcheck
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,11 +34,22 @@ var (
 
 	// Global node ID registry for multi-node support
 	nodeRegistryMutex sync.RWMutex
-	registeredNodeIDs []int        // All node IDs that should receive results
-	reportedNodeIDs   map[int]bool // Node IDs that have already reported in current hour
-	reportedHour      int          // The hour when reportedNodeIDs was last reset
-	reportedDate      string       // The date when reportedNodeIDs was last reset
+	registeredNodes   []reportTarget        // All nodes that should receive results
+	reportedNodes     map[reportTarget]bool // Nodes that have already reported in current hour
+	reportedHour      int                   // The hour when reportedNodes was last reset
+	reportedDate      string                // The date when reportedNodes was last reset
 )
+
+// reportTarget 按面板地址加 NodeID 区分节点：多面板部署时不同面板的同号节点是不同节点，
+// 检测结果只能经各自面板的客户端上报。
+type reportTarget struct {
+	host string
+	id   int
+}
+
+func newReportTarget(host string, nodeID int) reportTarget {
+	return reportTarget{host: strings.TrimRight(strings.TrimSpace(host), "/"), id: nodeID}
+}
 
 // ResetNodeIDs 清空节点注册表。注册表是包级状态，热重载会重新注册当前节点列表；
 // 不先清空的话，配置里已删掉的节点仍会被当成共享检测的上报对象。
@@ -43,37 +57,46 @@ func ResetNodeIDs() {
 	nodeRegistryMutex.Lock()
 	defer nodeRegistryMutex.Unlock()
 
-	registeredNodeIDs = nil
+	registeredNodes = nil
 }
 
-// RegisterNodeID registers a node ID for unlock check result sharing.
-// All registered nodes will receive the same detection results.
-func RegisterNodeID(nodeID int) {
+// RegisterNodeID registers a node of the panel at host for unlock check result sharing.
+// All registered nodes of the same panel will receive the same detection results.
+func RegisterNodeID(host string, nodeID int) {
+	if nodeID <= 0 {
+		return
+	}
 	nodeRegistryMutex.Lock()
 	defer nodeRegistryMutex.Unlock()
 
+	target := newReportTarget(host, nodeID)
 	// Check if already registered
-	for _, id := range registeredNodeIDs {
-		if id == nodeID {
+	for _, registered := range registeredNodes {
+		if registered == target {
 			return
 		}
 	}
-	registeredNodeIDs = append(registeredNodeIDs, nodeID)
-	log.Infof("[UnlockCheck] Registered node %d for shared detection (total: %d nodes)", nodeID, len(registeredNodeIDs))
+	registeredNodes = append(registeredNodes, target)
+	log.Infof("[UnlockCheck] Registered node %d for shared detection (total: %d nodes)", nodeID, len(registeredNodes))
 }
 
-// GetRegisteredNodeIDs returns all registered node IDs
-func GetRegisteredNodeIDs() []int {
+// GetRegisteredNodeIDs returns the registered node IDs of the panel at host
+func GetRegisteredNodeIDs(host string) []int {
 	nodeRegistryMutex.RLock()
 	defer nodeRegistryMutex.RUnlock()
 
-	result := make([]int, len(registeredNodeIDs))
-	copy(result, registeredNodeIDs)
+	panel := newReportTarget(host, 0).host
+	var result []int
+	for _, registered := range registeredNodes {
+		if registered.host == panel {
+			result = append(result, registered.id)
+		}
+	}
 	return result
 }
 
 // MarkNodeReported marks a node as having reported in the current hour
-func MarkNodeReported(nodeID int) {
+func MarkNodeReported(host string, nodeID int) {
 	nodeRegistryMutex.Lock()
 	defer nodeRegistryMutex.Unlock()
 
@@ -83,19 +106,19 @@ func MarkNodeReported(nodeID int) {
 
 	// Reset if hour changed
 	if reportedHour != currentHour || reportedDate != currentDate {
-		reportedNodeIDs = make(map[int]bool)
+		reportedNodes = make(map[reportTarget]bool)
 		reportedHour = currentHour
 		reportedDate = currentDate
 	}
 
-	if reportedNodeIDs == nil {
-		reportedNodeIDs = make(map[int]bool)
+	if reportedNodes == nil {
+		reportedNodes = make(map[reportTarget]bool)
 	}
-	reportedNodeIDs[nodeID] = true
+	reportedNodes[newReportTarget(host, nodeID)] = true
 }
 
 // HasNodeReported checks if a node has already reported in the current hour
-func HasNodeReported(nodeID int) bool {
+func HasNodeReported(host string, nodeID int) bool {
 	nodeRegistryMutex.RLock()
 	defer nodeRegistryMutex.RUnlock()
 
@@ -108,10 +131,10 @@ func HasNodeReported(nodeID int) bool {
 		return false
 	}
 
-	if reportedNodeIDs == nil {
+	if reportedNodes == nil {
 		return false
 	}
-	return reportedNodeIDs[nodeID]
+	return reportedNodes[newReportTarget(host, nodeID)]
 }
 
 // GetCachedResults returns cached results if still valid for the current hour, otherwise returns nil
@@ -229,53 +252,46 @@ func (c *Checker) RunAllChecks() *UnlockCheckResults {
 }
 
 // runCSMScript executes the embedded csm.sh script locally, returns results or nil if failed
-// This uses the locally embedded script (CSM_SCRIPT) instead of downloading from remote
 func (c *Checker) runCSMScript() *UnlockCheckResults {
-	scriptPath := "/tmp/ecycloudnode_csm_check.sh"
-	resultPath := "/tmp/ecycloudnode_unlock_check_result.json"
-
-	// Write embedded script to temp file
-	c.logger.Info("[UnlockCheck] Writing embedded csm.sh script to temp file...")
-	if err := os.WriteFile(scriptPath, []byte(CSM_SCRIPT), 0755); err != nil {
-		c.logger.Warnf("[UnlockCheck] Failed to write script file: %v", err)
-		return nil
-	}
-
-	// Execute the script
 	c.logger.Info("[UnlockCheck] Executing embedded csm.sh script (100% same logic as csm.sh)...")
-	execCmd := exec.Command("bash", scriptPath)
-	execCmd.Env = append(os.Environ(), "LANG=en_US.UTF-8")
-	output, err := execCmd.CombinedOutput()
+	resultData, output, err := RunScript("ecycloudnode-unlock-")
 	if err != nil {
-		c.logger.Warnf("[UnlockCheck] Failed to execute script: %v, output: %s", err, string(output))
-		// Clean up script file
-		os.Remove(scriptPath)
+		c.logger.Warnf("[UnlockCheck] %v, output: %s", err, string(output))
 		return nil
 	}
 
-	// Read result JSON file
-	resultData, err := os.ReadFile(resultPath)
-	if err != nil {
-		c.logger.Warnf("[UnlockCheck] Failed to read result file: %v", err)
-		os.Remove(scriptPath)
-		return nil
-	}
-
-	// Parse JSON results
 	var results UnlockCheckResults
 	if err := json.Unmarshal(resultData, &results); err != nil {
 		c.logger.Warnf("[UnlockCheck] Failed to parse result JSON: %v", err)
-		os.Remove(scriptPath)
-		os.Remove(resultPath)
 		return nil
 	}
 
-	// Clean up temp files
-	os.Remove(scriptPath)
-	os.Remove(resultPath)
-
 	c.logger.Info("[UnlockCheck] Embedded csm.sh script executed successfully")
 	return &results
+}
+
+// RunScript 在新建的私有临时目录里执行内嵌脚本并返回结果 JSON：节点以 root 运行，
+// 共享 /tmp 下的固定文件名可被其它用户预先创建或替换，从而伪造结果或借 root 执行命令。
+func RunScript(prefix string) (result, output []byte, err error) {
+	workDir, err := os.MkdirTemp("", prefix)
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建检测临时目录失败：%w", err)
+	}
+	defer os.RemoveAll(workDir)
+	scriptPath := filepath.Join(workDir, "check.sh")
+	script := strings.ReplaceAll(CSM_SCRIPT, "/tmp/ecycloudnode_unlock_check", "${ECYCLOUDNODE_UNLOCK_TMP}/unlock_check")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		return nil, nil, fmt.Errorf("写入检测脚本失败：%w", err)
+	}
+	execCmd := exec.Command("bash", scriptPath)
+	execCmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "ECYCLOUDNODE_UNLOCK_TMP="+filepath.ToSlash(workDir))
+	if output, err = execCmd.CombinedOutput(); err != nil {
+		return nil, output, fmt.Errorf("执行检测脚本失败：%w", err)
+	}
+	if result, err = os.ReadFile(filepath.Join(workDir, "unlock_check_result.json")); err != nil {
+		return nil, output, fmt.Errorf("读取检测结果失败：%w", err)
+	}
+	return result, output, nil
 }
 
 // ToJSON converts results to JSON string

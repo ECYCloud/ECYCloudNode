@@ -2,6 +2,8 @@ package tuic
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"reflect"
 	"strconv"
 	"time"
@@ -15,6 +17,13 @@ import (
 	"github.com/ECYCloud/ECYCloudNode/common/serverstatus"
 )
 
+// userKey 是认证后的用户名及各账本的键。TUIC 按 UUID 找用户、再核对密码，键里必须带密码摘要：
+// 面板只改密码时旧键随之消失，旧密码建立的会话与流在下一次复查时被断开。
+func userKey(u api.UserInfo) string {
+	digest := sha256.Sum256([]byte(u.Passwd))
+	return u.UUID + "|" + hex.EncodeToString(digest[:8])
+}
+
 func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 	if userInfo == nil {
 		return
@@ -23,7 +32,7 @@ func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 	s.globalChecker.SyncUsers(userInfo, s.tag)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	accountSlots := limiter.ReconcileDeviceSlots(s.onlineSlots, s.slotLastActive, *userInfo)
+	accountSlots := limiter.ReconcileDeviceSlots(s.onlineSlots, s.slotLastActive, *userInfo, userKey)
 
 	newUsers := make(map[string]userRecord, len(*userInfo))
 	authUsers := make([]option.TUICUser, 0, len(*userInfo))
@@ -36,11 +45,10 @@ func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 	}
 
 	for _, u := range *userInfo {
-		// TUIC uses UUID as the primary authentication key
-		key := u.UUID
-		if key == "" {
+		if u.UUID == "" {
 			continue
 		}
+		key := userKey(u)
 
 		rec := userRecord{
 			ValidUntil:      u.ValidUntil,
@@ -89,7 +97,7 @@ func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 			password = u.UUID
 		}
 		authUsers = append(authUsers, option.TUICUser{
-			Name:     u.UUID,
+			Name:     key,
 			UUID:     u.UUID,
 			Password: password,
 		})
@@ -200,9 +208,9 @@ func (s *TuicService) allowConnection(uuid, host string) bool {
 		s.slotLastActive[uuid] = activeMap
 	}
 
-	allowed, _ = limiter.AdmitDeviceSlot(&s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
+	allowed, _ = limiter.AdmitDeviceSlot(s.tag, &s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
 		_, latest, ok := s.slot(uuid, host, user.KickVersion)
-		if s.globalChecker != nil {
+		if s.globalChecker.Enforcing() {
 			return 0, ok
 		}
 		return latest.DeviceLimit, ok
@@ -231,7 +239,7 @@ func (s *TuicService) ensureOnline(uuid, host string, version ...uint64) bool {
 		return false
 	}
 	localLimit := user.DeviceLimit
-	if s.globalChecker != nil {
+	if s.globalChecker.Enforcing() {
 		localLimit = 0
 	}
 	online, due := limiter.EnsureDeviceSlot(s.onlineSlots, s.slotLastActive, uuid, slot, localLimit)
@@ -274,10 +282,13 @@ func (s *TuicService) verifyOnline(uuid, host string, version ...uint64) bool {
 	if !ok {
 		return false
 	}
-	if s.globalChecker != nil {
-		return s.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: s.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
+	if s.globalChecker.Enforcing() {
+		allowed := s.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: s.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
 			return s.currentDeviceLimit(uuid, host, user.KickVersion)
 		})
+		if !allowed || s.globalChecker.Enforcing() {
+			return allowed
+		}
 	}
 	return localAllowed
 }
@@ -345,35 +356,23 @@ func (s *TuicService) userMonitor() error {
 		}
 	}
 
-	usersChanged := true
 	newUserInfo, err := s.apiClient.GetUserList()
 	if err != nil {
-		if err.Error() == api.UserNotModified {
-			usersChanged = false
-			// Reset failure counter on successful "not modified" response
-			s.consecutiveFailures = 0
-		} else {
-			s.logger.Print(err)
-			// Track consecutive API failures for recovery
-			if api.IsAPIFailure(err) {
-				s.consecutiveFailures++
-				s.lastFailureTime = time.Now()
-				s.logger.Warnf("API communication failure detected (%d/%d)", s.consecutiveFailures, api.MaxConsecutiveFailures)
-				if s.consecutiveFailures >= api.MaxConsecutiveFailures {
-					s.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", s.consecutiveFailures)
-					s.triggerRecovery()
-				}
+		s.logger.Print(err)
+		// Track consecutive API failures for recovery
+		if api.IsAPIFailure(err) {
+			failures := s.consecutiveFailures.Add(1)
+			s.logger.Warnf("API communication failure detected (%d/%d)", failures, api.MaxConsecutiveFailures)
+			if failures >= api.MaxConsecutiveFailures {
+				s.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", failures)
+				s.triggerRecovery()
 			}
-			return nil
 		}
+		return nil
 	}
-	if s.consecutiveFailures != 0 {
-		s.consecutiveFailures = 0
-	}
-	if usersChanged {
-		s.syncUsers(newUserInfo)
-	}
-	if (usersChanged || s.hasUnbuiltAuthUser()) && !s.awaitingRebuild() {
+	s.consecutiveFailures.Store(0)
+	s.syncUsers(newUserInfo)
+	if s.hasUnbuiltAuthUser() && !s.awaitingRebuild() {
 		if err := s.updateInboundUsers(); err != nil {
 			s.logger.Errorf("TUIC user update failed: %v", err)
 		}
@@ -382,10 +381,9 @@ func (s *TuicService) userMonitor() error {
 	// Check Rule
 	if !s.config.DisableGetRule && s.rules != nil {
 		if ruleList, err := s.apiClient.GetNodeRule(); err != nil {
-			if err.Error() != api.RuleNotModified {
-				s.logger.Printf("Get rule list filed: %s", err)
-			}
-		} else if len(*ruleList) > 0 {
+			s.logger.Printf("Get rule list filed: %s", err)
+		} else {
+			// 面板删光规则时返回空列表，也要落地，否则旧规则会一直拦到节点重启
 			if err := s.rules.UpdateRule(s.tag, *ruleList); err != nil {
 				s.logger.Print(err)
 			}
@@ -394,7 +392,7 @@ func (s *TuicService) userMonitor() error {
 		if exemptUsers, err := s.apiClient.GetExemptUsers(); err != nil {
 			s.logger.Printf("Get exempt users failed: %s", err)
 		} else {
-			s.rules.UpdateExemptUsers(exemptUsers)
+			s.rules.UpdateExemptUsers(s.tag, exemptUsers)
 		}
 	}
 
@@ -402,7 +400,7 @@ func (s *TuicService) userMonitor() error {
 	if err = s.apiClient.ReportNodeOnlineUsers(&onlineUsers); err != nil {
 		s.logger.Print(err)
 	}
-	if kicks := limiter.TakeDeviceKicks(); len(kicks) > 0 {
+	if kicks := limiter.TakeDeviceKicks(s.tag); len(kicks) > 0 {
 		if err = s.apiClient.ReportKickedUsers(&kicks); err != nil {
 			s.logger.Print(err)
 		}
@@ -434,36 +432,22 @@ func (s *TuicService) nodeMonitor() error {
 
 	nodeInfo, err := s.apiClient.GetNodeInfo()
 	if err != nil {
-		if err.Error() == api.NodeNotModified {
-			// Reset failure counter on successful "not modified" response
-			s.consecutiveFailures = 0
-			// 304 不带配置，上一轮重建没走完时只能拿缓存的 nodeInfo 重试
-			if s.needsRebuild() {
-				if err := s.reloadNode(s.currentNodeInfo()); err != nil {
-					s.logger.Printf("TUIC node rebuild retry failed: %v", err)
-				}
-			}
-			return nil
-		}
 		s.logger.Print(err)
 		// Track consecutive API failures for recovery
 		if api.IsAPIFailure(err) {
-			s.consecutiveFailures++
-			s.lastFailureTime = time.Now()
-			s.logger.Warnf("API communication failure detected (%d/%d)", s.consecutiveFailures, api.MaxConsecutiveFailures)
+			failures := s.consecutiveFailures.Add(1)
+			s.logger.Warnf("API communication failure detected (%d/%d)", failures, api.MaxConsecutiveFailures)
 
 			// Check if we should trigger auto-recovery
-			if s.consecutiveFailures >= api.MaxConsecutiveFailures {
-				s.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", s.consecutiveFailures)
+			if failures >= api.MaxConsecutiveFailures {
+				s.logger.Errorf("Consecutive API failures reached threshold (%d), triggering service recovery...", failures)
 				s.triggerRecovery()
 			}
 		}
 		return nil
 	}
 
-	if s.consecutiveFailures != 0 {
-		s.consecutiveFailures = 0
-	}
+	s.consecutiveFailures.Store(0)
 
 	if nodeInfo == nil || nodeInfo.NodeType != "Tuic" {
 		if s.logger != nil {

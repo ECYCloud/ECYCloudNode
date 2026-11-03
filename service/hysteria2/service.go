@@ -88,6 +88,7 @@ func (h *Hysteria2Service) Start() error {
 	// audit rule state isolated.
 	h.tag = fmt.Sprintf("%s_%s_%d_%d", h.nodeInfo.NodeType, h.config.ListenIP, h.nodeInfo.Port, h.nodeInfo.NodeID)
 	h.startAt = time.Now()
+	limiter.SetReclaimConsumer(h.tag, limiter.PanelReclaim(h.apiClient))
 
 	// Initial user list.
 	userInfo, err := h.apiClient.GetUserList()
@@ -109,7 +110,7 @@ func (h *Hysteria2Service) Start() error {
 		if exemptUsers, err := h.apiClient.GetExemptUsers(); err != nil {
 			h.logger.Printf("Get exempt users failed: %s", err)
 		} else {
-			h.rules.UpdateExemptUsers(exemptUsers)
+			h.rules.UpdateExemptUsers(h.tag, exemptUsers)
 		}
 	}
 
@@ -206,11 +207,20 @@ func (h *Hysteria2Service) Close() error {
 		}
 	}
 	h.tasks = nil
+	limiter.SetReclaimConsumer(h.tag, nil)
 	var closeErr error
 	if srv != nil {
 		closeErr = srv.Close()
 	}
 	return errors.Join(closeErr, h.apiClient.CloseTraffic())
+}
+
+// currentNodeInfo 读取当前节点信息。nodeMonitor、userMonitor 与 certMonitor 是
+// 三个独立 goroutine，而 reloadNode 会在 h.mu 下整体替换它。
+func (h *Hysteria2Service) currentNodeInfo() *api.NodeInfo {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.nodeInfo
 }
 
 // needsRebuild 报告是否该重试上一轮没走完的重建。退避未到就先不动。
@@ -307,8 +317,11 @@ func (h *Hysteria2Service) reloadNode(nodeInfo *api.NodeInfo) error {
 		return errors.New("Hysteria2 service is closed")
 	}
 
+	// nodeInfo 同时被 userMonitor 读取（syncUsers 取 SpeedLimit），必须与其同锁
+	h.mu.Lock()
 	oldInfo := h.nodeInfo
 	h.nodeInfo = nodeInfo
+	h.mu.Unlock()
 
 	// Update port hopping iptables rules according to the latest node
 	// configuration before we rebuild the underlying Hysteria2 server.
@@ -357,7 +370,9 @@ func (h *Hysteria2Service) reloadNode(nodeInfo *api.NodeInfo) error {
 	if err != nil {
 		// nodeInfo 必须退回实际跑着的那份，端口跳跃规则跟着一起退，否则
 		// syncUsers、nodeMonitor 与 iptables 都会按一份没生效的配置判断。
+		h.mu.Lock()
 		h.nodeInfo = oldInfo
+		h.mu.Unlock()
 		h.updatePortHopRulesLocked()
 
 		rebuilt := false
@@ -407,7 +422,7 @@ func (h *Hysteria2Service) triggerRecovery() {
 	}
 
 	// Reset failure counter
-	h.consecutiveFailures = 0
+	h.consecutiveFailures.Store(0)
 
 	// Restart periodic tasks after a short delay
 	tasks := h.tasks

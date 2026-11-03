@@ -10,6 +10,8 @@ import (
 	"sync"
 
 	mapset "github.com/deckarep/golang-set/v3"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/option"
 	"github.com/xtls/xray-core/common/errors"
 
 	"github.com/ECYCloud/ECYCloudNode/api"
@@ -18,7 +20,8 @@ import (
 type Manager struct {
 	InboundRule         *sync.Map // Key: Tag, Value: []api.DetectRule
 	InboundDetectResult *sync.Map // key: Tag, Value: mapset.NewSet []api.DetectResult
-	// exemptUsers stores the audit exemption list. Key: UID, Value: *api.ExemptUser
+	// exemptUsers 按节点 tag 分别存各自面板下发的豁免表。Key: Tag, Value: *sync.Map（UID -> *api.ExemptUser）
+	// 同一 xray 进程的多面板节点共用一个 Manager，不同面板的同号 UID 是不同的用户。
 	exemptUsers *sync.Map
 }
 
@@ -30,24 +33,33 @@ func New() *Manager {
 	}
 }
 
-// UpdateExemptUsers replaces the exempt user list
-func (r *Manager) UpdateExemptUsers(users []api.ExemptUser) {
-	// Clear old entries
-	r.exemptUsers.Range(func(key, value interface{}) bool {
-		r.exemptUsers.Delete(key)
+// UpdateExemptUsers replaces the exempt user list of the node tag
+// 先写入新表再删去不在其中的旧项：先清空再写入时，并发的审计会在窗口内误拦豁免用户。
+func (r *Manager) UpdateExemptUsers(tag string, users []api.ExemptUser) {
+	value, _ := r.exemptUsers.LoadOrStore(tag, new(sync.Map))
+	table := value.(*sync.Map)
+	current := make(map[int]bool, len(users))
+	for i := range users {
+		table.Store(users[i].UID, &users[i])
+		current[users[i].UID] = true
+	}
+	table.Range(func(key, value interface{}) bool {
+		if !current[key.(int)] {
+			table.Delete(key)
+		}
 		return true
 	})
-	// Store new entries
-	for i := range users {
-		r.exemptUsers.Store(users[i].UID, &users[i])
-	}
 }
 
 // isExempt checks if a user (by UID) is exempt from a specific rule on a given node.
 // nodeID < 0 means "node unknown" — in that case we still respect the rules-dimension
 // exemption to avoid over-blocking, but cannot enforce node-scope precisely.
-func (r *Manager) isExempt(uid int, ruleID int, nodeID int) bool {
-	val, ok := r.exemptUsers.Load(uid)
+func (r *Manager) isExempt(tag string, uid int, ruleID int, nodeID int) bool {
+	table, ok := r.exemptUsers.Load(tag)
+	if !ok {
+		return false
+	}
+	val, ok := table.(*sync.Map).Load(uid)
 	if !ok {
 		return false
 	}
@@ -118,6 +130,7 @@ func (r *Manager) GetDetectResult(tag string) (*[]api.DetectResult, error) {
 
 func (r *Manager) Detect(tag string, destination string, userKey string, srcIP string) (reject bool) {
 	reject = false
+	destination = normalizeDestination(destination)
 	var hitRuleID = -1
 	// Parse UID early so we can check exemptions before rejecting
 	uid := -1
@@ -137,7 +150,7 @@ func (r *Manager) Detect(tag string, destination string, userKey string, srcIP s
 		for _, rule := range ruleList {
 			if rule.Pattern.Match([]byte(destination)) {
 				// Check if user is exempt from this rule on the current node
-				if uid >= 0 && r.isExempt(uid, rule.ID, nodeID) {
+				if uid >= 0 && r.isExempt(tag, uid, rule.ID, nodeID) {
 					continue
 				}
 				hitRuleID = rule.ID
@@ -163,4 +176,61 @@ func (r *Manager) Detect(tag string, destination string, userKey string, srcIP s
 		}
 	}
 	return reject
+}
+
+// DetectUnexempted 供拿不到用户身份的逐包检查使用：只按本节点没有任何豁免的规则拦截，
+// 有豁免的规则仍由带身份的审计判定，不能误伤豁免用户。
+func (r *Manager) DetectUnexempted(tag string, destination string) bool {
+	value, ok := r.InboundRule.Load(tag)
+	if !ok {
+		return false
+	}
+	destination = normalizeDestination(destination)
+	nodeID := nodeIDFromTag(tag)
+	for _, rule := range value.([]api.DetectRule) {
+		if rule.Pattern.Match([]byte(destination)) && !r.ruleExempted(tag, rule.ID, nodeID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Manager) ruleExempted(tag string, ruleID int, nodeID int) bool {
+	table, ok := r.exemptUsers.Load(tag)
+	if !ok {
+		return false
+	}
+	exempted := false
+	table.(*sync.Map).Range(func(uid, _ any) bool {
+		exempted = r.isExempt(tag, uid.(int), ruleID, nodeID)
+		return !exempted
+	})
+	return exempted
+}
+
+// SingBoxSniffRule 让按 IP 直连的 TLS / HTTP / QUIC 连接也能按其中的域名审计。
+// 不改写目标地址：连接仍发往客户端请求的地址，私网拦截照旧按该地址判定。
+func SingBoxSniffRule() option.Rule {
+	return option.Rule{
+		Type: C.RuleTypeDefault,
+		DefaultOptions: option.DefaultRule{
+			RuleAction: option.RuleAction{
+				Action:       C.RuleActionTypeSniff,
+				SniffOptions: option.RouteActionSniff{Sniffer: []string{C.ProtocolTLS, C.ProtocolHTTP, C.ProtocolQUIC}},
+			},
+		},
+	}
+}
+
+// normalizeDestination 去掉主机名末尾的根点：netflix.com. 与 netflix.com 解析结果相同，不能借此绕过规则
+func normalizeDestination(destination string) string {
+	if i := strings.LastIndex(destination, ".:"); i >= 0 && isPort(destination[i+2:]) {
+		destination = destination[:i] + destination[i+1:]
+	}
+	return strings.TrimSuffix(destination, ".")
+}
+
+func isPort(s string) bool {
+	_, err := strconv.ParseUint(s, 10, 16)
+	return err == nil
 }

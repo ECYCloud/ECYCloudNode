@@ -14,7 +14,10 @@ Group=root
 Type=simple
 LimitAS=infinity
 LimitRSS=infinity
-LimitCORE=infinity
+# 进程内存里有面板 ApiKey、证书私钥与用户凭据，崩溃转储会把它们写到磁盘
+LimitCORE=0
+# 节点及其拉起的 iptables、检测脚本都不能经 setuid 等途径再提权
+NoNewPrivileges=yes
 LimitNOFILE=999999
 WorkingDirectory=/usr/local/ECYCloudNode/
 # 启动前等待 DNS 解析可用（检测外部网络连通性）

@@ -167,11 +167,6 @@ func (l *Limiter) GuardWriter(writer buf.Writer, tag, userKey, ip string, versio
 	return &GuardWriter{writer: writer, guardState: l.connectionGuard(tag, userKey, ip, false, version)}
 }
 
-// GuardUplinkWriter 上行方向的写端（承载客户端→远端的数据）：核查并续期。
-func (l *Limiter) GuardUplinkWriter(writer buf.Writer, tag, userKey, ip string, version ...uint64) buf.Writer {
-	return &GuardWriter{writer: writer, guardState: l.connectionGuard(tag, userKey, ip, true, version)}
-}
-
 func (r *GuardReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if err := r.check(); err != nil {
 		return nil, err

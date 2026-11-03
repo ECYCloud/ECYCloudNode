@@ -2,6 +2,7 @@ package hysteria2
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
@@ -40,6 +41,8 @@ type Hysteria2Service struct {
 	onlineSlots    map[string]map[string]struct{}  // uuid -> set of slots
 	slotLastActive map[string]map[string]time.Time // uuid -> slot -> last active time
 	blockedIDs     map[string]bool                 // connection id -> blocked by audit
+	udpSessions    map[string]map[uint32]struct{}  // connection id -> open UDP session ids
+	streams        sync.Map                        // server.HyStream -> connection id, for the sniff hook
 	rateLimiters   map[string]*rate.Limiter        // uuid -> per-user speed limiter
 	// rebuildPending 记录「server 尚未按 nodeInfo 装好」。面板随后会返回 304，
 	// 届时既没有新配置可比，DeepEqual 也判不出重建没走完。
@@ -63,8 +66,8 @@ type Hysteria2Service struct {
 	portHopRules []portHopRule
 
 	// Recovery tracking for IP whitelist / connectivity issues
-	consecutiveFailures int
-	lastFailureTime     time.Time
+	// consecutiveFailures 由用户与节点两个周期任务各自的 goroutine 同时累加、清零
+	consecutiveFailures atomic.Int32
 	recoveryMutex       sync.Mutex
 	recoveryInProgress  bool
 }

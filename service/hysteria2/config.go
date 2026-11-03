@@ -8,6 +8,7 @@ import (
 	"github.com/apernet/hysteria/core/v2/server"
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/obfs"
+	"github.com/apernet/hysteria/extras/v2/sniff"
 
 	"github.com/ECYCloud/ECYCloudNode/common/mylego"
 )
@@ -90,9 +91,13 @@ func (h *Hysteria2Service) buildServerConfig() (*server.Config, error) {
 
 		BandwidthConfig:       bandwidth,
 		IgnoreClientBandwidth: hy.IgnoreClientBandwidth,
+		Outbound:              publicOutbound{rules: h.rules, tag: h.tag},
 		Authenticator:         &hyAuthenticator{svc: h},
 		EventLogger:           &hyEventLogger{svc: h},
 		TrafficLogger:         &hyTrafficLogger{svc: h},
+	}
+	if !h.config.DisableSniffing {
+		cfg.RequestHook = &sniffHook{Sniffer: sniff.Sniffer{Timeout: sniffTimeout}, svc: h}
 	}
 
 	return cfg, nil
@@ -134,7 +139,8 @@ func (h *Hysteria2Service) certMonitor() error {
 		return nil
 	}
 
-	if !h.nodeInfo.EnableTLS {
+	current := h.currentNodeInfo()
+	if current == nil || !current.EnableTLS {
 		return nil
 	}
 
@@ -155,7 +161,7 @@ func (h *Hysteria2Service) certMonitor() error {
 		// requiring a full ECYCloudNode restart.
 		if ok {
 			h.logger.Infof("Hysteria2 certificate renewed for %s, reloading server (cert=%s, key=%s)", h.config.CertConfig.CertDomain, certPath, keyPath)
-			if err := h.reloadNode(h.nodeInfo); err != nil {
+			if err := h.reloadNode(current); err != nil {
 				h.logger.Printf("Hysteria2 certificate reload failed: %v", err)
 			}
 		}

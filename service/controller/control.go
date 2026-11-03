@@ -2,12 +2,15 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	xlog "github.com/xtls/xray-core/common/log"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -48,6 +51,10 @@ func isECYCloudNodeManagedTag(tag string) bool {
 	return false
 }
 
+type auditDetector interface {
+	Detect(tag string, destination string, email string, srcIP string) bool
+}
+
 // dataPathWrapper wraps outbound.Handler to enforce device limit, user/node speed limit,
 // audit rules and ensure userland path is used for stats.
 type dataPathWrapper struct {
@@ -56,9 +63,7 @@ type dataPathWrapper struct {
 	sm      stats.Manager
 	limiter *limiter.Limiter
 	// ruleMgr provides audit detection
-	ruleMgr interface {
-		Detect(tag string, destination string, email string, srcIP string) bool
-	}
+	ruleMgr auditDetector
 	// tag identifies this node/inbound tag for limiter and rules
 	tag string
 	// obm allows us to look up the correct outbound handler by tag, so we can
@@ -137,59 +142,151 @@ func (w *dataPathWrapper) Dispatch(ctx context.Context, link *transport.Link) {
 
 	// --- Now we're in the correct wrapper (inTag matches w.tag) -------------
 	// Perform audit and rate limiting with the correct node tag.
-	if sess := session.InboundFromContext(ctx); sess != nil && sess.User != nil {
-		email := sess.User.Email
-		srcIP := sess.Source.Address.IP().String()
-		// Resolve destination from session
-		var destStr string
-		if outs := session.OutboundsFromContext(ctx); len(outs) > 0 {
-			ob := outs[len(outs)-1]
-			destStr = ob.Target.String()
-		}
-
-		// Use the wrapper's tag as node identifier; email is formatted as email|uid.
-		nodeTag := w.tag
-
-		// Audit check: reject immediately on hit
-		if w.ruleMgr != nil && email != "" && destStr != "" {
-			if w.ruleMgr.Detect(nodeTag, destStr, email, srcIP) {
-				// Log audit rule hit with destination and user info for all protocols.
-				log.WithFields(log.Fields{
-					"tag":   nodeTag,
-					"user":  email,
-					"srcIP": srcIP,
-					"dest":  destStr,
-				}).Warn("audit rule hit, closing connection")
-				// close link
-				common.Close(link.Writer)
-				common.Interrupt(link.Reader)
-				return
-			}
-		}
-
-		// Device limit and rate limit
-		if w.limiter != nil && email != "" {
-			if _, _, reject := w.limiter.GetUserBucket(nodeTag, email, srcIP); reject {
-				common.Close(link.Writer)
-				common.Interrupt(link.Reader)
-				return
-			}
-			link.Reader = w.limiter.RateReader(link.Reader, nodeTag, email)
-			if record := w.limiter.TrafficRecorder(nodeTag, email); record != nil {
-				link.Reader = &mydispatcher.SizeStatReader{Reader: link.Reader, Record: func(n int64) error { return record(n, 0) }}
-				link.Writer = &mydispatcher.SizeStatWriter{Writer: link.Writer, Record: func(n int64) error { return record(0, n) }}
-			}
-			// 存活连接周期复查在线名额，超限被挤出的 IP 会被强制断开；
-			// 上行（客户端数据）续期在线时间，下行只核查不续期
-			kickVersion := w.limiter.KickVersion(nodeTag, email)
-			link.Reader = w.limiter.GuardReader(link.Reader, nodeTag, email, srcIP, kickVersion)
-			link.Writer = w.limiter.GuardWriter(link.Writer, nodeTag, email, srcIP, kickVersion)
-			link.Writer = w.limiter.RateWriter(link.Writer, nodeTag, email)
-		}
+	if !guardDataPath(ctx, link, w.tag, w.limiter, w.ruleMgr) {
+		return
 	}
 
 	// Normal path: inbound tag matches this node's tag, dispatch to actual handler.
 	w.Handler.Dispatch(ctx, link)
+}
+
+// guardDataPath 返回 false 表示连接已被审计或名额拒绝，链路已关闭。
+func guardDataPath(ctx context.Context, link *transport.Link, nodeTag string, lim *limiter.Limiter, ruleMgr auditDetector) bool {
+	sess := session.InboundFromContext(ctx)
+	if sess == nil || sess.User == nil {
+		return true
+	}
+	email := sess.User.Email
+	srcIP := sess.Source.Address.IP().String()
+	// Resolve destination from session
+	var destStr string
+	var udp bool
+	if outs := session.OutboundsFromContext(ctx); len(outs) > 0 {
+		ob := outs[len(outs)-1]
+		destStr = ob.Target.String()
+		udp = ob.Target.Network == xnet.Network_UDP
+	}
+
+	// Audit check: reject immediately on hit
+	if ruleMgr != nil && email != "" && destStr != "" {
+		if ruleMgr.Detect(nodeTag, destStr, email, srcIP) {
+			// Log audit rule hit with destination and user info for all protocols.
+			log.WithFields(log.Fields{
+				"tag":   nodeTag,
+				"user":  email,
+				"srcIP": srcIP,
+				"dest":  destStr,
+			}).Warn("audit rule hit, closing connection")
+			// close link
+			common.Close(link.Writer)
+			common.Interrupt(link.Reader)
+			return false
+		}
+	}
+
+	// 全锥 UDP 的后续包带各自的目标（XUDP、Trojan、Shadowsocks 的逐包地址），上面只审计了首个目标
+	if udp && ruleMgr != nil && email != "" {
+		link.Reader = &udpAuditReader{Reader: link.Reader, blocked: func(dest string) bool { return ruleMgr.Detect(nodeTag, dest, email, srcIP) }}
+	}
+
+	// Device limit and rate limit
+	if lim != nil && email != "" {
+		if _, _, reject := lim.GetUserBucket(nodeTag, email, srcIP); reject {
+			common.Close(link.Writer)
+			common.Interrupt(link.Reader)
+			return false
+		}
+		link.Reader = lim.RateReader(link.Reader, nodeTag, email)
+		if record := lim.TrafficRecorder(nodeTag, email); record != nil {
+			link.Reader = &mydispatcher.SizeStatReader{Reader: link.Reader, Record: func(n int64) error { return record(n, 0) }}
+			link.Writer = &mydispatcher.SizeStatWriter{Writer: link.Writer, Record: func(n int64) error { return record(0, n) }}
+		}
+		// 存活连接周期复查在线名额，超限被挤出的 IP 会被强制断开；
+		// 上行（客户端数据）续期在线时间，下行只核查不续期
+		kickVersion := lim.KickVersion(nodeTag, email)
+		link.Reader = lim.GuardReader(link.Reader, nodeTag, email, srcIP, kickVersion)
+		link.Writer = lim.GuardWriter(link.Writer, nodeTag, email, srcIP, kickVersion)
+		link.Writer = lim.RateWriter(link.Writer, nodeTag, email)
+	}
+	return true
+}
+
+const maxAuditedTargets = 256
+
+// udpAuditReader 丢弃发往被审计规则命中目标的 UDP 包；放在计费与限速之内，丢弃的包不计流量。
+type udpAuditReader struct {
+	buf.Reader
+	blocked  func(dest string) bool
+	verdicts map[string]bool
+}
+
+func (r *udpAuditReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBuffer()
+	kept := mb[:0]
+	for _, b := range mb {
+		if b.UDP != nil && r.isBlocked(b.UDP.String()) {
+			b.Release()
+			continue
+		}
+		kept = append(kept, b)
+	}
+	return kept, err
+}
+
+func (r *udpAuditReader) isBlocked(dest string) bool {
+	if blocked, ok := r.verdicts[dest]; ok {
+		return blocked
+	}
+	blocked := r.blocked(dest)
+	if r.verdicts == nil || len(r.verdicts) >= maxAuditedTargets {
+		r.verdicts = make(map[string]bool)
+	}
+	r.verdicts[dest] = blocked
+	return blocked
+}
+
+// customOutboundWrapper 包装 custom_outbound.json 的出站：内核路由把 RouteConfigPath 的规则排在
+// 同节点规则之前，受管入站的连接可能直接落到这些出站，必须同样审计、占名额、限速与计费。
+type customOutboundWrapper struct {
+	outbound.Handler
+	limiter *limiter.Limiter
+	ruleMgr auditDetector
+}
+
+func (w *customOutboundWrapper) Dispatch(ctx context.Context, link *transport.Link) {
+	if sess := session.InboundFromContext(ctx); sess != nil && isECYCloudNodeManagedTag(sess.Tag) {
+		sess.CanSpliceCopy = 3
+		if !guardDataPath(ctx, link, sess.Tag, w.limiter, w.ruleMgr) {
+			return
+		}
+	}
+	w.Handler.Dispatch(ctx, link)
+}
+
+// AddCustomOutbounds 按配置顺序加入自定义出站，首个仍是内核默认出站。
+func AddCustomOutbounds(server *core.Instance, configs []*core.OutboundHandlerConfig) error {
+	obm, ok := server.GetFeature(outbound.ManagerType()).(outbound.Manager)
+	if !ok {
+		return fmt.Errorf("outbound manager not registered")
+	}
+	md, ok := server.GetFeature(mydispatcher.Type()).(*mydispatcher.DefaultDispatcher)
+	if !ok {
+		return fmt.Errorf("mydispatcher not registered")
+	}
+	for _, config := range configs {
+		rawHandler, err := core.CreateObject(server, config)
+		if err != nil {
+			return err
+		}
+		handler, ok := rawHandler.(outbound.Handler)
+		if !ok {
+			return fmt.Errorf("not an OutboundHandler: %s", config.Tag)
+		}
+		if err := obm.AddHandler(context.Background(), &customOutboundWrapper{Handler: handler, limiter: md.Limiter, ruleMgr: md.RuleManager}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Controller) removeOutbound(tag string) error {
@@ -256,23 +353,24 @@ func (c *Controller) addUsers(users []*protocol.User, tag string) error {
 		return fmt.Errorf("handler %s has not implemented proxy.UserManager", tag)
 	}
 	for _, item := range users {
-		mUser, err := item.ToMemoryUser()
-		if err != nil {
-			return err
+		// 上一轮可能只加上了一部分，已在的跳过，不能因「已存在」中止整批
+		if userManager.GetUser(context.Background(), item.Email) != nil {
+			continue
 		}
-		err = userManager.AddUser(context.Background(), mUser)
+		mUser, err := item.ToMemoryUser()
+		if err == nil {
+			err = userManager.AddUser(context.Background(), mUser)
+		}
 		if err != nil {
-			return err
+			// 单个用户凭据有误不能连累其余用户，也不能让重建停在装好 inbound 却没有限速器的状态；
+			// 面板改正凭据后用户标识随之变化，会作为新用户重新加入
+			c.logger.Errorf("Add user %s failed: %s", item.Email, err)
+			continue
 		}
 		// Pre-register per-user traffic counters so core can increment them (downlink/uplink)
-		uName := "user>>>" + mUser.Email + ">>>traffic>>>uplink"
-		dName := "user>>>" + mUser.Email + ">>>traffic>>>downlink"
-		if _, _ = c.stm.GetOrRegisterCounter(uName); true {
-			// no-op
-		}
-		if _, _ = c.stm.GetOrRegisterCounter(dName); true {
-			// no-op
-		}
+		uName, dName := trafficCounters(mUser.Email)
+		c.stm.GetOrRegisterCounter(uName)
+		c.stm.GetOrRegisterCounter(dName)
 	}
 	return nil
 }
@@ -291,18 +389,34 @@ func (c *Controller) removeUsers(users []string, tag string) error {
 	if !ok {
 		return fmt.Errorf("handler %s is not implement proxy.UserManager", err)
 	}
+	var removeErr error
 	for _, email := range users {
-		err = userManager.RemoveUser(context.Background(), email)
-		if err != nil {
-			return err
+		// 已不在的视为删除成功，重试时继续处理其余用户
+		if userManager.GetUser(context.Background(), email) != nil {
+			if err := userManager.RemoveUser(context.Background(), email); err != nil {
+				removeErr = errors.Join(removeErr, err)
+				continue
+			}
 		}
+		c.unregisterTraffic(email)
 	}
-	return nil
+	return removeErr
+}
+
+// trafficCounters 是 xray 按用户统计上下行的计数器名。
+func trafficCounters(email string) (string, string) {
+	return "user>>>" + email + ">>>traffic>>>uplink", "user>>>" + email + ">>>traffic>>>downlink"
+}
+
+// unregisterTraffic 注销已移除用户的计数器：统计表不会自行清理，用户每次增删或换凭据都会留下一对。
+func (c *Controller) unregisterTraffic(email string) {
+	uName, dName := trafficCounters(email)
+	c.stm.UnregisterCounter(uName)
+	c.stm.UnregisterCounter(dName)
 }
 
 func (c *Controller) getTraffic(email string) (up int64, down int64) {
-	upName := "user>>>" + email + ">>>traffic>>>uplink"
-	downName := "user>>>" + email + ">>>traffic>>>downlink"
+	upName, downName := trafficCounters(email)
 	if counter := c.stm.GetCounter(upName); counter != nil {
 		up = counter.Set(0)
 	}
@@ -318,6 +432,7 @@ func (c *Controller) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userLi
 		record = c.apiClient.RecordUserTraffic
 	}
 	err := c.dispatcher.Limiter.AddInboundLimiter(tag, nodeSpeedLimit, userList, globalDeviceLimitConfig, record)
+	limiter.SetReclaimConsumer(tag, limiter.PanelReclaim(c.apiClient))
 	return err
 }
 
@@ -328,6 +443,7 @@ func (c *Controller) UpdateInboundLimiter(tag string, updatedUserList *[]api.Use
 
 func (c *Controller) DeleteInboundLimiter(tag string) error {
 	err := c.dispatcher.Limiter.DeleteInboundLimiter(tag)
+	limiter.SetReclaimConsumer(tag, nil)
 	return err
 }
 

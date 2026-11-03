@@ -6,8 +6,36 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
+
+// DNSEnv 可能由面板下发并写进以 root 运行的节点进程：只放行服务商凭据形式的变量名，
+// 不允许改写动态加载、shell、代理、证书信任、Go 运行时与 xray 路径（如 BASH_FUNC_*、LD_PRELOAD、XRAY_LOCATION_CONFIG）。
+var dnsEnvName = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+
+var reservedEnvNames = []string{
+	"PATH", "HOME", "SHELL", "IFS", "ENV", "BASH_ENV", "BASHOPTS", "SHELLOPTS", "PS4", "PROMPT_COMMAND", "TMPDIR", "LANG",
+	"GODEBUG", "GOGC", "GOMAXPROCS", "GOMEMLIMIT", "GOTRACEBACK",
+	"SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+}
+
+var reservedEnvPrefixes = []string{"LD_", "DYLD_", "BASH_", "LC_", "XRAY_"}
+
+func dnsProviderEnv(name string) bool {
+	if !dnsEnvName.MatchString(name) || slices.Contains(reservedEnvNames, name) {
+		return false
+	}
+	for _, prefix := range reservedEnvPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return false
+		}
+	}
+	return true
+}
 
 func New(certConf *CertConfig) (*LegoCMD, error) {
 	// Set default path to configPath/cert
@@ -57,7 +85,12 @@ func (l *LegoCMD) DNSCert() (CertPath string, KeyPath string, err error) {
 
 	// Set Env for DNS configuration
 	for key, value := range l.C.DNSEnv {
-		os.Setenv(strings.ToUpper(key), value)
+		name := strings.ToUpper(key)
+		if !dnsProviderEnv(name) {
+			log.Warnf("Ignoring DNSEnv %q: not a DNS provider credential name", key)
+			continue
+		}
+		os.Setenv(name, value)
 	}
 
 	// First check if the certificate exists

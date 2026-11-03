@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -8,28 +10,18 @@ import (
 )
 
 const (
-	UserNotModified = "users not modified"
-	NodeNotModified = "node not modified"
-	RuleNotModified = "rules not modified"
-
 	// MaxConsecutiveFailures 是触发服务自动重启的连续 API 失败阈值。
 	// 当 monitor 连续检测到 API 通讯失败达到此次数后，服务会自动执行
 	// Close + Start 重启循环，以便在面板更新白名单后自动恢复通讯。
 	MaxConsecutiveFailures = 3
 )
 
-// IsAPIFailure 判断 API 调用返回的错误是否代表与面板的通讯失败
-// （区别于 "数据未变更" 等正常逻辑错误）。
+// IsAPIFailure 判断 API 调用返回的错误是否代表与面板的通讯失败。
 func IsAPIFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	switch msg {
-	case UserNotModified, NodeNotModified, RuleNotModified:
-		return false
-	}
-	lower := strings.ToLower(msg)
+	lower := strings.ToLower(err.Error())
 	if strings.Contains(lower, "ret") && strings.Contains(lower, "invalid") {
 		return true
 	}
@@ -102,9 +94,25 @@ type NodeInfo struct {
 // that ECYCloudNode can load from the panel (e.g. Cloudflare DNS provider
 // and its environment variables for lego/ACME).
 type ECYCloudNodeCertConfig struct {
-	Provider string            `json:"provider"`
-	Email    string            `json:"email"`
-	DNSEnv   map[string]string `json:"dns_env"`
+	Provider string `json:"provider"`
+	Email    string `json:"email"`
+	DNSEnv   DNSEnv `json:"dns_env"`
+}
+
+// DNSEnv 面板没有配置 DNS 变量时 PHP 把空数组输出成 []，按空表接收，否则整份证书配置都会被丢弃
+type DNSEnv map[string]string
+
+func (e *DNSEnv) UnmarshalJSON(data []byte) error {
+	if strings.TrimSpace(string(data)) == "[]" {
+		*e = nil
+		return nil
+	}
+	var values map[string]string
+	if err := json.Unmarshal(data, &values); err != nil {
+		return err
+	}
+	*e = values
+	return nil
 }
 
 // GlobalLimitConfig describes the panel-managed Redis connection info
@@ -112,6 +120,8 @@ type ECYCloudNodeCertConfig struct {
 type GlobalLimitConfig struct {
 	SiteIP        string `json:"site_ip"`
 	RedisPassword string `json:"redis_password"`
+	RedisTLS      bool   `json:"redis_tls"`
+	RedisCA       string `json:"redis_ca"` // PEM; empty: system roots
 }
 
 // WebAPIConfig is the panel-managed API host (设置中心「订阅域名」subUrl).
@@ -161,14 +171,17 @@ type UserInfo struct {
 	DeviceLimit     int
 }
 
+// Key 带凭据摘要：面板重置 UUID / 密码后键随之改变，旧凭据建立的连接与 mux 子流
+// 在限速器里查不到授权而被断开；UID 必须留在最后一段，审计按它解析用户。
 func (u UserInfo) Key(tag string) string {
 	if u.TrafficIdentity != "" {
 		tag += "|" + u.TrafficIdentity
 	}
 	if u.ClientID != 0 {
-		return fmt.Sprintf("%s|client-%d|%d", tag, u.ClientID, u.UID)
+		tag += fmt.Sprintf("|client-%d", u.ClientID)
 	}
-	return fmt.Sprintf("%s|%d", tag, u.UID)
+	digest := sha256.Sum256([]byte(u.UUID + "\x00" + u.Passwd + "\x00" + u.Method))
+	return fmt.Sprintf("%s|%s|%d", tag, hex.EncodeToString(digest[:8]), u.UID)
 }
 
 type OnlineUser struct {
