@@ -364,7 +364,9 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		c.consecutiveFailures = 0
 	}
 	if newNodeInfo.Port == 0 {
-		return errors.New("server port must > 0")
+		// 返回错误会让 Periodic 永久停止，记错误并保留当前 inbound，等面板改正
+		c.logger.Error("server port must > 0, keep the current inbound")
+		return nil
 	}
 
 	// Update User
@@ -428,21 +430,24 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	}
 
 	// Check Rule
+	// 推迟到加用户与限速器之后（与 Start 一致），不让网络请求拉长重建的断流窗口；用户同步失败提前返回时也照常刷新
 	if !c.config.DisableGetRule {
-		if ruleList, err := c.apiClient.GetNodeRule(); err != nil {
-			c.logger.Printf("Get rule list filed: %s", err)
-		} else {
-			// 面板删光规则时返回空列表，也要落地，否则旧规则会一直拦到节点重启
-			if err := c.UpdateRule(c.Tag, *ruleList); err != nil {
-				c.logger.Print(err)
+		defer func() {
+			if ruleList, err := c.apiClient.GetNodeRule(); err != nil {
+				c.logger.Printf("Get rule list filed: %s", err)
+			} else {
+				// 面板删光规则时返回空列表，也要落地，否则旧规则会一直拦到节点重启
+				if err := c.UpdateRule(c.Tag, *ruleList); err != nil {
+					c.logger.Print(err)
+				}
 			}
-		}
-		// Update exempt users
-		if exemptUsers, err := c.apiClient.GetExemptUsers(); err != nil {
-			c.logger.Printf("Get exempt users failed: %s", err)
-		} else {
-			c.dispatcher.RuleManager.UpdateExemptUsers(c.Tag, exemptUsers)
-		}
+			// Update exempt users
+			if exemptUsers, err := c.apiClient.GetExemptUsers(); err != nil {
+				c.logger.Printf("Get exempt users failed: %s", err)
+			} else {
+				c.dispatcher.RuleManager.UpdateExemptUsers(c.Tag, exemptUsers)
+			}
+		}()
 	}
 
 	if nodeInfoChanged {

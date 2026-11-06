@@ -10,7 +10,7 @@ type NodeInfoResponse struct {
 }
 
 type CustomConfig struct {
-	OffsetPortNode        string         `json:"offset_port_node"`
+	OffsetPortNode        looseString    `json:"offset_port_node"`
 	Host                  string         `json:"host"`
 	Method                string         `json:"method"`
 	ServerKey             string         `json:"server_key"`
@@ -22,15 +22,15 @@ type CustomConfig struct {
 	Seed                  string         `json:"seed"`
 	Servicename           string         `json:"servicename"`
 	Flow                  string         `json:"flow"`
-	EnableREALITY         bool           `json:"enable_reality"`
+	EnableREALITY         looseBool      `json:"enable_reality"`
 	RealityOpts           *REALITYConfig `json:"reality-opts"`
 	ObfsPassword          string         `json:"obfs_password"`
-	UpMbps                string         `json:"up_mbps"`
-	DownMbps              string         `json:"down_mbps"`
+	UpMbps                looseString    `json:"up_mbps"`
+	DownMbps              looseString    `json:"down_mbps"`
 	ServerName            string         `json:"server_name"`
 	Sni                   string         `json:"sni"`
-	Alpn                  []string       `json:"alpn"`
-	IgnoreClientBandwidth bool           `json:"ignore_client_bandwidth"`
+	Alpn                  looseList      `json:"alpn"`
+	IgnoreClientBandwidth looseBool      `json:"ignore_client_bandwidth"`
 	PaddingScheme         []string       `json:"padding_scheme"`
 	// Hysteria2 port hopping specific fields. We keep them as RawMessage so
 	// that the panel can store booleans, numbers or strings without breaking
@@ -39,16 +39,52 @@ type CustomConfig struct {
 	PortHopEnableRaw json.RawMessage `json:"port_hop_enable"`
 	PortHopPortsRaw  json.RawMessage `json:"port_hop_ports"`
 	// TUIC specific fields
-	CongestionControl string `json:"congestion_control"`
-	UDPRelayMode      string `json:"udp_relay_mode"`
-	ZeroRTTHandshake  string `json:"zero_rtt_handshake"` // "0" or "1" from SSPanel
-	Heartbeat         string `json:"heartbeat"`
+	CongestionControl string      `json:"congestion_control"`
+	UDPRelayMode      string      `json:"udp_relay_mode"`
+	ZeroRTTHandshake  looseString `json:"zero_rtt_handshake"` // "0" or "1" from SSPanel
+	Heartbeat         looseString `json:"heartbeat"`
 
-	EnableProxyProtocol bool `json:"enable_proxy_protocol"`
+	EnableProxyProtocol looseBool `json:"enable_proxy_protocol"`
 	// 请求带有其中任一请求头时才采信 X-Forwarded-For（套 CDN / 反代时由面板配置）
 	TrustedXForwardedFor []string `json:"trusted_x_forwarded_for"`
 	// VLESS Encryption 加密配置
 	Decryption string `json:"decryption"`
+}
+
+// 面板可能把下列字段存成数字、布尔或字符串，按宽松口径解析，避免整份 custom_config 解析失败。
+type looseString string
+
+func (v *looseString) UnmarshalJSON(raw []byte) error {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		*v = looseString(s)
+	} else if string(raw) != "null" {
+		*v = looseString(raw)
+	}
+	return nil
+}
+
+type looseBool bool
+
+func (v *looseBool) UnmarshalJSON(raw []byte) error {
+	*v = looseBool(parseBoolLooseJSON(raw))
+	return nil
+}
+
+// looseList 兼容字符串数组与逗号分隔的字符串
+type looseList []string
+
+func (v *looseList) UnmarshalJSON(raw []byte) error {
+	var list []string
+	if err := json.Unmarshal(raw, &list); err == nil {
+		*v = list
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		*v = splitPortsExprString(s)
+	}
+	return nil
 }
 
 // UserResponse is the response of user

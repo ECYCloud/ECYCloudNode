@@ -218,7 +218,7 @@ func (c *APIClient) trafficProgress() (string, error) {
 		SetResult(&Response{}).ForceContentType("application/json").Get(path)
 	response, err := c.parseResponse(res, path, requestErr)
 	if err != nil {
-		return "", fmt.Errorf("cannot read panel traffic progress; local traffic retained")
+		return "", fmt.Errorf("cannot read panel traffic progress; local traffic retained: %w", err)
 	}
 	var progress struct {
 		ID      *string `json:"report_id"`
@@ -242,9 +242,9 @@ func (c *APIClient) sendTrafficReport(report *traffic.Report) (string, error) {
 	response, err := c.parseResponse(res, path, requestErr)
 	if err != nil {
 		if res != nil && res.StatusCode() > 0 {
-			return "", fmt.Errorf("traffic report was not confirmed (HTTP %d)", res.StatusCode())
+			return "", fmt.Errorf("traffic report was not confirmed (HTTP %d): %w", res.StatusCode(), err)
 		}
-		return "", fmt.Errorf("traffic report request failed; pending report retained")
+		return "", fmt.Errorf("traffic report request failed; pending report retained: %w", err)
 	}
 	var confirmation struct {
 		ID      string `json:"report_id"`

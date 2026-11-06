@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/apernet/hysteria/core/v2/server"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
@@ -66,20 +67,11 @@ func (l *hyEventLogger) auditRequest(id, reqAddr string) bool {
 
 	userKey := fmt.Sprintf("%d", user.UID)
 	if l.svc.rules.Detect(l.svc.tag, reqAddr, userKey, host) {
-		// Mark this connection ID as blocked. The TrafficLogger will see this
-		// flag and return false on the next traffic callback, which instructs
-		// the Hysteria2 core to disconnect the client immediately.
-		if l.svc.blockedIDs != nil {
-			l.svc.mu.Lock()
-			l.svc.blockedIDs[id] = true
-			l.svc.mu.Unlock()
-		}
-
 		l.logger().WithFields(log.Fields{
 			"remote":  host,
 			"reqAddr": reqAddr,
 			"uid":     user.UID,
-		}).Warn("Hysteria2 audit rule hit, scheduling disconnect")
+		}).Warn("Hysteria2 audit rule hit, rejecting request")
 		return true
 	}
 	return false
@@ -155,7 +147,9 @@ func (l *hyEventLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 			remote, reqAddr, nodeTag)
 	}
 
-	l.auditRequest(id, reqAddr)
+	if l.auditRequest(id, reqAddr) {
+		l.svc.rejectStreams(id, reqAddr)
+	}
 }
 
 func (l *hyEventLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
@@ -207,7 +201,12 @@ func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, r
 			remote, reqAddr, nodeTag)
 	}
 
-	l.auditRequest(id, reqAddr)
+	// 无豁免的规则由出站拒绝这个会话；有豁免的规则出站拿不到身份无法区分，只能断开整条连接
+	if l.auditRequest(id, reqAddr) && !l.svc.rules.DetectUnexempted(l.svc.tag, reqAddr) {
+		l.svc.mu.Lock()
+		l.svc.blockedIDs[id] = true
+		l.svc.mu.Unlock()
+	}
 
 	if l != nil && l.svc != nil && l.svc.trackUDPSession(id, sessionID) {
 		udpSessionLimitLog.Do(func() {
@@ -218,6 +217,16 @@ func (l *hyEventLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, r
 			}).Warn("Hysteria2 connection exceeded the UDP session limit, disconnecting")
 		})
 	}
+}
+
+// rejectStreams 让该连接发往被拦目标的流读写立即超时：内核随后结束这条流，连接与其它流不受影响。
+func (h *Hysteria2Service) rejectStreams(id, reqAddr string) {
+	h.streams.Range(func(stream, value any) bool {
+		if stats := value.(*server.StreamStats); stats.AuthID == id && (stats.ReqAddr.Load() == reqAddr || stats.HookedReqAddr.Load() == reqAddr) {
+			_ = stream.(server.HyStream).SetDeadline(time.Now())
+		}
+		return true
+	})
 }
 
 // trackUDPSession 登记连接新开的 UDP 会话；超出上限时标记断连，由 LogTraffic 在下一个流量事件

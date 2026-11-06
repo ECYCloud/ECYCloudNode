@@ -2,6 +2,7 @@ package panel
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -147,7 +148,7 @@ func parseNodeIDExpr(expr string) []int {
 	return ids
 }
 
-func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
+func (p *Panel) loadCore(panelConfig *Config) (*core.Instance, error) {
 	// Log Config
 	coreLogConfig := &conf.LogConfig{}
 	logConfig := getDefaultLogConfig()
@@ -161,14 +162,16 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 	coreLogConfig.ErrorLog = logConfig.ErrorPath
 
 	// DNS config
+	// DNS 文件读不到或格式错时退回默认 DNS，可选配置出错不能让节点起不来
 	coreDnsConfig := &conf.DNSConfig{}
 	if panelConfig.DnsConfigPath != "" {
-		if data, err := os.ReadFile(panelConfig.DnsConfigPath); err != nil {
-			log.Panicf("Failed to read DNS config file at: %s", panelConfig.DnsConfigPath)
-		} else {
-			if err = json.Unmarshal(data, coreDnsConfig); err != nil {
-				log.Panicf("Failed to unmarshal DNS config: %s", panelConfig.DnsConfigPath)
-			}
+		data, err := os.ReadFile(panelConfig.DnsConfigPath)
+		if err == nil {
+			err = json.Unmarshal(data, coreDnsConfig)
+		}
+		if err != nil {
+			log.Errorf("Failed to load DNS config %s, using the default DNS: %s", panelConfig.DnsConfigPath, err)
+			coreDnsConfig = &conf.DNSConfig{}
 		}
 	}
 
@@ -179,32 +182,33 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 
 	dnsConfig, err := coreDnsConfig.Build()
 	if err != nil {
-		log.Panicf("Failed to understand DNS config, Please check: https://xtls.github.io/config/dns.html for help: %s", err)
+		log.Errorf("Failed to understand DNS config, using the default DNS. Please check: https://xtls.github.io/config/dns.html for help: %s", err)
+		dnsConfig, _ = (&conf.DNSConfig{}).Build()
 	}
 
 	// Routing config
 	coreRouterConfig := &conf.RouterConfig{}
 	if panelConfig.RouteConfigPath != "" {
 		if data, err := os.ReadFile(panelConfig.RouteConfigPath); err != nil {
-			log.Panicf("Failed to read Routing config file at: %s", panelConfig.RouteConfigPath)
+			return nil, fmt.Errorf("failed to read Routing config file at: %s", panelConfig.RouteConfigPath)
 		} else {
 			if err = json.Unmarshal(data, coreRouterConfig); err != nil {
-				log.Panicf("Failed to unmarshal Routing config: %s", panelConfig.RouteConfigPath)
+				return nil, fmt.Errorf("failed to unmarshal Routing config: %s", panelConfig.RouteConfigPath)
 			}
 		}
 	}
 	routeConfig, err := coreRouterConfig.Build()
 	if err != nil {
-		log.Panicf("Failed to understand Routing config  Please check: https://xtls.github.io/config/routing.html for help: %s", err)
+		return nil, fmt.Errorf("failed to understand Routing config  Please check: https://xtls.github.io/config/routing.html for help: %s", err)
 	}
 	// Custom Inbound config
 	var coreCustomInboundConfig []conf.InboundDetourConfig
 	if panelConfig.InboundConfigPath != "" {
 		if data, err := os.ReadFile(panelConfig.InboundConfigPath); err != nil {
-			log.Panicf("Failed to read Custom Inbound config file at: %s", panelConfig.OutboundConfigPath)
+			return nil, fmt.Errorf("failed to read Custom Inbound config file at: %s", panelConfig.InboundConfigPath)
 		} else {
 			if err = json.Unmarshal(data, &coreCustomInboundConfig); err != nil {
-				log.Panicf("Failed to unmarshal Custom Inbound config: %s", panelConfig.OutboundConfigPath)
+				return nil, fmt.Errorf("failed to unmarshal Custom Inbound config: %s", panelConfig.InboundConfigPath)
 			}
 		}
 	}
@@ -212,7 +216,7 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 	for _, config := range coreCustomInboundConfig {
 		oc, err := config.Build()
 		if err != nil {
-			log.Panicf("Failed to understand Inbound config, Please check: https://xtls.github.io/config/inbound.html for help: %s", err)
+			return nil, fmt.Errorf("failed to understand Inbound config, Please check: https://xtls.github.io/config/inbound.html for help: %s", err)
 		}
 		inBoundConfig = append(inBoundConfig, oc)
 	}
@@ -220,10 +224,10 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 	var coreCustomOutboundConfig []conf.OutboundDetourConfig
 	if panelConfig.OutboundConfigPath != "" {
 		if data, err := os.ReadFile(panelConfig.OutboundConfigPath); err != nil {
-			log.Panicf("Failed to read Custom Outbound config file at: %s", panelConfig.OutboundConfigPath)
+			return nil, fmt.Errorf("failed to read Custom Outbound config file at: %s", panelConfig.OutboundConfigPath)
 		} else {
 			if err = json.Unmarshal(data, &coreCustomOutboundConfig); err != nil {
-				log.Panicf("Failed to unmarshal Custom Outbound config: %s", panelConfig.OutboundConfigPath)
+				return nil, fmt.Errorf("failed to unmarshal Custom Outbound config: %s", panelConfig.OutboundConfigPath)
 			}
 		}
 	}
@@ -231,7 +235,7 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 	for _, config := range coreCustomOutboundConfig {
 		oc, err := config.Build()
 		if err != nil {
-			log.Panicf("Failed to understand Outbound config, Please check: https://xtls.github.io/config/outbound.html for help: %s", err)
+			return nil, fmt.Errorf("failed to understand Outbound config, Please check: https://xtls.github.io/config/outbound.html for help: %s", err)
 		}
 		outBoundConfig = append(outBoundConfig, oc)
 	}
@@ -262,13 +266,23 @@ func (p *Panel) loadCore(panelConfig *Config) *core.Instance {
 	}
 	server, err := core.New(config)
 	if err != nil {
-		log.Panicf("failed to create instance: %s", err)
+		return nil, fmt.Errorf("failed to create instance: %s", err)
 	}
 	if err := controller.AddCustomOutbounds(server, outBoundConfig); err != nil {
-		log.Panicf("Failed to add custom outbound: %s", err)
+		server.Close()
+		return nil, fmt.Errorf("failed to add custom outbound: %s", err)
 	}
 
-	return server
+	return server, nil
+}
+
+// CheckConfig 用新配置试建一次内核（不启动、不监听），热重载据此决定是否替换正在运行的实例。
+func CheckConfig(panelConfig *Config) error {
+	server, err := (&Panel{}).loadCore(panelConfig)
+	if err != nil {
+		return err
+	}
+	return server.Close()
 }
 
 // Start the panel
@@ -313,7 +327,10 @@ func (p *Panel) Start() {
 	log.Printf("[UnlockCheck] Pre-registered all %d node IDs for shared detection", registered)
 
 	// Load Core
-	server := p.loadCore(p.panelConfig)
+	server, err := p.loadCore(p.panelConfig)
+	if err != nil {
+		log.Panic(err)
+	}
 	if err := server.Start(); err != nil {
 		log.Panicf("Failed to start instance: %s", err)
 	}
@@ -400,8 +417,7 @@ func (p *Panel) newNodeService(server *core.Instance, nodeConfig *NodesConfig) s
 			if err := sspanel.CheckAPIHost(oldHost, newHost); err != nil {
 				log.Warnf("Ignoring panel-provided ApiHost %q for node %d: %v", newHost, apiClient.NodeID, err)
 			} else if err := apiClient.UpdateAPIHost(newHost); err != nil {
-				log.Errorf("Cannot retain traffic state for node %d after panel address change: %v", apiClient.NodeID, err)
-				return nil
+				log.Warnf("Cannot retain traffic state for node %d after panel address change, keep using ApiHost %q: %v", apiClient.NodeID, oldHost, err)
 			} else {
 				log.Infof("ApiHost updated from panel: %s -> %s", oldHost, newHost)
 				nodeConfig.ApiConfig.APIHost = newHost
@@ -424,16 +440,15 @@ func (p *Panel) newNodeService(server *core.Instance, nodeConfig *NodesConfig) s
 	controllerConfig.CertConfig = nil
 
 	var svc service.Service
-	var nodeInfo *api.NodeInfo
 
 	// If the panel exposes global ECYCloudNode cert settings, merge Provider/Email/
 	// DNSEnv into the controller's CertConfig. When CertConfig is missing
 	// from config.yml (which is common now that certificate settings are
 	// managed from the panel), allocate a minimal struct on demand and
 	// default CertMode to "dns" so that TLS nodes work out-of-the-box.
-	panelCert, err := apiClient.GetECYCloudNodeCertConfig()
-	if err != nil {
-		log.Warnf("Failed to get ECYCloudNode cert config from panel: %v", err)
+	panelCert, certErr := apiClient.GetECYCloudNodeCertConfig()
+	if certErr != nil {
+		log.Warnf("Failed to get ECYCloudNode cert config from panel: %v", certErr)
 	} else if panelCert != nil {
 		if controllerConfig.CertConfig == nil {
 			controllerConfig.CertConfig = &mylego.CertConfig{}
@@ -466,7 +481,9 @@ func (p *Panel) newNodeService(server *core.Instance, nodeConfig *NodesConfig) s
 	if glc := controllerConfig.GlobalDeviceLimitConfig; glc != nil && glc.Enable && (glc.RedisAddr == "" || glc.RedisPassword == "") {
 		panelGlobal, err := apiClient.GetGlobalLimitConfig()
 		if err != nil {
-			log.Warnf("Failed to get global limit config from panel: %v", err)
+			// 启动后不再重拉，交给 retryNodes 稍后整节点重试，避免整个生命周期缺少 Redis 配置
+			log.Errorf("Failed to get global limit config from panel, retry this node later: %v", err)
+			return nil
 		} else if panelGlobal != nil {
 			applyPanelRedis(glc, panelGlobal)
 		}
@@ -475,7 +492,7 @@ func (p *Panel) newNodeService(server *core.Instance, nodeConfig *NodesConfig) s
 		}
 	}
 
-	nodeInfo, err = apiClient.GetNodeInfo()
+	nodeInfo, err := apiClient.GetNodeInfo()
 	if err != nil {
 		// 对于单个节点的拉取失败，不再直接 panic 终止整个进程，而是
 		// 打印错误并跳过该节点，保证其它已正确配置的节点仍然可以正常
@@ -496,6 +513,12 @@ func (p *Panel) newNodeService(server *core.Instance, nodeConfig *NodesConfig) s
 			}(),
 			err,
 		)
+		return nil
+	}
+
+	// 证书配置启动后不再重拉，TLS 节点缺它时交给 retryNodes 稍后整节点重试
+	if certErr != nil && nodeInfo.EnableTLS && !nodeInfo.EnableREALITY {
+		log.Errorf("ECYCloudNode cert config unavailable for TLS node %d, retry this node later", apiClient.NodeID)
 		return nil
 	}
 

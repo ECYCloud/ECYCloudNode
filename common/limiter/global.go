@@ -30,7 +30,7 @@ type GlobalDeviceChecker struct {
 	users         map[string]map[int]api.UserInfo
 	pending       map[string][]api.UserInfo
 	dirty         atomic.Bool
-	unavailable   atomic.Bool
+	unavailable   atomic.Int64 // 最近一次访问 Redis 失败的时间（UnixNano），0 表示可用
 	policyVersion atomic.Uint64
 	verified      sync.Map
 	clockOffset   atomic.Int64
@@ -391,11 +391,24 @@ func NewGlobalDeviceChecker(config *GlobalDeviceLimitConfig) *GlobalDeviceChecke
 // Enforcing 为 false 时（未启用，或最近一次访问 Redis 失败）由各节点本地账本按原上限判定，
 // Redis 故障不能让名额限制整体失效。
 func (g *GlobalDeviceChecker) Enforcing() bool {
-	return g != nil && !g.unavailable.Load()
+	return g != nil && g.unavailable.Load() == 0
 }
 
 func (g *GlobalDeviceChecker) noteResult(err error) {
-	g.unavailable.Store(err != nil && err != redis.Nil)
+	if err != nil && err != redis.Nil {
+		g.unavailable.Store(time.Now().UnixNano())
+	} else {
+		g.unavailable.Store(0)
+	}
+}
+
+// redisRetryInterval 是 Redis 失败后的熔断时长：期间检查直接按出错放行、走本地账本，
+// 不再每次等满超时；过后由下一次检查重试。
+const redisRetryInterval = 10 * time.Second
+
+func (g *GlobalDeviceChecker) coolingDown() bool {
+	failedAt := g.unavailable.Load()
+	return failedAt != 0 && time.Since(time.Unix(0, failedAt)) < redisRetryInterval
 }
 
 // Allow 判定 uid 的 slot 是否允许在线（全局口径）。
@@ -565,6 +578,9 @@ func (g *GlobalDeviceChecker) SyncUsers(users *[]api.UserInfo, scope ...string) 
 }
 
 func (g *GlobalDeviceChecker) syncPending() bool {
+	if g.coolingDown() {
+		return false
+	}
 	if !g.dirty.Load() {
 		return true
 	}

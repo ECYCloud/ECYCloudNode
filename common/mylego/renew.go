@@ -7,21 +7,11 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/go-acme/lego/v5/certcrypto"
-	"github.com/go-acme/lego/v5/lego"
 )
 
 func (l *LegoCMD) Renew() (bool, error) {
-	account, client := setup(NewAccountsStorage(l))
-	setupChallenges(l, client)
-
-	if account.Registration == nil {
-		log.Panicf("Account %s is not registered. Use 'run' to register a new account.\n", account.Email)
-	}
-
-	return renewForDomains(l.C.CertDomain, client, NewCertificatesStorage(l.path))
-}
-
-func renewForDomains(domain string, client *lego.Client, certsStorage *CertificatesStorage) (bool, error) {
+	domain := l.C.CertDomain
+	certsStorage := NewCertificatesStorage(l.path)
 	// load the cert resource from files.
 	// We store the certificate, private key and metadata in different files
 	// as web servers would not be able to work with a combined file.
@@ -32,8 +22,16 @@ func renewForDomains(domain string, client *lego.Client, certsStorage *Certifica
 
 	cert := certificates[0]
 
+	// 先判断是否到期再建 ACME 客户端：不需要续期时不访问 CA，也不要求 DNS 服务商配置齐全
 	if !needRenewal(cert, domain, 30) {
 		return false, nil
+	}
+
+	account, client := setup(NewAccountsStorage(l))
+	setupChallenges(l, client)
+
+	if account.Registration == nil {
+		log.Panicf("Account %s is not registered. Use 'run' to register a new account.\n", account.Email)
 	}
 
 	// This is just meant to be informal for the user.

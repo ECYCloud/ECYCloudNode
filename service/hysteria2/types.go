@@ -42,7 +42,7 @@ type Hysteria2Service struct {
 	slotLastActive map[string]map[string]time.Time // uuid -> slot -> last active time
 	blockedIDs     map[string]bool                 // connection id -> blocked by audit
 	udpSessions    map[string]map[uint32]struct{}  // connection id -> open UDP session ids
-	streams        sync.Map                        // server.HyStream -> connection id, for the sniff hook
+	streams        sync.Map                        // server.HyStream -> *server.StreamStats, for the sniff hook and audit
 	rateLimiters   map[string]*rate.Limiter        // uuid -> per-user speed limiter
 	// rebuildPending 记录「server 尚未按 nodeInfo 装好」。面板随后会返回 304，
 	// 届时既没有新配置可比，DeepEqual 也判不出重建没走完。

@@ -131,6 +131,12 @@ func run() error {
 			return
 		}
 
+		// 先用新配置试建内核：DNS / 路由 / 入站 / 出站文件有误时保留旧实例，不能先关掉再起不来
+		if err := panel.CheckConfig(newPanelConfig); err != nil {
+			log.Errorf("Hot reload: new config file %s cannot be loaded: %v; keeping existing configuration", e.Name, err)
+			return
+		}
+
 		// 到这里说明新配置已经成功解析，且包含有效的节点；再关闭旧实例并切换。
 		panelMu.Lock()
 		defer panelMu.Unlock()

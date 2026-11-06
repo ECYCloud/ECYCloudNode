@@ -30,7 +30,7 @@ func (h *sniffHook) TCP(stream server.HyStream, reqAddr *string) ([]byte, error)
 	if !ok {
 		return nil, errUntracedStream
 	}
-	id := value.(string)
+	id := value.(*server.StreamStats).AuthID
 	if (&hyEventLogger{svc: h.svc}).auditRequest(id, *reqAddr) {
 		return nil, errAuditBlocked
 	}

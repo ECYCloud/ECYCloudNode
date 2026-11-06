@@ -20,9 +20,6 @@ LimitCORE=0
 NoNewPrivileges=yes
 LimitNOFILE=999999
 WorkingDirectory=/usr/local/ECYCloudNode/
-# 启动前等待 DNS 解析可用（检测外部网络连通性）
-# 尝试解析 google.com，最多等待 30 秒
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do nslookup google.com >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
 ExecStart=/usr/local/ECYCloudNode/ECYCloudNode --config /etc/ECYCloudNode/config.yml
 # 设置合理的超时时间
 TimeoutStartSec=60

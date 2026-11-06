@@ -90,7 +90,7 @@ func (t *hyTrafficLogger) LogOnlineState(id string, online bool) {
 }
 
 func (t *hyTrafficLogger) TraceStream(stream server.HyStream, stats *server.StreamStats) {
-	t.svc.streams.Store(stream, stats.AuthID)
+	t.svc.streams.Store(stream, stats)
 }
 
 func (t *hyTrafficLogger) UntraceStream(stream server.HyStream) {

@@ -43,7 +43,11 @@ func (publicOutbound) TCP(reqAddr string) (net.Conn, error) {
 	return nil, err
 }
 
-func (publicOutbound) UDP(string) (server.UDPConn, error) {
+// UDP 拒绝首个目标即命中无豁免规则的会话，只关这一个会话。
+func (o publicOutbound) UDP(reqAddr string) (server.UDPConn, error) {
+	if err := o.CheckUDP(reqAddr); err != nil {
+		return nil, err
+	}
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return nil, err

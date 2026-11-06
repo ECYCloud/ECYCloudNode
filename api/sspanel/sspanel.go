@@ -193,18 +193,17 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 	if path != "" {
 		// open the file
 		file, err := os.Open(path)
-
+		// handle errors while opening
+		if err != nil {
+			log.Printf("Error when opening file: %s", err)
+			return LocalRuleList
+		}
 		defer func(file *os.File) {
 			err := file.Close()
 			if err != nil {
 				log.Printf("Error when closing file: %s", err)
 			}
 		}(file)
-		// handle errors while opening
-		if err != nil {
-			log.Printf("Error when opening file: %s", err)
-			return LocalRuleList
-		}
 
 		fileScanner := bufio.NewScanner(file)
 
@@ -227,8 +226,7 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 		}
 		// handle first encountered error while reading
 		if err := fileScanner.Err(); err != nil {
-			log.Fatalf("Error while reading file: %s", err)
-			return
+			log.Errorf("Error while reading file: %s", err)
 		}
 	}
 
@@ -801,7 +799,7 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		speedLimit = uint64((nodeInfoResponse.SpeedLimit * 1000000) / 8)
 	}
 
-	parsedPort, err := strconv.ParseInt(nodeConfig.OffsetPortNode, 10, 32)
+	parsedPort, err := strconv.ParseInt(string(nodeConfig.OffsetPortNode), 10, 32)
 	if err != nil {
 		return nil, err
 	}
@@ -927,9 +925,9 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		ServiceName:          nodeConfig.Servicename,
 		Header:               header,
 		Seed:                 nodeConfig.Seed,
-		EnableREALITY:        nodeConfig.EnableREALITY,
+		EnableREALITY:        bool(nodeConfig.EnableREALITY),
 		REALITYConfig:        realityConfig,
-		AcceptProxyProtocol:  nodeConfig.EnableProxyProtocol,
+		AcceptProxyProtocol:  bool(nodeConfig.EnableProxyProtocol),
 		TrustedXForwardedFor: nodeConfig.TrustedXForwardedFor,
 	}
 
@@ -939,13 +937,13 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		// 未配置或配置为非正数时，视为不限速（0 表示不在服务器侧强制带宽上限）
 		up := 0
 		if nodeConfig.UpMbps != "" {
-			if v, err := strconv.Atoi(nodeConfig.UpMbps); err == nil && v > 0 {
+			if v, err := strconv.Atoi(string(nodeConfig.UpMbps)); err == nil && v > 0 {
 				up = v
 			}
 		}
 		down := 0
 		if nodeConfig.DownMbps != "" {
-			if v, err := strconv.Atoi(nodeConfig.DownMbps); err == nil && v > 0 {
+			if v, err := strconv.Atoi(string(nodeConfig.DownMbps)); err == nil && v > 0 {
 				down = v
 			}
 		}
@@ -970,7 +968,7 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 			ObfsPassword:          nodeConfig.ObfsPassword,
 			UpMbps:                up,
 			DownMbps:              down,
-			IgnoreClientBandwidth: nodeConfig.IgnoreClientBandwidth,
+			IgnoreClientBandwidth: bool(nodeConfig.IgnoreClientBandwidth),
 			PortHopEnabled:        portHopEnabled,
 			PortHopPorts:          portHopPorts,
 		}
@@ -988,7 +986,7 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		// Parse heartbeat interval
 		heartbeat := 10 // default 10 seconds
 		if nodeConfig.Heartbeat != "" {
-			if v, err := strconv.Atoi(nodeConfig.Heartbeat); err == nil && v > 0 {
+			if v, err := strconv.Atoi(string(nodeConfig.Heartbeat)); err == nil && v > 0 {
 				heartbeat = v
 			}
 		}
