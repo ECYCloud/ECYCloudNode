@@ -221,7 +221,7 @@ jobs:
       # 故首次失败先不中断作业，再试一次；overwrite 让重试幂等，否则第二次会因同名资产已存在而失败。
       - name: Upload files to Artifacts
         id: upload_artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         continue-on-error: true
         with:
           name: ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}
@@ -229,7 +229,7 @@ jobs:
             ./ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}/*
       - name: Upload files to Artifacts (retry)
         if: steps.upload_artifact.outcome == 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ECYCloudNode-${{ steps.get_filename.outputs.ASSET_NAME }}
           path: |
