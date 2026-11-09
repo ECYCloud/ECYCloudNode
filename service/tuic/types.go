@@ -73,6 +73,7 @@ type userRecord struct {
 	ClientID        int
 	UID             int
 	DeviceLimit     int
+	OverLimitGrace  int64
 	SpeedLimit      uint64
 }
 

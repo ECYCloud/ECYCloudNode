@@ -128,6 +128,7 @@ func (h *Hysteria2Service) syncUsers(userInfo *[]api.UserInfo) {
 			TrafficIdentity: u.TrafficIdentity,
 			ClientID:        u.ClientID,
 			DeviceLimit:     u.DeviceLimit,
+			OverLimitGrace:  u.OverLimitGrace,
 			SpeedLimit:      u.SpeedLimit,
 		}
 		for _, key := range keys {
@@ -250,7 +251,7 @@ func (h *Hysteria2Service) collectUsage() []api.OnlineUser {
 		}
 	}
 
-	return onlineUsers
+	return append(onlineUsers, L.OverLimitOnlineUsers(h.tag)...)
 }
 
 // userMonitor is the periodic task used by Hysteria2Service to

@@ -31,6 +31,7 @@ type UserInfo struct {
 	ClientID        int
 	SpeedLimit      uint64
 	DeviceLimit     int
+	OverLimitGrace  int64
 }
 
 // onlineEntry 记录单个在线 名额 的归属与最近活跃时间（unix 秒）
@@ -94,6 +95,7 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 			ClientID:        u.ClientID,
 			SpeedLimit:      u.SpeedLimit,
 			DeviceLimit:     u.DeviceLimit,
+			OverLimitGrace:  u.OverLimitGrace,
 		})
 	}
 	inboundInfo.UserInfo = userMap
@@ -164,6 +166,7 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 				ClientID:        u.ClientID,
 				SpeedLimit:      u.SpeedLimit,
 				DeviceLimit:     u.DeviceLimit,
+				OverLimitGrace:  u.OverLimitGrace,
 			})
 			inboundInfo.updateRateBucket(u.UID, u.SpeedLimit)
 		}
@@ -258,6 +261,7 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 	} else {
 		return nil, fmt.Errorf("no such inbound in limiter: %s", tag)
 	}
+	onlineUser = append(onlineUser, OverLimitOnlineUsers(tag)...)
 
 	return &onlineUser, nil
 }
@@ -367,6 +371,11 @@ func admitSlot(inboundInfo *InboundInfo, userKey, ip string, uid, deviceLimit in
 			return true
 		})
 		if deviceLimit > 0 && counter >= deviceLimit {
+			// 第三方 IP 超限先放行一段宽限，不登记进账本，有空余名额后由复查转正
+			if overLimitGrace(inboundInfo.Tag, uid, slot, user.OverLimitGrace, true) {
+				inboundInfo.slotMu.Unlock()
+				return true
+			}
 			if _, ok := peekOldestOnlineSlot(slotMap, now); !ok {
 				inboundInfo.slotMu.Unlock()
 				return false
@@ -471,9 +480,15 @@ func (l *Limiter) EnsureOnline(tag, userKey, ip string) bool {
 	}
 
 	inboundInfo.slotMu.Lock()
-	if !l.AuthorizationAllowed(tag, userKey, user.KickVersion) || (!inboundInfo.GlobalLimit.Enforcing() && !l.VerifyOnline(tag, userKey, ip)) {
+	if !l.AuthorizationAllowed(tag, userKey, user.KickVersion) {
 		inboundInfo.slotMu.Unlock()
 		return false
+	}
+	if !inboundInfo.GlobalLimit.Enforcing() && !inboundInfo.slotFits(uid, clientID, slot, user.DeviceLimit) {
+		// 名额外的 slot 只剩超限宽限一条路，宽限内放行但不登记进账本
+		allowed := overLimitGrace(tag, uid, slot, user.OverLimitGrace, false)
+		inboundInfo.slotMu.Unlock()
+		return allowed
 	}
 	v, _ := inboundInfo.UserOnlineSlots.LoadOrStore(onlineBucket(tag, uid, clientID), new(sync.Map))
 	slotMap := v.(*sync.Map)
@@ -495,7 +510,7 @@ func (info *InboundInfo) releaseRejectedSlot(userKey, slot string, slots *sync.M
 // VerifyOnline 供下行方向（远端→客户端）周期性复查：只读、不续期、不登记。
 // 下行流量不能证明客户端仍然存活——客户端异常离线后，远端仍可能持续向
 // 残留连接推送数据；若据此续期，离线 名额 会被无限"续命"，名额永不释放。
-// 放行条件：该 名额 仍持有新鲜名额，或该用户尚有空余名额。
+// 放行条件：该 名额 仍持有新鲜名额，或该用户尚有空余名额，或第三方 IP 仍在超限宽限内。
 func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 	if !l.AuthorizationAllowed(tag, userKey) {
 		return false
@@ -529,7 +544,15 @@ func (l *Limiter) VerifyOnline(tag, userKey, ip string) bool {
 		}
 	}
 
-	v, ok := inboundInfo.UserOnlineSlots.Load(onlineBucket(tag, uid, clientID))
+	return inboundInfo.slotFits(uid, clientID, slot, deviceLimit) || overLimitGrace(tag, uid, slot, user.OverLimitGrace, false)
+}
+
+// slotFits 只读判断 slot 是否在本地名额内：自身仍持有新鲜名额，或该用户尚有空余名额。
+func (info *InboundInfo) slotFits(uid, clientID int, slot string, deviceLimit int) bool {
+	if deviceLimit <= 0 {
+		return true
+	}
+	v, ok := info.UserOnlineSlots.Load(onlineBucket(info.Tag, uid, clientID))
 	if !ok {
 		return true
 	}

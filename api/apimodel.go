@@ -169,6 +169,7 @@ type UserInfo struct {
 	Method          string
 	SpeedLimit      uint64 // Bps
 	DeviceLimit     int
+	OverLimitGrace  int64 // 第三方 IP 超出在线上限后放行的秒数，0 为立即拒绝
 }
 
 // Key 带凭据摘要：面板重置 UUID / 密码后键随之改变，旧凭据建立的连接与 mux 子流

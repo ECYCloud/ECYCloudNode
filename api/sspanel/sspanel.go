@@ -760,6 +760,7 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]UserResponse) (*[]
 			Passwd:          user.Passwd,
 			SpeedLimit:      speedLimit,
 			DeviceLimit:     deviceLimit,
+			OverLimitGrace:  user.OverLimitGrace,
 			Port:            user.Port,
 			Method:          user.Method,
 		})

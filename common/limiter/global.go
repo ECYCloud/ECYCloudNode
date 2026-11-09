@@ -479,6 +479,10 @@ func (g *GlobalDeviceChecker) check(uid int, slot string, deviceLimit int, grant
 		}
 		deviceLimit = latest
 	}
+	// 第三方没有回收授权，判满后只看超限宽限；宽限内放行但不登记进 Redis，有空余名额后由复查转正
+	if len(authorization) > 0 && authorization[0].OverLimitGrace > 0 && !IsClientOnlineKey(slot) {
+		return overLimitGrace(scope, uid, slot, authorization[0].OverLimitGrace, reclaim)
+	}
 	if !reclaim {
 		return false
 	}
@@ -558,6 +562,9 @@ func (g *GlobalDeviceChecker) Verify(uid int, slot string, deviceLimit int, user
 		if latest != deviceLimit {
 			return g.Verify(uid, slot, latest, user, current...)
 		}
+	}
+	if allowed == 0 {
+		return overLimitGrace(user.Scope, uid, slot, user.OverLimitGrace, false)
 	}
 	return allowed == 1
 }

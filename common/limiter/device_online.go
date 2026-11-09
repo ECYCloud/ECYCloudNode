@@ -215,7 +215,8 @@ func PurgeStaleDeviceSlots(onlineSlots map[string]struct{}, activeMap map[string
 // 调用方须持 mu 进入，返回时仍持 mu：取确认是一次对面板的 HTTP 调用，不能持锁等待，
 // 这里会解锁去取、取回后重新加锁并重数一遍再踢。
 // 第二个返回值是本次消耗到的确认，供全局限制复用，避免再查一次授权。
-func AdmitDeviceSlot(tag string, mu sync.Locker, onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int, current ...func() (int, bool)) (allowed bool, grant ReclaimGrant) {
+// grace 为第三方 IP 超限后的宽限秒数，宽限内放行但不登记进账本。
+func AdmitDeviceSlot(tag string, mu sync.Locker, onlineSlots map[string]struct{}, activeMap map[string]time.Time, slot string, uid, deviceLimit int, grace int64, current ...func() (int, bool)) (allowed bool, grant ReclaimGrant) {
 	if slot == "" {
 		return false, grant
 	}
@@ -234,6 +235,9 @@ func AdmitDeviceSlot(tag string, mu sync.Locker, onlineSlots map[string]struct{}
 			return true, grant
 		}
 		if deviceLimit > 0 && fresh >= deviceLimit {
+			if overLimitGrace(tag, uid, slot, grace, true) {
+				return true, grant
+			}
 			if _, ok := peekOldestDeviceSlot(activeMap); !ok {
 				return false, grant
 			}
@@ -273,8 +277,9 @@ func AdmitDeviceSlot(tag string, mu sync.Locker, onlineSlots map[string]struct{}
 // due 表示是否到了复查全局名额的时点，未到时调用方应跳过 Redis 往返：读写回调按每个
 // 缓冲区触发，不节流会把每个包都变成一次跨节点查询。活跃时间也只在到点时刷新，否则持续
 // 传输时永远到不了复查时点，全局名额会在 Expiry 后过期。
-func EnsureDeviceSlot(onlineSlots map[string]map[string]struct{}, slotLastActive map[string]map[string]time.Time,
-	key, slot string, deviceLimit int) (online, due bool) {
+// 名额已满时第三方 IP 只看超限宽限，宽限内放行但不登记。
+func EnsureDeviceSlot(tag string, onlineSlots map[string]map[string]struct{}, slotLastActive map[string]map[string]time.Time,
+	key, slot string, uid, deviceLimit int, grace int64) (online, due bool) {
 	if slot == "" {
 		return false, false
 	}
@@ -287,8 +292,8 @@ func EnsureDeviceSlot(onlineSlots map[string]map[string]struct{}, slotLastActive
 		activeMap[slot] = now
 		return true, true
 	}
-	if !VerifyDeviceSlot(activeMap, slot, deviceLimit) {
-		return false, false
+	if !deviceSlotFits(activeMap, slot, deviceLimit) {
+		return overLimitGrace(tag, uid, slot, grace, false), false
 	}
 	if activeMap == nil {
 		activeMap = make(map[string]time.Time)
@@ -307,8 +312,12 @@ func EnsureDeviceSlot(onlineSlots map[string]map[string]struct{}, slotLastActive
 // VerifyDeviceSlot 是协议侧下行方向（远端→客户端）的名额复查，与 Limiter.VerifyOnline
 // 同语义：只读、不续期。下行流量不能证明客户端仍然存活——客户端异常离线后，远端仍
 // 可能持续向残留连接推送数据；若据此续期，离线名额会被无限"续命"、永不释放。
-// 放行条件：该 slot 仍持有新鲜名额，或该用户尚有空余名额。
-func VerifyDeviceSlot(activeMap map[string]time.Time, slot string, deviceLimit int) bool {
+// 放行条件：该 slot 仍持有新鲜名额，或该用户尚有空余名额，或第三方 IP 仍在超限宽限内。
+func VerifyDeviceSlot(tag string, activeMap map[string]time.Time, slot string, uid, deviceLimit int, grace int64) bool {
+	return deviceSlotFits(activeMap, slot, deviceLimit) || overLimitGrace(tag, uid, slot, grace, false)
+}
+
+func deviceSlotFits(activeMap map[string]time.Time, slot string, deviceLimit int) bool {
 	if deviceLimit <= 0 {
 		return true
 	}

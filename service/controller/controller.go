@@ -681,10 +681,12 @@ func compareUserList(old, next *[]api.UserInfo) (deleted, added []api.UserInfo) 
 }
 
 // userIdentity 去掉每轮同步都可能变化的授权期限与下线序号，用来认出同一用户：
-// 面板时钟换算会让 ValidUntil 秒级抖动，直接拿整条记录做键，超速计数与已施加的限速每轮都对不上
+// 面板时钟换算会让 ValidUntil 秒级抖动，直接拿整条记录做键，超速计数与已施加的限速每轮都对不上。
+// 超限宽限只由限速器读取，后台改设置时不能让全部第三方用户被删除重加。
 func userIdentity(user api.UserInfo) api.UserInfo {
 	user.ValidUntil = 0
 	user.KickVersion = 0
+	user.OverLimitGrace = 0
 	return user
 }
 

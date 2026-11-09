@@ -99,6 +99,7 @@ type UserResponse struct {
 	Method          string  `json:"method"`
 	SpeedLimit      float64 `json:"node_speedlimit"`
 	DeviceLimit     int     `json:"node_connector"`
+	OverLimitGrace  int64   `json:"over_limit_grace"`
 	UUID            string  `json:"uuid"`
 }
 

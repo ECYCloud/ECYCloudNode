@@ -138,7 +138,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		return false, ""
 	}
 	a.svc.mu.Unlock()
-	allowed := a.svc.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, true, func() (int, bool) {
+	allowed := a.svc.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil, OverLimitGrace: user.OverLimitGrace}, true, func() (int, bool) {
 		return a.svc.currentDeviceLimit(auth, host, user.KickVersion)
 	}, a.svc.tag)
 	if !allowed {
@@ -164,7 +164,7 @@ func (a *hyAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (b
 		a.svc.slotLastActive[auth] = activeMap
 	}
 
-	allowed, _ = limiter.AdmitDeviceSlot(a.svc.tag, &a.svc.mu, slotSet, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
+	allowed, _ = limiter.AdmitDeviceSlot(a.svc.tag, &a.svc.mu, slotSet, activeMap, slot, user.UID, user.DeviceLimit, user.OverLimitGrace, func() (int, bool) {
 		_, latest, ok := a.svc.slot(auth, host, user.KickVersion)
 		if a.svc.globalChecker.Enforcing() {
 			return 0, ok
@@ -218,7 +218,7 @@ func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bo
 	if h.globalChecker.Enforcing() {
 		localLimit = 0
 	}
-	online, due := limiter.EnsureDeviceSlot(h.onlineSlots, h.slotLastActive, cred, slot, localLimit)
+	online, due := limiter.EnsureDeviceSlot(h.tag, h.onlineSlots, h.slotLastActive, cred, slot, user.UID, localLimit, user.OverLimitGrace)
 	h.mu.Unlock()
 
 	if !online {
@@ -228,7 +228,7 @@ func (h *Hysteria2Service) ensureOnline(cred, host string, version ...uint64) bo
 		return true
 	}
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if h.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, false, func() (int, bool) {
+	if h.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil, OverLimitGrace: user.OverLimitGrace}, false, func() (int, bool) {
 		return h.currentDeviceLimit(cred, host, user.KickVersion)
 	}, h.tag) {
 		limiter.NoteClientIP(user.ClientID, host)
@@ -246,13 +246,13 @@ func (h *Hysteria2Service) verifyOnline(cred, host string, version ...uint64) bo
 	h.mu.RLock()
 
 	slot, user, ok := h.slot(cred, host, version...)
-	localAllowed := limiter.VerifyDeviceSlot(h.slotLastActive[cred], slot, user.DeviceLimit)
+	localAllowed := limiter.VerifyDeviceSlot(h.tag, h.slotLastActive[cred], slot, user.UID, user.DeviceLimit, user.OverLimitGrace)
 	h.mu.RUnlock()
 	if !ok {
 		return false
 	}
 	if h.globalChecker.Enforcing() {
-		allowed := h.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: h.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
+		allowed := h.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: h.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil, OverLimitGrace: user.OverLimitGrace}, func() (int, bool) {
 			return h.currentDeviceLimit(cred, host, user.KickVersion)
 		})
 		if !allowed || h.globalChecker.Enforcing() {

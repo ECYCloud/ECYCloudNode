@@ -57,6 +57,7 @@ func (s *TuicService) syncUsers(userInfo *[]api.UserInfo) {
 			TrafficIdentity: u.TrafficIdentity,
 			ClientID:        u.ClientID,
 			DeviceLimit:     u.DeviceLimit,
+			OverLimitGrace:  u.OverLimitGrace,
 			SpeedLimit:      u.SpeedLimit,
 		}
 		if old, ok := s.users[key]; ok && old.KickVersion != u.KickVersion {
@@ -182,7 +183,7 @@ func (s *TuicService) allowConnection(uuid, host string) bool {
 		return false
 	}
 	s.mu.Unlock()
-	allowed := s.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, true, func() (int, bool) {
+	allowed := s.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil, OverLimitGrace: user.OverLimitGrace}, true, func() (int, bool) {
 		return s.currentDeviceLimit(uuid, host, user.KickVersion)
 	}, s.tag)
 	if !allowed {
@@ -208,7 +209,7 @@ func (s *TuicService) allowConnection(uuid, host string) bool {
 		s.slotLastActive[uuid] = activeMap
 	}
 
-	allowed, _ = limiter.AdmitDeviceSlot(s.tag, &s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit, func() (int, bool) {
+	allowed, _ = limiter.AdmitDeviceSlot(s.tag, &s.mu, slots, activeMap, slot, user.UID, user.DeviceLimit, user.OverLimitGrace, func() (int, bool) {
 		_, latest, ok := s.slot(uuid, host, user.KickVersion)
 		if s.globalChecker.Enforcing() {
 			return 0, ok
@@ -242,7 +243,7 @@ func (s *TuicService) ensureOnline(uuid, host string, version ...uint64) bool {
 	if s.globalChecker.Enforcing() {
 		localLimit = 0
 	}
-	online, due := limiter.EnsureDeviceSlot(s.onlineSlots, s.slotLastActive, uuid, slot, localLimit)
+	online, due := limiter.EnsureDeviceSlot(s.tag, s.onlineSlots, s.slotLastActive, uuid, slot, user.UID, localLimit, user.OverLimitGrace)
 	s.mu.Unlock()
 
 	if !online {
@@ -252,7 +253,7 @@ func (s *TuicService) ensureOnline(uuid, host string, version ...uint64) bool {
 		return true
 	}
 	// 全局（跨节点）限制：涉及 Redis 访问，必须在锁外执行
-	if s.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, false, func() (int, bool) {
+	if s.globalChecker.CheckCurrent(user.UID, slot, limiter.UserInfo{KickVersion: user.KickVersion, ValidUntil: user.ValidUntil, OverLimitGrace: user.OverLimitGrace}, false, func() (int, bool) {
 		return s.currentDeviceLimit(uuid, host, user.KickVersion)
 	}, s.tag) {
 		limiter.NoteClientIP(user.ClientID, host)
@@ -277,13 +278,13 @@ func (s *TuicService) verifyOnline(uuid, host string, version ...uint64) bool {
 	s.mu.RLock()
 
 	slot, user, ok := s.slot(uuid, host, version...)
-	localAllowed := limiter.VerifyDeviceSlot(s.slotLastActive[uuid], slot, user.DeviceLimit)
+	localAllowed := limiter.VerifyDeviceSlot(s.tag, s.slotLastActive[uuid], slot, user.UID, user.DeviceLimit, user.OverLimitGrace)
 	s.mu.RUnlock()
 	if !ok {
 		return false
 	}
 	if s.globalChecker.Enforcing() {
-		allowed := s.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: s.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil}, func() (int, bool) {
+		allowed := s.globalChecker.Verify(user.UID, slot, user.DeviceLimit, limiter.UserInfo{Scope: s.tag, KickVersion: user.KickVersion, ValidUntil: user.ValidUntil, OverLimitGrace: user.OverLimitGrace}, func() (int, bool) {
 			return s.currentDeviceLimit(uuid, host, user.KickVersion)
 		})
 		if !allowed || s.globalChecker.Enforcing() {
@@ -331,7 +332,7 @@ func (s *TuicService) collectUsage() []api.OnlineUser {
 		}
 	}
 
-	return online
+	return append(online, limiter.OverLimitOnlineUsers(s.tag)...)
 }
 
 func (s *TuicService) userMonitor() error {
