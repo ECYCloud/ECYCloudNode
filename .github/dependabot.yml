@@ -13,3 +13,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # init / autobuild / analyze 必须同版本，否则 CodeQL 扫描失败，合并为一个 PR 升级
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"

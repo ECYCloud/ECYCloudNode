@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -172,6 +174,14 @@ type UserInfo struct {
 	OverLimitGrace  int64 // 第三方 IP 超出在线上限后放行的秒数，0 为立即拒绝
 }
 
+// keySecret 每次启动随机生成：键会作为 Xray 的 email 进访问日志，带密钥的摘要无法从日志离线比对出连接密码；
+// 键只在进程内使用，不落盘、不进 Redis，重启后变化不影响任何状态。
+var keySecret = func() []byte {
+	secret := make([]byte, 32)
+	rand.Read(secret)
+	return secret
+}()
+
 // Key 带凭据摘要：面板重置 UUID / 密码后键随之改变，旧凭据建立的连接与 mux 子流
 // 在限速器里查不到授权而被断开；UID 必须留在最后一段，审计按它解析用户。
 func (u UserInfo) Key(tag string) string {
@@ -181,8 +191,9 @@ func (u UserInfo) Key(tag string) string {
 	if u.ClientID != 0 {
 		tag += fmt.Sprintf("|client-%d", u.ClientID)
 	}
-	digest := sha256.Sum256([]byte(u.UUID + "\x00" + u.Passwd + "\x00" + u.Method))
-	return fmt.Sprintf("%s|%s|%d", tag, hex.EncodeToString(digest[:8]), u.UID)
+	mac := hmac.New(sha256.New, keySecret)
+	mac.Write([]byte(u.UUID + "\x00" + u.Passwd + "\x00" + u.Method))
+	return fmt.Sprintf("%s|%s|%d", tag, hex.EncodeToString(mac.Sum(nil)[:8]), u.UID)
 }
 
 type OnlineUser struct {
