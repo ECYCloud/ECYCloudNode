@@ -74,14 +74,14 @@ func prepare() error {
 		}
 	}
 	patchPath := filepath.Join(workingDir, "patches", "xray-tls-config.patch")
-	if module.Version != "v1.260327.1-0.20261031132019-a4a3dff5b20c" {
+	if module.Version != "v1.260327.1-0.20261109052709-676eaf66f8f0" {
 		patch, err := os.ReadFile(patchPath)
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("读取旧 TLS 补丁：%w", err)
 		}
 		if err == nil {
 			patch = bytes.ReplaceAll(patch, []byte("\r\n"), []byte("\n"))
-			if fmt.Sprintf("%x", sha256.Sum256(patch)) != "156aebf968fe80a3b2a56960968b5befba5114f6f99b457ff756f56aa31a659c" {
+			if fmt.Sprintf("%x", sha256.Sum256(patch)) != "f6e979d7f1c52b3b564e9ca00ba58bc815fc7893f33171fffe10b9c8f1089da5" {
 				return fmt.Errorf("旧 TLS 补丁内容已改动，拒绝自动删除：%s", patchPath)
 			}
 			if err := os.Remove(patchPath); err != nil {
