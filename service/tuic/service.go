@@ -64,8 +64,12 @@ func (s *TuicService) Start() error {
 	if err != nil {
 		return err
 	}
-	if nodeInfo == nil || nodeInfo.NodeType != "Tuic" {
-		return fmt.Errorf("TuicService can only be used with Tuic node, got %v", nodeInfo)
+	if nodeInfo == nil {
+		return errors.New("TuicService: node info is empty")
+	}
+	// 只输出类型：节点信息含服务端密钥、VLESS 解密私钥等，不能整体进日志
+	if nodeInfo.NodeType != "Tuic" {
+		return fmt.Errorf("TuicService can only be used with Tuic node, got %s", nodeInfo.NodeType)
 	}
 	if nodeInfo.Port == 0 {
 		return errors.New("server port must > 0")
