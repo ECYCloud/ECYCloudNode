@@ -7,7 +7,7 @@ godebug multipathtcp=0
 require (
 	dario.cat/mergo v1.0.2
 	github.com/anytls/sing-anytls v0.0.13
-	github.com/apernet/hysteria/core/v2 v2.13.0
+	github.com/apernet/hysteria/core/v2 v2.14.0
 	github.com/apernet/hysteria/extras/v2 v2.13.0
 	github.com/deckarep/golang-set/v3 v3.0.0
 	github.com/fsnotify/fsnotify v1.10.1
@@ -65,7 +65,7 @@ require (
 	github.com/andybalholm/brotli v1.2.6 // indirect
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/anthropics/anthropic-sdk-go v1.80.0 // indirect
-	github.com/apernet/quic-go v0.63.1-0.20261004180939-a10df75c260c // indirect
+	github.com/apernet/quic-go v0.65.1-0.20261109005002-2895f039137a // indirect
 	github.com/aws/aws-sdk-go-v2 v1.47.5 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.33.12 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.12 // indirect
